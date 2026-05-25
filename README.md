@@ -1,12 +1,14 @@
 # aperta
 
+[![tests](https://github.com/mmiotti/aperta/actions/workflows/test.yml/badge.svg)](https://github.com/mmiotti/aperta/actions/workflows/test.yml)
+
 A Python toolkit for **accessibility analysis on multimodal transport networks** — measuring how open places are to their surroundings via routing, distance/time calculations, and gravity-style metrics on `networkx` / `igraph` graphs.
 
 The name is Latin/Italian for "open."
 
 ## Status
 
-**Pre-1.0, alpha.** The library is in active development inside the [aperta-atlas](../../README.md) umbrella project (Swiss application + reproducibility material) and will be extracted to its own repository at toolkit-paper publication. APIs may change without notice until then. The boundary rule for what belongs here: *if the code could run 1:1 on a different country's data, it goes in `aperta/`. If it knows the name of a specific input file or schema, it goes in the application repo.*
+**Pre-1.0, alpha.** Published alongside a toolkit paper (in submission). APIs may change without notice until v1.0. The boundary rule for what belongs here: *if the code could run 1:1 on a different country's data, it goes in `aperta`. If it knows the name of a specific input file or schema, it belongs in an application repo built on top* (e.g. the sibling [aperta-lab](https://github.com/mmiotti/aperta-lab) repo with the Swiss "Urban Mobility Atlas" application).
 
 ## Workflow
 
@@ -62,15 +64,16 @@ The reference project applying this workflow is **LUMOS Switzerland** (`src/proj
 ## Install
 
 ```bash
-pip install -e ./src/aperta
+git clone git@github.com:mmiotti/aperta.git
+pip install -e ./aperta
 ```
 
-(Editable install. From a clone of aperta-atlas, run from the project root.)
-
-Once published to PyPI:
+(Editable install for development.) Once published to PyPI:
 
 ```bash
-pip install aperta
+pip install aperta              # algorithms only
+pip install 'aperta[osm]'       # + OSM ingestion (osmnx)
+pip install 'aperta[examples]'  # + everything needed to run the example notebooks
 ```
 
 Requires Python ≥ 3.11.
