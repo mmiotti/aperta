@@ -1,0 +1,5 @@
+# Pair every .ipynb in this folder with a .py shadow in `percent` format.
+# The .py file is what shows up in git diff; the .ipynb is what users open
+# in Jupyter / what GitHub renders inline.
+formats = "ipynb,py:percent"
+notebook_metadata_filter = "-jupytext.text_representation.jupytext_version"
