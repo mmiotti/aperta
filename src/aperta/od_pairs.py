@@ -531,7 +531,14 @@ def get_pairs(
     zone_nodes: list = zones[node_column].tolist()
     cells_in_zone: dict = (
         cells_with_node.groupby('zone_id')[node_column]
-        .apply(lambda s: s.unique()).to_dict()
+        # `np.asarray` normalises across pandas dtypes: with the default
+        # numpy backend `s.unique()` returns a numpy array, but with
+        # nullable string / Int dtypes it returns a `pd.<...>Array`
+        # whose `.dtype` is a pandas ExtensionDtype that
+        # `np.array(..., dtype=...)` downstream can't interpret. Coerce
+        # to a plain numpy array here so callers can rely on a numpy
+        # dtype on these values.
+        .apply(lambda s: np.asarray(s.unique())).to_dict()
     )
     n_zones = len(zone_ids)
 

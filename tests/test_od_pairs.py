@@ -665,6 +665,20 @@ class GetPairsMaskFiltersTestCase(unittest.TestCase):
         # Origins limited to N0-N3 (Z0's cells).
         self.assertSetEqual(set(pairs.cells_to_cells.keys()), {'N0', 'N1', 'N2', 'N3'})
 
+    def test_node_column_with_string_extension_dtype(self):
+        """Regression: pandas `StringDtype` `node_column` shouldn't break
+        the orig_cells filter. `s.unique()` returns a `pd.StringArray`
+        whose `.dtype` is a pandas ExtensionDtype that `np.array(...,
+        dtype=...)` downstream can't interpret. `cells_in_zone` coerces
+        through `np.asarray` to defend against this."""
+        cells = self.cells.copy()
+        cells['node_id'] = cells['node_id'].astype('string')
+        orig = self.cells['zone_id'] == 'Z0'
+        pairs = get_pairs(cells, r_cells=1.5, node_column='node_id',
+                          zones=self.zones, r_zones=2.5,
+                          orig_cells=orig)
+        self.assertSetEqual(set(pairs.cells_to_cells.keys()), {'N0', 'N1', 'N2', 'N3'})
+
 
 class AggregateAcrossModesTestCase(unittest.TestCase):
     """`aggregate_across_modes` combines per-mode geo-keyed (pairs, costs) into
