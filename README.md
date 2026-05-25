@@ -10,7 +10,7 @@ The name is Latin/Italian for *open*.
 
 **Pre-1.0, alpha.** Published alongside a toolkit paper (in submission). APIs may change without notice until v1.0.
 
-aperta the library lives here. For an opinionated *project* scaffolding layer on top (filesystem layout, typed I/O, per-scenario coefficient tables, optional dependency tracking) see the sibling [`aperta-projects`](https://github.com/mmiotti/aperta-projects) package. For a complete production-scale application — the Swiss "Urban Mobility Atlas" — see the [`aperta-lab`](https://github.com/mmiotti/aperta-lab) umbrella repo.
+aperta the library lives here. The sibling [`aperta-lab`](https://github.com/mmiotti/aperta-lab) repo holds (a) an opinionated project-scaffolding package (`aperta_lab` — filesystem layout, typed I/O, per-scenario coefficient tables, optional dependency tracking) and (b) the concrete projects built on it, most prominently the Swiss "Urban Mobility Atlas".
 
 The boundary rule for what belongs in aperta: *if the code could run 1:1 on a different country's data, it goes here. If it knows the name of a specific input file or schema, it belongs in an application repo built on top.*
 
@@ -96,7 +96,7 @@ print(res)
 
 aperta is intentionally lightweight and **agnostic about how you organise your data and pipeline**:
 
-- **No filesystem assumptions.** Algorithm functions take plain `networkx` graphs, `pandas` / `geopandas` frames, and `numpy` arrays. They don't read or write files. The opinionated I/O + project scaffolding layer lives in the sibling [`aperta-projects`](https://github.com/mmiotti/aperta-projects) package.
+- **No filesystem assumptions.** Algorithm functions take plain `networkx` graphs, `pandas` / `geopandas` frames, and `numpy` arrays. They don't read or write files. The opinionated I/O + project scaffolding layer lives in the sibling [`aperta-lab`](https://github.com/mmiotti/aperta-lab) repo (`aperta_lab` package).
 - **No DAG engine.** No caching, no dependency graph, no orchestration. For full DAG features layer [DVC](https://dvc.org/) or [Snakemake](https://snakemake.readthedocs.io/) on top.
 - **Routing profiles are plain Python functions, not config files.** Other routing tools define modes (car, bike, pedestrian) via custom formats — Lua profiles in OSRM, JSON costing-options in Valhalla, YAML in GraphHopper. aperta skips that layer: a profile is a Python callable that returns an edge cost. Trade-off: no shared library of pre-built profiles to pick from, but full Python expressivity (call numpy, look up calibrated coefficients, branch on anything).
 - **No global state** — every function takes its inputs explicitly.

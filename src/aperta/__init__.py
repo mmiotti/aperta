@@ -37,7 +37,7 @@ real-world example (Cambridge MA, walk + car + cross-modal logsum).
 For an opinionated project scaffolding layer on top of aperta —
 filesystem layout, typed I/O, per-scenario coefficient tables,
 scenario-keyed output paths, optional dependency tracking — see the
-sibling `aperta-projects` package.
+sibling `aperta-lab` repo (`aperta_lab` package).
 
 Key types:
   - `od_pairs.TieredODNodePairs` — three-tier OD dict-of-arrays keyed by network
