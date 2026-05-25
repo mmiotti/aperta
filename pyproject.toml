@@ -78,9 +78,9 @@ examples = [
     "contextily>=1.4",
 ]
 
-# `aperta` lives directly in this directory (the .py files are siblings of
-# pyproject.toml). Conventional `aperta/aperta/*.py` layout can be adopted
-# later if the package grows enough to warrant it.
-[tool.setuptools]
-packages = ["aperta"]
-package-dir = {aperta = "."}
+# Src layout: package code lives under `src/aperta/`. Prevents accidental
+# imports of the local source (Python won't find `aperta` unless it's
+# actually `pip install`-ed), which catches "works on my machine but
+# breaks when installed" bugs early.
+[tool.setuptools.packages.find]
+where = ["src"]
