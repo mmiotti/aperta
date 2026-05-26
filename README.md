@@ -33,6 +33,10 @@ pip install -e ".[osm,topo,h3]"
 python -m unittest discover -s tests -t .
 ```
 
+> If you plan to edit the example notebooks under `examples/`, run the
+> [notebook editing setup](#editing-notebooks) once after cloning. Not
+> needed if you're only using the library or modifying Python source.
+
 ## Workflow
 
 aperta is organised around a six-phase workflow. Every module slots into one of these phases.
@@ -108,6 +112,32 @@ aperta is intentionally lightweight and **agnostic about how you organise your d
 ## Contributing
 
 Internal repository for now. External contributions will open after the toolkit-paper publication.
+
+## Editing notebooks
+
+Notebook outputs (matplotlib figures, dataframe HTML, etc.) bloat git
+quickly — a single Bern map can be 2 MB of embedded PNGs. This repo
+uses [`nbstripout`](https://github.com/kynan/nbstripout) as a clean
+filter to strip output cells on commit. The filter is declared in
+[`.gitattributes`](.gitattributes); to activate it in your local clone,
+run once after cloning:
+
+```bash
+pip install nbstripout
+nbstripout --install
+```
+
+The filter then runs transparently on every commit — `git diff` and
+`git log` on .ipynb files show only code + markdown changes.
+
+Notebooks here are jupytext-paired: each `.ipynb` has a `.py` shadow
+under the same basename. Edits in either form propagate to the other
+via `jupytext --sync <file>`. Only the .py shadow needs to be human-
+readable in code review; the .ipynb travels for the GitHub-rendered
+view.
+
+If you skip the `nbstripout --install` step, your commits will include
+output cells (large diffs, slow GitHub renders). Just install it.
 
 ## License
 
