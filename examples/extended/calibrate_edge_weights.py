@@ -193,6 +193,62 @@ plt.show()
 
 
 # %% [markdown]
+# ## 6. Export the calibrated graph
+#
+# `calibrate_edge_weights` writes the fitted per-edge duration to
+# `car_graph[u][v][k][result.edge_duration_attr]` (default
+# `'duration_calibrated'`) on every edge. The graph is now self-contained
+# — anything that can read GraphML can pick up the calibrated weights.
+
+# %%
+ox.save_graphml(car_graph, PREPARED_DIR / 'car_graph_calibrated.graphml')
+
+# Companion GeoPackage of edges — opens directly in QGIS / ArcGIS for
+# inspection, and serves as a portable cross-tool exchange format.
+edges_gdf = ox.graph_to_gdfs(car_graph, nodes=False)
+edges_gdf[['length', 'speed_kph', result.edge_duration_attr, 'geometry']].to_file(
+    PREPARED_DIR / 'car_edges_calibrated.gpkg', driver='GPKG',
+)
+print(f"Wrote calibrated graph + edge layer to {PREPARED_DIR}/.")
+
+
+# %% [markdown]
+# ### Consuming the calibrated weights from Pandana
+#
+# [Pandana](https://github.com/UDST/pandana) is a fast C++ routing engine
+# widely used for cumulative-opportunity accessibility. Aperta and Pandana
+# are complementary: aperta produces calibrated, multi-modal,
+# behaviour-anchored edge weights; Pandana consumes them for
+# high-throughput single-mode shortest-path queries on a fixed network.
+#
+# ```python
+# import osmnx as ox
+# import pandana
+# import pandas as pd
+#
+# g = ox.load_graphml('data/prepared/car_graph_calibrated.graphml')
+# nodes = ox.graph_to_gdfs(g, edges=False)
+# edges = ox.graph_to_gdfs(g, nodes=False).reset_index()
+#
+# net = pandana.Network(
+#     node_x=nodes['x'], node_y=nodes['y'],
+#     edge_from=edges['u'], edge_to=edges['v'],
+#     edge_weights=edges[['duration_calibrated']],
+# )
+# net.set(pd.Series(supermarket_node_ids, index=supermarket_node_ids),
+#         name='supermarkets')
+# n_within_15min = net.aggregate(
+#     distance=15 * 60, type='count', name='supermarkets',
+# )
+# ```
+#
+# The same `.graphml` loads into NetworkX, igraph (via aperta's bridges),
+# r5py, and any custom Dijkstra implementation. Calibration is a one-time
+# step whose product is a standard graph file — downstream tooling is
+# the caller's choice.
+
+
+# %% [markdown]
 # ## What this notebook does NOT do
 #
 # This is a self-contained demo of one library capability — calibrating
@@ -209,9 +265,10 @@ plt.show()
 # - **No iterative refinement on stricter trip filters.** Production
 #   typically iterates filters (drop trip outliers, retain only trips
 #   within a polygon, etc.) — we use a single set here.
-# - **Output not consumed by `accessibility.ipynb`.** That notebook
-#   uses published-paper coefficients instead. Each showcase notebook
-#   stands alone; they aren't wired into a pipeline.
+# - **Export not consumed by `accessibility.ipynb`.** The calibrated
+#   GraphML written in §6 isn't picked up by the other notebooks —
+#   `accessibility.ipynb` uses published-paper coefficients instead.
+#   Each showcase notebook stands alone; they aren't wired into a pipeline.
 #
 # For an example of these pieces wired into a full production stack
 # with `aperta_lab` scaffolding (scenario configs, typed I/O,

@@ -14,13 +14,15 @@
 # ---
 
 # %% [markdown]
-# # Aperta minimal example: walking accessibility in Cambridge, MA
+# # Aperta minimal example: walking accessibility in Central Paris
 #
-# This notebook runs the full aperta workflow end-to-end on a small real-world
-# example: walking accessibility to supermarkets across Cambridge,
-# Massachusetts. It takes ~5–10 minutes on a laptop. All data is pulled from
-# public sources (OpenStreetMap via OSMnx; Uber's H3 grid system); no
-# authentication or external downloads beyond `pip install` are needed.
+# This notebook runs the full aperta workflow end-to-end on a real-world
+# example: walking accessibility to supermarkets across Central Paris
+# (arrondissements 1–7 — the historic core of the city: Louvre, Bourse,
+# Marais, Latin Quarter, Saint-Germain, Invalides, ~14 km²). It takes
+# ~10–15 minutes on a laptop. All data is pulled from public sources
+# (OpenStreetMap via OSMnx; Uber's H3 grid system); no authentication or
+# external downloads beyond `pip install` are needed.
 #
 # The notebook follows aperta's six-phase workflow:
 #
@@ -40,10 +42,11 @@
 # area-of-interest string needs to change.
 
 # %%
-# Auto-reload aperta (and any other imported module) when its source files
-# change on disk — saves a kernel restart on each library edit. The two lines
-# below are IPython magics; running this notebook as a plain `.py` script is a
-# no-op for them (a Python comment).
+# `%matplotlib inline` makes figures show up inline below each cell when
+# running in a Jupyter kernel; `autoreload` re-imports modules when their
+# source changes on disk, so library edits don't require a kernel restart.
+# All three are IPython magics — no-ops when running this file as plain Python.
+# %matplotlib inline
 # %load_ext autoreload
 # %autoreload 2
 
@@ -75,15 +78,23 @@ warnings.filterwarnings('ignore', category=FutureWarning)
 # ## 1. Area of interest
 
 # %%
-PLACE = 'Cambridge, Massachusetts, USA'
+# OSMnx accepts a list of place names — the area-of-interest becomes the
+# union of all listed polygons. For Central Paris we explicitly enumerate
+# the seven historic arrondissements (the alternative `'Paris, France'`
+# returns all 20, ~10× the network).
+PLACE = [f'Paris {n} Arrondissement, France'
+         for n in ('1er', '2e', '3e', '4e', '5e', '6e', '7e')]
+LOCATION_LABEL = 'Central Paris (arrondissements 1–7)'
 H3_RES_CELLS = 10  # ~66 m hex edge — building-block scale
 H3_RES_ZONES = 8   # ~460 m hex edge — small-neighbourhood scale
 
-# OSMnx returns the place polygon in WGS84 (EPSG:4326).
-boundary = ox.geocode_to_gdf(PLACE)
+# OSMnx returns the place polygon in WGS84 (EPSG:4326). When `PLACE` is a
+# list, `geocode_to_gdf` returns one row per place — dissolve to a single
+# union polygon so downstream code can treat the AOI uniformly.
+boundary = ox.geocode_to_gdf(PLACE).dissolve()
 boundary_proj_crs = boundary.estimate_utm_crs()  # local metric CRS
 
-print(f"Place:          {PLACE}")
+print(f"Place:          {LOCATION_LABEL}")
 print(f"Projected CRS:  {boundary_proj_crs}")
 
 # %% [markdown]
@@ -186,7 +197,7 @@ supermarkets.plot(
     ax=ax, color='red', markersize=30,
     edgecolor='black', linewidth=0.5, zorder=10,
 )
-ax.set_title(f'Inputs: walking network + {len(supermarkets)} supermarkets, {PLACE}')
+ax.set_title(f'Inputs: walking network + {len(supermarkets)} supermarkets, {LOCATION_LABEL}')
 ax.set_axis_off()
 plt.tight_layout()
 plt.show()
@@ -570,7 +581,199 @@ plt.show()
 
 
 # %% [markdown]
-# ## 11. Utility-based accessibility + logsum
+# ## 11. Adding a bike mode (separate network + intersection-aware edge times)
+#
+# Cycling-walking is the canonical "soft modes" pair for accessibility
+# analyses in dense European city centres — cycling-infrastructure
+# expansion in central Paris (Plan Vélo, cyclable arteries, low-traffic
+# neighbourhoods) is one of the most actively-studied urban-planning
+# topics right now. Compared to walking, biking is ~3× faster but has
+# setup overhead (unlock, parking) and pays a time penalty at every
+# intersection traversed.
+#
+# This section adds the bike mode end-to-end in the **time domain** —
+# fetch network, intersection-aware edge times, overhead, route, lift
+# to geo-keyed form, bake overhead. The bike *utility* spec (with a
+# route-feature) lands later in §14, after we've introduced utilities
+# generally.
+#
+# Two new ingredients beyond the walking template:
+#
+# 1. **Edge weights richer than baseline length / speed.** Each
+#    bike-network edge gets a per-traversal time penalty added to its
+#    `length / bike_speed` baseline — every intersection crossed costs
+#    a few seconds of stop-and-go. The router uses these
+#    penalty-augmented weights, so a slightly-longer detour that avoids
+#    one extra intersection can win on total time.
+# 2. **An overhead the walking mode doesn't have.** Unlocking the bike
+#    + walking to it adds ~30–60 s of trip-invariant cost. For very
+#    short trips this can flip the fastest-mode choice back to walking
+#    — exactly the cross-modal effect demonstrated in §12.
+
+# %% [markdown]
+# ### 11.1 Fetch and snap the bike network
+
+# %%
+bike_graph = ox.graph_from_place(PLACE, network_type='bike', simplify=True)
+bike_graph = ox.project_graph(bike_graph, to_crs=boundary_proj_crs)
+print(f"Bike network: {bike_graph.number_of_nodes():,} nodes, "
+      f"{bike_graph.number_of_edges():,} edges")
+
+# Per-cell snapping (centroid → nearest bike-network node), capturing the
+# centroid→node distance for the per-cell first-mile overhead below.
+cells['bike_node_id'], bike_dist_to_node = network_processing.snap_to_network_nodes(
+    cell_centroids_gdf, bike_graph,
+)
+
+# Zone snapping via transport centroid (same tier-aware logic as for walk).
+bike_node_road_class = network_processing.aggregate_edges_to_nodes(
+    bike_graph, edge_attribute=edge_road_class, aggregator='max',
+)
+bike_eligible_nodes = bike_node_road_class[
+    (bike_node_road_class >= 2) & (bike_node_road_class <= 4)
+].index
+zones['bike_node_id'], _ = network_processing.assign_to_eligible_centroid(
+    zones, bike_graph, eligible_node_ids=bike_eligible_nodes,
+)
+
+# %% [markdown]
+# ### 11.2 Intersection-aware edge times
+#
+# Each edge's bike-time is its `length / bike_speed` baseline plus a flat
+# per-edge penalty — in a simplified OSMnx graph (every degree-2 node
+# collapsed away), each edge spans exactly one intersection-to-intersection
+# segment, so charging the penalty per edge directly counts intersections
+# along the route. Two effects worth predicting:
+#
+# - The router prefers paths with fewer edges, all else equal.
+# - Routes via longer arterial segments (fewer intersections) get
+#   cheaper than dense grid-routes with many short turns.
+#
+# This is a deliberately tiny example of "edge weights richer than
+# pure length / speed". For systematic calibration against observed
+# travel times see the separate `calibrate_edge_weights.ipynb` notebook.
+
+# %%
+BIKE_SPEED_MS = 20 / 3.6           # 20 km/h, typical urban cycling speed
+INTERSECTION_PENALTY_S = 8.0       # stop-and-go time per intersection traversed
+
+for u, v, k, data in bike_graph.edges(keys=True, data=True):
+    base_time = float(data['length']) / BIKE_SPEED_MS
+    data['bike_time_s'] = base_time + INTERSECTION_PENALTY_S
+
+# %% [markdown]
+# ### 11.3 Bike overhead (unlock + walk-to-bike)
+#
+# Per-cell origin overhead = walk-to-bike + fixed setup time. No
+# density-dependent term (unlike cars, bikes don't need to "find
+# parking" at scale in central Paris).
+
+# %%
+BIKE_INIT_SPEED_MS = 1.4       # walk-to-bike speed
+BIKE_SETUP_S = 30.0            # unlock + helmet
+
+cells['bike_overhead_s'] = bike_dist_to_node / BIKE_INIT_SPEED_MS + BIKE_SETUP_S
+print(f"Bike overhead per cell: mean {cells['bike_overhead_s'].mean():.1f}s, "
+      f"5-95 pct [{cells['bike_overhead_s'].quantile(0.05):.1f}, "
+      f"{cells['bike_overhead_s'].quantile(0.95):.1f}]")
+
+# %% [markdown]
+# ### 11.4 Route, lift to geo, bake overhead
+#
+# Same three-step pattern as the walking pipeline (§6, §7): route on the
+# bike graph → reindex to geo-keyed form → bake per-cell origin overhead
+# into the cost ODM. The result `bike_times_geo` is a `TieredODGeoPairs`
+# of bike travel times in seconds with overhead included, ready to combine
+# with `times_geo` in the cross-modal section that follows.
+
+# %%
+bike_pairs = od_pairs.get_pairs(
+    cells, r_cells=R_CELLS, node_column='bike_node_id',
+    zones=zones, r_zones=R_ZONES,
+)
+bike_times = routing.tiered_path_costs(bike_pairs, bike_graph, weight='bike_time_s')
+bike_pairs_geo, bike_times_geo = od_pairs.reindex_by_geo_unit(
+    bike_pairs, bike_times, cells,
+    cell_node_column='bike_node_id',
+    zones=zones, zone_node_column='bike_node_id',
+)
+bike_times_geo = overhead.add_origin_cell_overhead(
+    bike_times_geo, bike_pairs_geo, cells, 'bike_overhead_s',
+)
+print(bike_times_geo)
+
+
+# %% [markdown]
+# ## 12. Cross-modal accessibility (time domain): nearest-*k* via fastest mode
+#
+# With walk and bike costs both available, the simplest cross-modal
+# accessibility metric is **"what's the mean time to the 3 nearest
+# supermarkets, *if a traveller always picks whichever mode is fastest
+# for each destination*"**. Walking wins the very short trips (no
+# overhead); cycling wins the longer ones (speed dominates once the
+# setup time has been amortised).
+#
+# **Why this needs in-loop aggregation across modes** — and *not* a
+# simple "average the per-mode nearest-k results" shortcut:
+#
+# - Computing per-mode nearest-k separately and combining double-counts
+#   supermarkets reachable by both modes and loses the "pick fastest"
+#   semantics entirely.
+# - The right answer requires taking `min(walk_cost, bike_cost)` for
+#   *every OD pair* before applying the nearest-k aggregator.
+#
+# `od_pairs.aggregate_across_modes` does exactly that: it unions the
+# per-mode OD pair sets per origin and applies the per-OD aggregator
+# (here: elementwise min across modes, treating unreachable as inf).
+
+# %%
+def fastest_mode_cost(stacked: np.ndarray) -> np.ndarray:
+    """Per-OD elementwise min cost across modes.
+
+    Stacked shape: `(n_modes, n_dests)`. NaN entries (mode-unreachable
+    for that OD pair) are treated as inf so the min picks any
+    reachable mode. Returns inf for OD pairs no mode can reach.
+    """
+    finite_stack = np.where(np.isnan(stacked), np.inf, stacked)
+    return finite_stack.min(axis=0)
+
+
+fastest_pairs, fastest_times = od_pairs.aggregate_across_modes(
+    {'walk': (pairs_geo, times_geo),
+     'bike': (bike_pairs_geo, bike_times_geo)},
+    aggregator=fastest_mode_cost,
+)
+sm_weights_fastest = od_pairs.dest_values_geo(
+    'supermarkets', fastest_pairs, cells, zones=zones,
+)
+acc_nk_fastest = accessibility.nearest_k(
+    fastest_times, {'supermarkets': sm_weights_fastest},
+    cell_to_zone, ks=[1, 3, 5],
+)
+acc_nk_fastest.head()
+
+# %% [markdown]
+# Visualise: walking-only nearest-3 (from §8) vs cross-modal "fastest-
+# mode" nearest-3, on a shared scale (minutes, lower = better). The
+# bike-helps map (right) should be uniformly faster than walk-only
+# (left); the gap reveals where cycling earns its overhead back.
+
+# %%
+viz.plot_cell_values_comparison(
+    cells,
+    {'Walking only — mean time to 3 nearest supermarkets (min)':
+         acc_nk[(3, 'supermarkets')] / 60,
+     'Walk *or* bike, whichever is fastest (min)':
+         acc_nk_fastest[(3, 'supermarkets')] / 60},
+    suptitle='Nearest-3 accessibility — lower = better',
+    cmap='viridis_r',
+    overlays=[(supermarkets, {'color': 'red', 'markersize': 8})],
+)
+plt.show()
+
+
+# %% [markdown]
+# ## 13. Utility-based accessibility (walking)
 #
 # Building on the path-first primitive: define a per-mode *utility* function
 # combining travel cost and per-edge route features, then derive
@@ -584,22 +787,20 @@ plt.show()
 #          + Σ_o β_o · feature_o(i)                  (origin features)
 #          + Σ_d β_d · feature_d(j)                  (destination features)
 #
-# For walking, we'll use a small example spec: time has a cost coefficient
-# (less time = better), and the road class along the route has a moderately
-# negative coefficient (pedestrian-friendly routes preferred over busy roads).
+# For walking, the simplest possible spec: a small fixed constant
+# (representing the trivial setup cost of just leaving the building) and a
+# strong negative time coefficient (every minute of walking really costs
+# you something).
+#
+#     U_walk = −2 − 1 · (t_walk / 60)
+#
+# Time in seconds is divided by 60 so the coefficient is per *minute* of
+# walking — a more interpretable unit than per-second.
 
 # %%
 walking_utility = utility.Utility(
-    constant=0.0,
-    cost_coefficient=-0.01,  # utils per second — ≈ -0.6 per minute of walking
-    route_features=[
-        utility.RouteFeature(
-            name='road_class',
-            attribute=edge_road_class,   # reuses the callable defined above
-            coefficient=-0.2,            # less utility on busier streets
-            aggregator='mean',
-        ),
-    ],
+    constant=-2.0,
+    cost_coefficient=-1.0 / 60.0,    # utils per second (= −1 per minute walking)
 )
 
 # %% [markdown]
@@ -617,8 +818,7 @@ route_u
 # **Step 2**: add the constant + origin + destination components. This
 # example has neither origin nor destination features in the utility (the
 # destination "attractiveness" enters via the supermarket weight in the
-# gravity step below), and constant = 0, so this is essentially a no-op —
-# included for completeness of the workflow.
+# gravity step below), so this just adds the −2 constant.
 
 # %%
 full_u = utility.add_endpoint_utility(route_u, pairs, walking_utility, cells=cells)
@@ -673,7 +873,7 @@ logsum_accessibility.head()
 viz.plot_cell_values(
     cells, logsum_accessibility,
     title=('Logsum accessibility to supermarkets (walking)\n'
-           'utility = −0.01·time − 0.2·mean_road_class; less negative = better access'),
+           'utility = −2 − 1·(time/60); less negative = better access'),
     overlays=[(supermarkets,
                {'color': 'red', 'markersize': 10, 'edgecolor': 'black'})],
 )
@@ -682,325 +882,115 @@ plt.show()
 
 
 # %% [markdown]
-# ### Cross-modal logsum
+# ## 14. Bike utility with a route-feature
 #
-# The walk-only logsum above is the single-mode special case of the canonical
-# discrete-choice accessibility:
+#     U_bike = −4 − 0.7 · (t_bike / 60) + 0.7 · mean_bike_score_on_path
 #
-#     A_i = ln Σ_j W_j Σ_m exp(U_ijm)
+# - **Constant −4**: non-trivial setup before any trip (walk to bike,
+#   unlock, helmet — bigger than walking's −2).
+# - **Time coefficient −0.7 / minute**: time costs disutility, but less
+#   per minute than walking (−1). Cycling time is less unpleasant than
+#   walking time minute-for-minute.
+# - **Route-feature coefficient +0.7 on mean bike-friendliness score**:
+#   the score is 1 (worst) to 5 (best), combining road tier and OSM
+#   cycleway infrastructure tags. Highest scores require either a
+#   dedicated cycle path or a quiet road with explicit bike provision;
+#   busy roads with no infrastructure score 1. Positive coefficient =
+#   bike-friendlier routes raise utility.
 #
-# §14 below demonstrates the *cross-modal* case: walking + driving combined
-# via `od_pairs.aggregate_across_modes` at the geo-unit level. Aperta
-# computes this natively across modes that live on different network graphs
-# — one of the architectural distinctions called out in the paper.
-
-
-# %% [markdown]
-# ## 12. Adding a car mode (on a separate network graph)
-#
-# Cross-modal accessibility — combining walking and driving into a single
-# "best-mode" measure — is one of aperta's distinguishing capabilities. The
-# `TieredODGeoPairs` data structure and `aggregate_across_modes` helper let
-# us route each mode on its own graph (different node IDs, different edge
-# attributes) and then combine at the geo-unit level where IDs align.
-#
-# This section adds a driving network, computes density-adjusted edge travel
-# times and a density-based parking penalty, then routes + lifts + bakes
-# car-side overheads in the same pattern as walking.
-
-# %% [markdown]
-# ### 12.1 Fetch and snap the driving network
+# `RouteFeature` triggers `tiered_path_aggregate` internally — one
+# routing pass returns both the cost and the per-OD-pair averaged
+# bike score along the realised path. The bike network, snapping, and
+# `bike_pairs` were already built in §11; the utility step reuses them.
 
 # %%
-car_graph = ox.graph_from_place(PLACE, network_type='drive', simplify=True)
-car_graph = ox.project_graph(car_graph, to_crs=boundary_proj_crs)
-print(f"Car network: {car_graph.number_of_nodes():,} nodes, "
-      f"{car_graph.number_of_edges():,} edges")
+def edge_bike_score(u, v, data) -> float:
+    """Per-edge bike-friendliness, 1 (worst) to 5 (best for cycling).
 
-# Per-cell snapping (centroid → nearest car-network node), capturing the
-# centroid→node distance for the per-cell first-mile overhead below.
-cells['car_node_id'], car_dist_to_node = network_processing.snap_to_network_nodes(
-    cell_centroids_gdf, car_graph,
-)
+    Combines road tier (quieter = better) with OSM bicycle-infrastructure
+    tags. Dedicated cycleways score 5 outright; otherwise the base score
+    comes from road tier (inverse of `edge_road_class`: pedestrian = 5,
+    residential = 4, ..., primary/motorway = 1), with a +1 / +2 bonus
+    for cycleway lane / track on the road, capped at 5.
+    """
+    h = data.get('highway')
+    if isinstance(h, list):
+        h = h[0] if h else None
+    # Dedicated bike infrastructure wins outright.
+    if h == 'cycleway' or data.get('bicycle') == 'designated':
+        return 5.0
+    # Base score = inverse of road tier (1..5 → 5..1).
+    base = 6 - int(edge_road_class(u, v, data))
+    # Bonus for any cycleway infrastructure tagged on this road.
+    cw = (data.get('cycleway')
+          or data.get('cycleway:left')
+          or data.get('cycleway:right'))
+    if isinstance(cw, list):
+        cw = cw[0] if cw else None
+    if cw in ('track', 'opposite_track'):
+        bonus = 2
+    elif cw:                  # 'lane', 'shared', 'opposite_lane', etc.
+        bonus = 1
+    else:
+        bonus = 0
+    return float(min(5, base + bonus))
 
-# Zone snapping via transport centroid (same tier-aware logic as for walk).
-# The 'drive' filter excludes pedestrian-only paths upfront, so eligible
-# zone-snap targets are any tier-2-through-5 nodes.
-car_node_road_class = network_processing.aggregate_edges_to_nodes(
-    car_graph, edge_attribute=edge_road_class, aggregator='max',
-)
-car_eligible_nodes = car_node_road_class[
-    (car_node_road_class >= 2) & (car_node_road_class <= 5)
-].index
-zones['car_node_id'], _ = network_processing.assign_to_eligible_centroid(
-    zones, car_graph, eligible_node_ids=car_eligible_nodes,
-)
 
-# %% [markdown]
-# ### 12.2 Building density around each car-network node
-#
-# Two car-mode features depend on local density: travel speed (denser =
-# slower) and origin overhead (parking time rises with density). Both come
-# from a single "buildings within R metres of each node" measure, computed
-# in one KDTree pass over the building centroids we already downloaded.
-#
-# Density is a deliberately simple proxy here; the *calibration* notebook
-# (a separate, more advanced example) covers fitting realistic edge weights
-# from empirical travel-time data.
-
-# %%
-BUFFER_M = 200.0  # neighbourhood scale: count buildings within 200 m
-
-# Convert graph nodes to a point GeoDataFrame so we can pass them as targets
-# to `aggregate_within_radius`. OSMnx's `graph_to_gdfs(edges=False)` does
-# exactly this: index = node IDs, geometry = node positions.
-car_nodes_gdf = ox.graph_to_gdfs(car_graph, edges=False)
-car_node_density = geo_processing.aggregate_within_radius(
-    targets=car_nodes_gdf, sources=buildings,
-    radius=BUFFER_M, return_density=True, name='density',
-)
-# Per-edge density: average of endpoint node densities.
-for u, v, k, data in car_graph.edges(keys=True, data=True):
-    data['density'] = 0.5 * (car_node_density[u] + car_node_density[v])
-
-# Normalise density to [0, 1] for use as a penalty factor. Using the 95th
-# percentile (not the max) so a handful of outlier nodes don't compress the
-# rest of the distribution into the bottom of the scale.
-_d_high = float(car_node_density.quantile(0.95)) or 1e-9
-car_node_density_norm = (car_node_density / _d_high).clip(upper=1.0)
-print(f"Car-node density (buildings/m²): "
-      f"5-95 pct [{car_node_density.quantile(0.05):.5f}, "
-      f"{car_node_density.quantile(0.95):.5f}]")
-
-# %% [markdown]
-# ### 12.3 Density-adjusted car edge travel times
-#
-# OSMnx fills in baseline speed limits per edge from OSM `maxspeed` tags
-# (with sensible fallbacks per highway class) via `add_edge_speeds`. We then
-# apply a density penalty:
-#
-#     effective_kph = speed_limit_kph × max(DENSITY_FLOOR, 1 − α · density_norm)
-#
-# floored at `DENSITY_FLOOR` of the speed limit so peak-density edges don't
-# collapse to zero speed.
-
-# %%
-ox.add_edge_speeds(car_graph)
-ALPHA_DENSITY = 0.6   # speed reduction strength
-DENSITY_FLOOR = 0.3   # never go below 30 % of speed limit
-
-for u, v, k, data in car_graph.edges(keys=True, data=True):
-    speed_kph = float(data['speed_kph'])
-    edge_density_norm = float(data['density']) / _d_high
-    factor = max(DENSITY_FLOOR, 1.0 - ALPHA_DENSITY * min(edge_density_norm, 1.0))
-    effective_kph = speed_kph * factor
-    data['car_time_s'] = float(data['length']) / (effective_kph * 1000 / 3600)
-
-# %% [markdown]
-# ### 12.4 Car overheads — first-mile + density-based parking
-#
-# Per-cell origin overhead has two components:
-#
-# - **Centroid → assigned car node**, divided by a slow neighbourhood
-#   driving speed (≈ 5 m/s — capturing the "back out of the driveway and
-#   crawl to the main road" portion of any trip).
-# - **Parking penalty at the assigned node**: a baseline plus a density-
-#   scaled term (dense cells → harder to park).
-
-# %%
-CAR_INIT_SPEED_MS = 5.0     # slow neighbourhood driving speed
-PARKING_BASE_S = 30.0       # baseline parking-search time
-PARKING_DENSITY_S = 90.0    # additional parking time at peak density
-
-cells['car_centroid_to_node_s'] = car_dist_to_node / CAR_INIT_SPEED_MS
-car_parking_penalty_s = (
-    PARKING_BASE_S + PARKING_DENSITY_S * car_node_density_norm
-)
-cells['car_overhead_s'] = (
-    cells['car_centroid_to_node_s']
-    + cells['car_node_id'].map(car_parking_penalty_s).fillna(PARKING_BASE_S)
-)
-print(f"Car overhead per cell: mean {cells['car_overhead_s'].mean():.1f}s, "
-      f"5-95 pct [{cells['car_overhead_s'].quantile(0.05):.1f}, "
-      f"{cells['car_overhead_s'].quantile(0.95):.1f}]")
-
-# %% [markdown]
-# ### 12.5 Car routing pipeline (mirrors the walk pipeline of §5–§11)
-
-# %%
-# Build car OD pairs and route.
-car_pairs = od_pairs.get_pairs(
-    cells, r_cells=R_CELLS, node_column='car_node_id',
-    zones=zones, r_zones=R_ZONES,
-)
-car_times = routing.tiered_path_costs(car_pairs, car_graph, weight='car_time_s')
-print(car_times)
-
-# Build the car utility spec. Same structure as the walk one but with a
-# smaller (in magnitude) road-class coefficient — cars typically prefer
-# arterial roads, opposite preference to pedestrians.
-car_utility = utility.Utility(
-    constant=0.0,
-    cost_coefficient=-0.01,
+bike_utility = utility.Utility(
+    constant=-4.0,
+    cost_coefficient=-0.7 / 60.0,    # utils per second (= −0.7 per minute)
     route_features=[
         utility.RouteFeature(
-            name='road_class',
-            attribute=edge_road_class,
-            coefficient=-0.05,  # weaker penalty than walking (-0.2)
+            name='bike_score_avg',
+            attribute=edge_bike_score,
+            coefficient=0.7,
             aggregator='mean',
         ),
     ],
 )
-car_route_u = utility.route_utility(
-    car_pairs, car_graph, cost_weight='car_time_s', utility=car_utility,
+bike_route_u = utility.route_utility(
+    bike_pairs, bike_graph, cost_weight='bike_time_s', utility=bike_utility,
 )
-car_full_u = utility.add_endpoint_utility(
-    car_route_u, car_pairs, car_utility, cells=cells,
+bike_full_u = utility.add_endpoint_utility(
+    bike_route_u, bike_pairs, bike_utility, cells=cells,
 )
 
-# Lift the car utility ODM to geo-keyed form, then bake the per-cell car
-# origin overhead (in utility units: β_cost · car_overhead_s).
-car_pairs_geo, car_full_u_geo = od_pairs.reindex_by_geo_unit(
-    car_pairs, car_full_u, cells,
-    cell_node_column='car_node_id',
-    zones=zones, zone_node_column='car_node_id',
+# Lift to geo-keyed form (pairs_geo from §11 would be identical, so we
+# discard the one returned here); bake the per-cell bike origin overhead
+# in utility units (β_cost · bike_overhead_s).
+_, bike_full_u_geo = od_pairs.reindex_by_geo_unit(
+    bike_pairs, bike_full_u, cells,
+    cell_node_column='bike_node_id',
+    zones=zones, zone_node_column='bike_node_id',
 )
-cells['car_util_overhead'] = car_utility.cost_coefficient * cells['car_overhead_s']
-car_full_u_geo = overhead.add_origin_cell_overhead(
-    car_full_u_geo, car_pairs_geo, cells, 'car_util_overhead',
+cells['bike_util_overhead'] = bike_utility.cost_coefficient * cells['bike_overhead_s']
+bike_full_u_geo = overhead.add_origin_cell_overhead(
+    bike_full_u_geo, bike_pairs_geo, cells, 'bike_util_overhead',
 )
 
 
 # %% [markdown]
-# ## 13. Destination overheads (last-mile)
+# ## 15. Cross-modal logsum accessibility (walk + bike, utility domain)
 #
-# §7's `add_origin_cell_overhead` baked the **origin-side** overhead (each
-# cell's first-mile from centroid to its network node) into the walking
-# cost ODM. The symmetric **destination-side** overhead — the last-mile
-# from the destination network node to the actual destination cell — is
-# also material, especially for **short trips** where it consumes a real
-# fraction of the total cost.
+# The canonical cross-modal logsum accessibility:
 #
-# `add_geo_overheads` applies destination overheads at each tier directly
-# by unit ID (no node-ID re-keying):
-#
-# - **cell-tier dest** (`dest_cell=`): per-cell last-mile = each cell's own
-#   first-mile (here `car_overhead_s`, which itself bundles the centroid →
-#   node driving time plus a parking penalty). Passed directly from `cells`.
-# - **zone-tier dest** (`dest_zone=`): per-zone last-mile = average over
-#   cells in the zone of (Euclidean centroid distance / speed + each cell's
-#   own first-mile), computed via
-#   `aggregate_dest_overhead_per_group_euclidean`.
-#
-# We illustrate with the **car** mode and a **gravity** accessibility
-# metric (continuous, on a shared scale across the two panels). Gravity is
-# better than a cumulative threshold for this comparison: every OD pair
-# contributes via `exp(-β · cost)`, so the overhead's impact varies
-# *multiplicatively* across the map. Cells with longer routed times to
-# begin with see a larger relative penalty from the same added overhead,
-# making the spatial pattern of "where overhead bites hardest" easy to
-# read.
-
-# %%
-# Build a car cost ODM WITHOUT any overheads — pure routed driving time,
-# lifted to geo-keyed form. (`car_full_u_geo` from §12 already has origin
-# overhead baked in, but that's a *utility* ODM; for the comparison we
-# need a clean *cost* ODM to start from.)
-_, car_times_geo_raw = od_pairs.reindex_by_geo_unit(
-    car_pairs, car_times, cells,
-    cell_node_column='car_node_id',
-    zones=zones, zone_node_column='car_node_id',
-)
-
-# Per-zone destination overhead for the car mode.
-zones['car_dest_overhead_s'] = overhead.aggregate_dest_overhead_per_group_euclidean(
-    cells, zones, speed=CAR_INIT_SPEED_MS,
-    group_id_column='zone_id', cell_overhead_column='car_overhead_s',
-)
-print(f"Per-zone car destination overhead: "
-      f"mean {zones['car_dest_overhead_s'].mean():.1f}s, "
-      f"5–95 pct [{zones['car_dest_overhead_s'].quantile(0.05):.1f}, "
-      f"{zones['car_dest_overhead_s'].quantile(0.95):.1f}]")
-
-# %%
-# Apply BOTH origin and destination overheads on top of the raw car costs.
-car_times_geo_full = overhead.add_origin_cell_overhead(
-    car_times_geo_raw, car_pairs_geo, cells, 'car_overhead_s',
-)
-car_times_geo_full = overhead.add_geo_overheads(
-    car_times_geo_full, car_pairs_geo,
-    dest_cell=cells['car_overhead_s'],
-    dest_zone=zones['car_dest_overhead_s'],
-)
-
-# %% [markdown]
-# Compute gravity (β = 0.005, ≈ 2 min half-life) on both cost ODMs and
-# render side-by-side.
-
-# %%
-# Destination weights aligned to the car pairs.
-sm_weights_car = od_pairs.dest_values_geo(
-    'supermarkets', car_pairs_geo, cells, zones=zones,
-)
-# Floor the raw ODM's intrazonal cost: cell-self-pair at cost 0 would
-# otherwise contribute exp(-β·0) = 1 to the gravity sum, drowning out
-# the rest. The "with overhead" ODM has finite self-pair cost already
-# (origin + dest overheads on both sides), so no flooring there.
-car_times_geo_raw_floored = routing.set_min_intrazonal_cost(
-    car_times_geo_raw, min_cost=30.0)
-
-car_decay = accessibility.exp_decay('beta_005', 0.005)
-gravity_car_raw = accessibility.gravity(
-    car_times_geo_raw_floored, {'supermarkets': sm_weights_car},
-    cell_to_zone, car_decay,
-)
-gravity_car_full = accessibility.gravity(
-    car_times_geo_full, {'supermarkets': sm_weights_car},
-    cell_to_zone, car_decay,
-)
-
-# %%
-viz.plot_cell_values_comparison(
-    cells,
-    {'Without overheads\n(pure routed driving time)':
-         gravity_car_raw[('beta_005', 'supermarkets')],
-     'With origin + destination overheads\n(first-mile + parking)':
-         gravity_car_full[('beta_005', 'supermarkets')]},
-    suptitle=('Gravity accessibility to supermarkets by car '
-              '(β = 0.005, ≈ 2 min half-life)'),
-    overlays=[(supermarkets, {'color': 'red', 'markersize': 8})],
-)
-plt.show()
-
-
-# %% [markdown]
-# The "with overhead" map is uniformly dimmer — every OD pair gets the
-# overhead added, and `exp(-β · overhead)` multiplies the contribution by
-# roughly `exp(-0.005 · 180 s) ≈ 0.41` for a typical ~3-minute combined
-# origin + destination overhead. Spatial variation in the penalty is
-# visible too: central cells in dense areas eat the highest parking
-# penalty on BOTH the origin and the destination side, so they lose
-# relatively more accessibility than suburban cells.
-#
-# Beyond the cumulative metric, the same `car_times_geo_full` ODM feeds into
-# any other accessibility primitive — gravity, nearest-*k*, utility, logsum —
-# unchanged. The destination overhead is a one-time augmentation of the cost
-# ODM that propagates through the whole pipeline.
-
-
-# %% [markdown]
-# ## 14. Cross-modal logsum accessibility (walk + car)
+#     A_i = ln Σ_j W_j Σ_m exp(U_ijm)
 #
 # Combine the per-mode utility ODMs into a single combined ODM via
-# `aggregate_across_modes` with a custom utility-domain logsum aggregator.
-# The result expresses, per OD pair, the "expected max utility" across
-# modes: `ln Σ_m exp(U_ijm)`. Downstream gravity-on-utility + log produces
-# the canonical cross-modal logsum accessibility per cell.
+# `aggregate_across_modes` with a custom utility-domain logsum aggregator,
+# then apply gravity-on-utility + log to get one logsum scalar per origin.
 #
-# `aggregate_across_modes` unions the per-mode origin sets and the per-origin
-# dest sets — for OD pairs reachable by one mode but not the other, the
-# missing mode is treated as `inf` cost (NaN-and-inf-tolerant inside the
-# aggregator).
+# **Note on equivalence with the per-mode shortcut.** Unlike the
+# cross-modal nearest-*k* in §12 (where the in-loop min was load-bearing),
+# the gravity-on-utility logsum is algebraically `ln(Σ_m G_im)` where
+# `G_im = Σ_j W_j · exp(U_ijm)` is the per-mode gravity-on-utility — i.e.
+# you could compute per-mode logsum accessibilities and then `log` the sum
+# of `exp`s, and get the same answer (a sum-order swap). The in-loop
+# pattern below is here for API consistency with §12, dest-set-union
+# handling, and skipping an `exp → log → exp → log` round-trip — not
+# because the equivalence breaks. For cumulative-opportunity or nearest-*k*
+# cross-modal accessibility the in-loop aggregation is the *only*
+# mathematically correct path.
 
 # %%
 def logsum_utility(stacked: np.ndarray) -> np.ndarray:
@@ -1017,16 +1007,16 @@ def logsum_utility(stacked: np.ndarray) -> np.ndarray:
         return np.log(sum_exp)
 
 
-# Combine the walk + car utility ODMs at the geo-unit level.
+# Combine the walk + bike utility ODMs at the geo-unit level.
 combined_u_pairs, combined_u = od_pairs.aggregate_across_modes(
     {'walk': (pairs_geo, full_u_geo),
-     'car':  (car_pairs_geo, car_full_u_geo)},
+     'bike': (bike_pairs_geo, bike_full_u_geo)},
     aggregator=logsum_utility,
 )
 print(combined_u_pairs)
 
 # Destination weights aligned to the UNION dest set (combined_u_pairs may
-# include cells reachable from some origins by car but not by walk, or
+# include cells reachable from some origins by bike but not by walk, or
 # vice versa — sm_weights from §7 was built against `pairs_geo` only).
 sm_weights_combined = od_pairs.dest_values_geo(
     'supermarkets', combined_u_pairs, cells, zones=zones,
@@ -1034,7 +1024,6 @@ sm_weights_combined = od_pairs.dest_values_geo(
 
 # Gravity-on-utility: Σ_j W_j · exp(combined_u_ij) = Σ_j W_j · Σ_m exp(U_ijm).
 # Then log → canonical cross-modal logsum accessibility per cell.
-exp_utility_decay = accessibility.Decay('exp_u', np.exp)
 gravity_combined = accessibility.gravity(
     combined_u, {'supermarkets': sm_weights_combined}, cell_to_zone,
     exp_utility_decay,
@@ -1045,15 +1034,15 @@ cross_modal_logsum = np.log(
 cross_modal_logsum.head()
 
 # %% [markdown]
-# Visualisation: side-by-side walking-only logsum (from §11) and the
-# cross-modal walking-or-driving logsum, on a shared colour scale. Cells
-# where neither mode reaches any supermarket appear as missing (light grey).
+# Visualisation: side-by-side walking-only logsum (from §13) and the
+# cross-modal walking-or-cycling logsum, on a shared colour scale. Cells
+# where neither mode reaches any supermarket appear as missing.
 
 # %%
 viz.plot_cell_values_comparison(
     cells,
     {'Walking-only logsum': logsum_accessibility,
-     'Cross-modal logsum (walking or driving)': cross_modal_logsum},
+     'Cross-modal logsum (walking or cycling)': cross_modal_logsum},
     suptitle='Logsum accessibility to supermarkets — less negative = better',
     overlays=[(supermarkets,
                {'color': 'red', 'markersize': 10, 'edgecolor': 'black'})],
@@ -1065,10 +1054,10 @@ plt.show()
 # The cross-modal map is uniformly *less negative* (better) than walking-only
 # — adding a second mode can only expand reachability. The gap is largest in
 # cells far from any supermarket: walking-only sees long travel times (very
-# negative utility, so very small contribution to the gravity sum), but
-# driving brings them within practical reach. In dense central cells with
-# many walkable supermarkets, the walking utility already dominates the
-# modal sum and the cross-modal addition is small.
+# negative utility, very small contribution to the gravity sum), but cycling
+# brings them within practical reach. In dense central cells with many
+# walkable supermarkets, the walking utility already dominates the modal
+# sum and the cross-modal addition is small.
 #
 # Architectural notes:
 #
@@ -1077,13 +1066,12 @@ plt.show()
 #   level via `TieredODGeoPairs`.
 # - Per-mode origin overhead is baked into the per-mode utility ODM
 #   *before* aggregation, so the cross-modal logsum sees the right
-#   mode-specific first-mile cost (walking time at 1.4 m/s vs slow driving
-#   at 5 m/s + parking penalty).
+#   mode-specific first-mile cost (walking at 1.4 m/s vs cycling with a
+#   30-second unlock setup).
 # - `aggregate_across_modes` unions the per-origin dest sets across modes
-#   and fills missing entries with `inf` (mode-unreachable). For our toy
-#   example walk and car cover roughly the same Cambridge cells, but at
-#   country scale this matters — different modes naturally reach different
-#   sub-graphs.
+#   and fills missing entries with `inf` (mode-unreachable). For our example,
+#   walk and bike cover roughly the same Central Paris cells, but at country
+#   scale this matters — different modes naturally reach different sub-graphs.
 # - Destination-side overheads (last-mile, also mode-specific) are NOT
 #   baked into the utility ODMs in this minimal example. A production
 #   analysis would add them via `add_geo_overheads(dest_cell=...,

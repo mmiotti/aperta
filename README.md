@@ -61,33 +61,45 @@ The extended example splits its prep across five notebooks and its analysis acro
 | 5. Estimate travel costs | [calibrate_edge_weights.ipynb](examples/extended/calibrate_edge_weights.ipynb) (calibrates the model); each analysis notebook applies edge times inline |
 | 6. Calculate accessibilities | [accessibility.ipynb](examples/extended/accessibility.ipynb) |
 
-For the *full* workflow in one notebook, see [examples/minimal/accessibility.ipynb](examples/minimal/accessibility.ipynb) — single-mode, ~10-minute end-to-end Cambridge example.
+Runnable examples, in increasing depth:
+
+- [examples/quickstart/quickstart.ipynb](examples/quickstart/quickstart.ipynb) — what aperta does in ~40 lines using only OpenStreetMap. Cambridge MA, ~10 s.
+- [examples/minimal/accessibility.ipynb](examples/minimal/accessibility.ipynb) — guided tour of every primitive; multi-modal walk + car, cross-modal logsum, path-first per-edge feature aggregation. Central Paris, ~15 min end-to-end.
+- [examples/extended/](examples/extended/) — production-scale Bern + 25 km: prep pipeline, calibration against observed travel times, traffic-flow estimation, accessibility analysis. ~30 min.
 
 The toy-world end-to-end test in [tests/test_workflow.py](tests/test_workflow.py) doubles as the smallest possible walk-through (~150 lines, runs in a second).
 
 ## Quick example
 
+A walking-accessibility map in ~40 lines using only OSM. One aperta call per phase:
+
 ```python
-import networkx as nx
-from aperta import routing
+import osmnx as ox
+from aperta import (accessibility, geo_mapping, geo_processing,
+                    network_processing, od_pairs, routing, visualization)
 
-# Tiny graph: A -> B -> C, plus a more expensive shortcut A -> C
-g = nx.MultiDiGraph()
-g.add_edge('A', 'B', length=10.0, cost=1.0)
-g.add_edge('B', 'C', length=10.0, cost=1.0)
-g.add_edge('A', 'C', length=30.0, cost=3.0)
+# 1. AOI + walking network
+boundary = ox.geocode_to_gdf('Cambridge, Massachusetts, USA')
+crs = boundary.estimate_utm_crs()
+graph = ox.project_graph(ox.graph_from_place('Cambridge, MA', 'walk'), to_crs=crs)
 
-# Single-source distances from A (all reachable nodes)
-print(routing.shortest_distances_from(g, 'A', weight='cost'))
-# -> {'A': 0, 'B': 1.0, 'C': 2.0}
+# 2. H3 cells (origins) + supermarkets (destinations)
+cells = geo_processing.build_h3_grid(boundary.geometry.iloc[0], 10,
+                                      polygon_crs='EPSG:4326', target_crs=crs)
+cells['node_id'], _ = network_processing.snap_to_network_nodes(centroids, graph)
+cells['supermarkets'] = ...   # OSM POIs counted per cell
 
-# One-to-one routing for a list of trips
-res = routing.shortest_path_metrics_one_to_one(
-    g, trip_ids=['t1'], origins=['A'], destinations=['C'], weight='cost')
-print(res)
-#     distance  cost
-# t1      20.0   2.0
+# 3. Tiered OD pairs + routing
+pairs = od_pairs.get_pairs(cells, r_cells=2000.0, node_column='node_id')
+times = routing.tiered_path_costs(pairs, graph, weight='walk_time_s')
+
+# 4. Accessibility
+sm_weights = od_pairs.dest_values('supermarkets', pairs, cells, node_column='node_id')
+acc = accessibility.count_in_bins(times, {'supermarkets': sm_weights}, {},
+                                   [accessibility.Bin('15min', 0, 15 * 60)])
 ```
+
+Runnable end-to-end version: [examples/quickstart/quickstart.ipynb](examples/quickstart/quickstart.ipynb).
 
 ## Modules
 
