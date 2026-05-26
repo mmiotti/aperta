@@ -44,7 +44,11 @@ aperta is organised around a six-phase workflow. Every module slots into one of 
 5. **Estimate travel costs** — `routing.tiered_path_costs` / `routing.tiered_path_aggregate` (Dijkstra on any networkx graph) + `overhead.add_node_overheads` / `add_geo_overheads` / `add_origin_cell_overhead`. Plus `utility.route_utility` / `add_endpoint_utility` for utility-based costs.
 6. **Calculate accessibilities** — `accessibility.count_in_bins`, `accessibility.gravity`, `accessibility.nearest_k`. Cross-modal: `od_pairs.aggregate_across_modes` on per-mode `TieredODGeoPairs`, then any accessibility primitive on the combined ODM.
 
-`tests/test_workflow.py` is the runnable ~150-line minimal example showing the full workflow on a toy world; it doubles as the integration test. `examples/minimal/accessibility.ipynb` is the canonical end-to-end real-world example (Cambridge MA, walk + car + cross-modal logsum).
+Two runnable examples:
+
+- **`tests/test_workflow.py`** — the ~150-line toy-world walk-through. Doubles as the integration test.
+- **`examples/minimal/accessibility.ipynb`** — quickstart with real OSM data (Cambridge MA, ~10 min). Hello-world of aperta.
+- **`examples/extended/`** — multi-modal accessibility for Bern + 25 km, with published-paper calibration for edge weights. Four standalone notebooks: prep, accessibility, traffic-flow estimation, edge-weight calibration. Each demonstrates one library capability on real data; each stands alone (no pipeline coupling — see [aperta-lab/projects/lumos/](https://github.com/mmiotti/aperta-lab/tree/main/src/projects/lumos) for a production-stack example).
 
 ## Quick example
 

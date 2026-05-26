@@ -1,0 +1,11 @@
+﻿,walk,bicycle,bicycle,bicycle,car,car,car
+,,regular,ebike25,ebike45,night,offpeak,peak
+alpha_up,2.4,3.1,1.5,1.3,0,0,0
+alpha_down,0.1,-0.3,-0.3,-0.3,0,0,0
+beta_density,0,0,0,0,0,-0.20,-0.45
+beta_intersection_4,0,7,7,7,5,6,6
+beta_traffic_signal,0,1,1,1,4,10,16
+overhead_orig_const,49,74,74,74,52,52,52
+overhead_dest_const,49,74,74,74,52,52,52
+overhead_orig_density,0,66,66,66,128,128,128
+overhead_dest_density,0,2,2,2,153,153,153
