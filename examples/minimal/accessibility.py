@@ -524,7 +524,7 @@ plt.show()
 # extractor and an aggregator.
 costs, path_aggs = routing.tiered_path_aggregate(
     pairs, graph, weight='walk_time_s',
-    aggregations=[
+    edge_aggregations=[
         routing.PathAggregation('mean_road_class', edge_road_class, 'mean'),
     ],
 )

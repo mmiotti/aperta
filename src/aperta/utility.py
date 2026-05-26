@@ -176,7 +176,8 @@ def route_utility(
             for rf in utility.route_features
         ]
         costs, aggs = tiered_path_aggregate(
-            pairs, graph, cost_weight, path_aggs,
+            pairs, graph, cost_weight,
+            edge_aggregations=path_aggs,
             mask=mask, dtype=dtype,
         )
     else:

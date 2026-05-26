@@ -129,17 +129,17 @@ seed_area_km2 = seed_polygon.area / 1e6
 print(f"{LOCATION_LABEL} seed area: {seed_area_km2:.1f} km²")
 
 # %%
-# AOI = seed + 5 km, smoothed. The buffer rounds the outer boundary; the
+# AOI = seed + 10 km, smoothed. The buffer rounds the outer boundary; the
 # simplify pass drops sub-200 m features that survive the buffer. Result is
 # a clean polygon with O(50) vertices.
-AOI_BUFFER_M = 5_000
+AOI_BUFFER_M = 10_000
 SMOOTH_TOLERANCE_M = 200
 
 aoi_polygon = seed_polygon.buffer(AOI_BUFFER_M).simplify(SMOOTH_TOLERANCE_M)
 print(f"AOI area:                {aoi_polygon.area / 1e6:.1f} km²")
 
-# Destination polygon = AOI + 25 km. This is what we fetch raw data for.
-DEST_BUFFER_M = 25_000
+# Destination polygon = AOI + 30 km. This is what we fetch raw data for.
+DEST_BUFFER_M = 30_000
 dest_polygon = aoi_polygon.buffer(DEST_BUFFER_M).simplify(SMOOTH_TOLERANCE_M)
 print(f"Destination area:        {dest_polygon.area / 1e6:.1f} km²")
 

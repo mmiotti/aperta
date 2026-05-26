@@ -15,11 +15,17 @@ The library is organized around a six-phase workflow:
                               `network_processing.get_*_betweenness*`.
   5. Estimate travel costs  — `routing.tiered_path_costs` /
                               `routing.tiered_path_aggregate` (Dijkstra on any
-                              networkx graph) + the `overhead` module
+                              networkx graph; the latter also aggregates
+                              per-edge / per-node features along realised
+                              routes via `PathAggregation` / `NodeAggregation`)
+                              + the `overhead` module
                               (`add_node_overheads` for node-keyed,
                               `add_geo_overheads` / `add_origin_cell_overhead`
                               for geo-keyed). `utility.route_utility` +
                               `add_endpoint_utility` for utility-based costs.
+                              `routing.aggregate_along_paths` is the path-walker
+                              primitive when you have a pre-computed list of
+                              paths rather than a `TieredODPairs`.
   6. Calculate accessibility — `accessibility.count_in_bins` (cumulative),
                                `accessibility.gravity`, `accessibility.nearest_k`.
                                Cross-modal: combine per-mode `TieredODGeoPairs`

@@ -504,10 +504,51 @@ class PathAggregation(NamedTuple):
     aggregator: str | Callable = 'sum'
 
 
+class NodeAggregation(NamedTuple):
+    """Named per-node feature aggregation along realised shortest paths.
+
+    Parallel to `PathAggregation` but for node attributes (e.g. counting
+    traffic signals encountered, or finding the highest-elevation node
+    along a route). The node sequence of a path is `[u₀, u₁, ..., uₙ]`;
+    `include_endpoints` controls whether the route's origin (u₀) and
+    destination (uₙ) nodes contribute.
+
+    `name`, `aggregator`: as in `PathAggregation`.
+
+    `attribute`:
+        - `str`: name of a node attribute on the graph; the per-node value
+          is `node_data[attribute]`.
+        - `Callable[(node, data) -> float]`: arbitrary per-node function.
+
+    `include_endpoints`:
+        - `True` (default): all `n+1` nodes contribute, including origin
+          and destination. Risk: endpoints shared across many routes get
+          amplified weight in cross-route counts.
+        - `False`: interior nodes only (`u₁ .. uₙ₋₁`). Self-pair `[u]` and
+          single-edge path `[u, v]` both yield an empty array → aggregator
+          empty-path semantics apply (`'sum'` → 0; `'mean'/'min'/'max'`
+          → NaN).
+    """
+    name: str
+    attribute: str | Callable
+    aggregator: str | Callable = 'sum'
+    include_endpoints: bool = True
+
+
 def _resolve_attribute(attr: str | Callable) -> Callable:
-    """Normalise an `attribute` spec into `(u, v, data) -> value`."""
+    """Normalise an edge `attribute` spec into `(u, v, data) -> value`."""
     if isinstance(attr, str):
         return lambda u, v, data: data[attr]
+    if callable(attr):
+        return attr
+    raise ValueError(
+        f"`attribute` must be a string or callable, got {type(attr).__name__}.")
+
+
+def _resolve_node_attribute(attr: str | Callable) -> Callable:
+    """Normalise a node `attribute` spec into `(node, data) -> value`."""
+    if isinstance(attr, str):
+        return lambda node, data: data[attr]
     if callable(attr):
         return attr
     raise ValueError(
@@ -535,62 +576,72 @@ def _resolve_aggregator(agg: str | Callable) -> Callable:
         f"or a callable.")
 
 
-@timeit
-def tiered_path_aggregate(
-    pairs: TieredODPairs,
+def aggregate_along_paths(
+    paths: list[list],
     graph: nx.Graph,
     weight: str,
-    aggregations: list[PathAggregation],
     *,
-    mask: TieredODPairs | None = None,
+    edge_aggregations: list[PathAggregation] = (),
+    node_aggregations: list[NodeAggregation] = (),
     dtype: np.dtype | type = np.float64,
-) -> tuple[TieredODPairs, dict[str, TieredODPairs]]:
-    """Route shortest paths and aggregate per-edge attributes along each path.
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Walk realised paths and aggregate per-edge / per-node features along each.
 
-    For every OD pair: routes the shortest path under `weight`, walks the
-    realised edges, and aggregates each entry in `aggregations` into a per-OD
-    scalar. Memory cost is the same as `tiered_path_costs` for the cost
-    component — paths are processed per-origin and discarded.
+    Pure path walker — no routing, no igraph dependency. Use this directly
+    when you already have a list of paths (Strava traces, prebuilt routes,
+    calibration targets, etc.). `tiered_path_aggregate` is the wrapper that
+    routes shortest paths on a `TieredODPairs` and scatters results back
+    into per-tier `TieredODPairs` outputs.
 
-    For the cost-only case (no per-edge aggregations needed), use
-    `tiered_path_costs` directly: it can skip path retrieval (which is more
-    expensive than distance retrieval) and is faster.
+    For each path:
+      - `cost`     = sum of `weight` along the path's edges
+      - each `PathAggregation` reduces per-edge attribute values
+      - each `NodeAggregation` reduces per-node attribute values
+
+    `paths` semantics:
+      - `[]`           → unreachable: cost=`inf`, all aggs=`NaN`
+      - `[u]`          → self-pair: cost=0, edge aggs follow empty-array
+                         semantics, node aggs follow each spec's
+                         `include_endpoints` setting
+      - `[u, v, ...]`  → multi-node path; cost + aggs walked normally
 
     Args:
-        pairs, graph, weight, mask, dtype: as in `tiered_path_costs`.
-        aggregations: list of `PathAggregation` specs. The returned dict has
-            one `TieredODPairs` per spec, keyed by spec name. Spec names must
-            be unique.
+        paths: list of node-id sequences (lists). Node IDs must match
+            `graph` keys.
+        graph: networkx graph used for edge / node attribute lookup. For
+            MultiGraph / MultiDiGraph the min-`weight` parallel edge is
+            used (matches the router's choice).
+        weight: edge attribute name used as the per-edge cost.
+        edge_aggregations: list of `PathAggregation` specs (per-edge).
+        node_aggregations: list of `NodeAggregation` specs (per-node).
+            At least one of `edge_aggregations` / `node_aggregations` must
+            be non-empty. Names must be unique across both lists.
+        dtype: dtype of returned arrays (default `np.float64`).
 
     Returns:
         `(costs, aggregations_by_name)`:
-            - `costs`: `TieredODPairs` of routing costs (sum of `weight` along
-              the realised path). Same shape and conventions as
-              `tiered_path_costs`. Unreachable / masked-out destinations are
-              `np.inf`.
-            - `aggregations_by_name`: `dict[name -> TieredODPairs]`. Each
-              TieredODPairs holds per-OD aggregated scalars. Unreachable /
-              masked-out destinations are `np.nan` (not `inf`, since
-              aggregations may be signed or already use `inf` semantics).
-
-    For OSMnx-style MultiDiGraphs with multiple parallel edges between the
-    same `(u, v)` pair, the edge with the lowest `weight` is used for both
-    cost computation and attribute extraction (matching the router's choice).
-
-    For self-pairs (origin == destination, path length 0): cost is 0.0,
-    aggregations follow each aggregator's empty-array semantics — `'sum'`
-    returns 0.0, `'mean'` / `'min'` / `'max'` return NaN.
+            - `costs`: ndarray of shape `(len(paths),)`. `inf` for
+              unreachable; `0.0` for self-pairs.
+            - `aggregations_by_name`: dict `{name -> ndarray}` with one
+              entry per spec across both lists. Unreachable destinations
+              are `NaN`.
     """
-    if not aggregations:
+    if not edge_aggregations and not node_aggregations:
         raise ValueError(
-            "`aggregations` must be non-empty. For cost-only routing, use "
-            "`tiered_path_costs` instead.")
-    names = [a.name for a in aggregations]
+            "At least one of `edge_aggregations` / `node_aggregations` must be "
+            "non-empty. For cost-only routing, use `tiered_path_costs` instead.")
+    edge_aggregations = list(edge_aggregations)
+    node_aggregations = list(node_aggregations)
+    names = [a.name for a in edge_aggregations] + [a.name for a in node_aggregations]
     if len(set(names)) != len(names):
-        raise ValueError(f"`aggregations` names must be unique; got {names}.")
+        raise ValueError(
+            f"Aggregation names must be unique across edge + node specs; got {names}.")
 
-    attr_fns = [_resolve_attribute(a.attribute) for a in aggregations]
-    agg_fns = [_resolve_aggregator(a.aggregator) for a in aggregations]
+    edge_attr_fns = [_resolve_attribute(a.attribute) for a in edge_aggregations]
+    edge_agg_fns = [_resolve_aggregator(a.aggregator) for a in edge_aggregations]
+    node_attr_fns = [_resolve_node_attribute(a.attribute) for a in node_aggregations]
+    node_agg_fns = [_resolve_aggregator(a.aggregator) for a in node_aggregations]
+    node_include_endpoints = [a.include_endpoints for a in node_aggregations]
     is_multi = isinstance(graph, (nx.MultiGraph, nx.MultiDiGraph))
 
     def _get_edge(u, v):
@@ -600,6 +651,114 @@ def tiered_path_aggregate(
                        key=lambda d: d.get(weight, np.inf))
         return graph[u][v]
 
+    n = len(paths)
+    n_edge = len(edge_aggregations)
+    n_node = len(node_aggregations)
+    costs = np.full(n, np.inf, dtype=dtype)
+    edge_out = [np.full(n, np.nan, dtype=dtype) for _ in range(n_edge)]
+    node_out = [np.full(n, np.nan, dtype=dtype) for _ in range(n_node)]
+
+    for i, path in enumerate(paths):
+        if not path:
+            continue  # unreachable: cost=inf, aggs=NaN (both preallocated)
+
+        n_edges = len(path) - 1
+        edge_vals = np.empty((n_edge, n_edges), dtype=dtype)
+        cost_sum = 0.0
+        valid = True
+        for k in range(n_edges):
+            u, v = path[k], path[k + 1]
+            try:
+                edge = _get_edge(u, v)
+            except KeyError:
+                valid = False
+                break
+            cost_sum += float(edge.get(weight, np.inf))
+            for j, attr_fn in enumerate(edge_attr_fns):
+                edge_vals[j, k] = float(attr_fn(u, v, edge))
+        if not valid:
+            continue
+
+        costs[i] = cost_sum
+        for j, agg_fn in enumerate(edge_agg_fns):
+            edge_out[j][i] = float(agg_fn(edge_vals[j]))
+        for j, attr_fn in enumerate(node_attr_fns):
+            nodes = path if node_include_endpoints[j] else path[1:-1]
+            if nodes:
+                node_vals = np.fromiter(
+                    (float(attr_fn(node, graph.nodes[node])) for node in nodes),
+                    dtype=dtype, count=len(nodes))
+            else:
+                node_vals = np.empty(0, dtype=dtype)
+            node_out[j][i] = float(node_agg_fns[j](node_vals))
+
+    aggs: dict[str, np.ndarray] = {}
+    for spec, arr in zip(edge_aggregations, edge_out):
+        aggs[spec.name] = arr
+    for spec, arr in zip(node_aggregations, node_out):
+        aggs[spec.name] = arr
+    return costs, aggs
+
+
+@timeit
+def tiered_path_aggregate(
+    pairs: TieredODPairs,
+    graph: nx.Graph,
+    weight: str,
+    *,
+    edge_aggregations: list[PathAggregation] = (),
+    node_aggregations: list[NodeAggregation] = (),
+    mask: TieredODPairs | None = None,
+    dtype: np.dtype | type = np.float64,
+) -> tuple[TieredODPairs, dict[str, TieredODPairs]]:
+    """Route shortest paths and aggregate per-edge / per-node features along each.
+
+    Wraps `aggregate_along_paths` with igraph-backed routing on every tier
+    of `pairs`. Memory cost matches `tiered_path_costs` for the cost
+    component — paths are processed per-origin and discarded.
+
+    For the cost-only case (no aggregations needed), use `tiered_path_costs`
+    directly: it can skip path retrieval (more expensive than distance
+    retrieval) and is faster.
+
+    Args:
+        pairs, graph, weight, mask, dtype: as in `tiered_path_costs`.
+        edge_aggregations: list of `PathAggregation` specs (per-edge).
+        node_aggregations: list of `NodeAggregation` specs (per-node).
+            At least one of the two must be non-empty. Names must be unique
+            across both lists.
+
+    Returns:
+        `(costs, aggregations_by_name)`:
+            - `costs`: `TieredODPairs` of routing costs (sum of `weight`
+              along the realised path). Same shape and conventions as
+              `tiered_path_costs`. Unreachable / masked-out destinations
+              are `np.inf`.
+            - `aggregations_by_name`: `dict[name -> TieredODPairs]`. One
+              entry per spec (edge + node), keyed by spec name. Unreachable
+              / masked-out destinations are `np.nan` (not `inf`, since
+              aggregations may be signed or already use `inf` semantics).
+
+    For OSMnx-style MultiDiGraphs with multiple parallel edges between the
+    same `(u, v)` pair, the edge with the lowest `weight` is used for both
+    cost computation and attribute extraction (matching the router's choice).
+
+    For self-pairs (origin == destination, path length 0): cost is 0.0,
+    edge aggregations follow each aggregator's empty-array semantics
+    (`'sum'` → 0.0; `'mean'`/`'min'`/`'max'` → NaN), node aggregations
+    depend on each spec's `include_endpoints` setting.
+    """
+    if not edge_aggregations and not node_aggregations:
+        raise ValueError(
+            "At least one of `edge_aggregations` / `node_aggregations` must be "
+            "non-empty. For cost-only routing, use `tiered_path_costs` instead.")
+    edge_aggregations = list(edge_aggregations)
+    node_aggregations = list(node_aggregations)
+    names = [a.name for a in edge_aggregations] + [a.name for a in node_aggregations]
+    if len(set(names)) != len(names):
+        raise ValueError(
+            f"Aggregation names must be unique across edge + node specs; got {names}.")
+
     # Per-origin path retrieval via igraph (vectorised C engine). Returns a
     # list of node-id lists, one per dest, [] when unreachable.
     from aperta.network_processing import ig_from_networkx_with_idx_maps
@@ -608,9 +767,8 @@ def tiered_path_aggregate(
     ig_to_nx = idx_maps['node_ig_to_nx']
 
     def _paths(orig, sub_dests):
-        # Zero-edge graph short-circuit (same reason as in tiered_path_costs):
-        # igraph raises on missing weight attribute when the graph has no
-        # edges. Self-pair → [orig]; everyone else → [] (unreachable).
+        # Zero-edge graph short-circuit: igraph raises on missing weight
+        # attribute when the graph has no edges. Self-pair → [orig]; others → [].
         if h.ecount() == 0:
             return [[orig] if d == orig else [] for d in sub_dests]
         ig_orig = nx_to_ig[orig]
@@ -618,67 +776,49 @@ def tiered_path_aggregate(
         paths_ig = h.get_shortest_paths(ig_orig, to=ig_dests, weights=weight)
         return [[ig_to_nx[v] for v in p] for p in paths_ig]
 
-    n_agg = len(aggregations)
-
     def _per_origin(orig, dests, dest_mask):
         n = len(dests)
         cost_arr = np.full(n, np.inf, dtype=dtype)
-        agg_arr = np.full((n_agg, n), np.nan, dtype=dtype)
+        agg_arrs = {name: np.full(n, np.nan, dtype=dtype) for name in names}
         if n == 0:
-            return cost_arr, agg_arr
+            return cost_arr, agg_arrs
         if dest_mask is None:
             active_idx = np.arange(n)
             active_dests = dests
         else:
             active_idx = np.where(dest_mask)[0]
             if len(active_idx) == 0:
-                return cost_arr, agg_arr
+                return cost_arr, agg_arrs
             active_dests = dests[active_idx]
 
         paths = _paths(orig, active_dests)
-        for slot, path in zip(active_idx, paths):
-            if not path:
-                # Unreachable — keep cost=inf, aggregations=NaN.
-                continue
-            n_edges = len(path) - 1
-            # Walk the edges, gathering cost and per-aggregation per-edge values.
-            edge_vals = np.empty((n_agg, n_edges), dtype=dtype) if n_edges else None
-            cost_sum = 0.0
-            valid = True
-            for k in range(n_edges):
-                u, v = path[k], path[k + 1]
-                try:
-                    edge = _get_edge(u, v)
-                except KeyError:
-                    valid = False
-                    break
-                cost_sum += float(edge.get(weight, np.inf))
-                for j, attr_fn in enumerate(attr_fns):
-                    edge_vals[j, k] = float(attr_fn(u, v, edge))
-            if not valid:
-                continue
-            cost_arr[slot] = cost_sum
-            for j, agg_fn in enumerate(agg_fns):
-                vals = edge_vals[j] if edge_vals is not None else np.empty(0, dtype=dtype)
-                agg_arr[j, slot] = float(agg_fn(vals))
-        return cost_arr, agg_arr
+        sub_costs, sub_aggs = aggregate_along_paths(
+            paths, graph, weight,
+            edge_aggregations=edge_aggregations,
+            node_aggregations=node_aggregations,
+            dtype=dtype,
+        )
+        cost_arr[active_idx] = sub_costs
+        for name in names:
+            agg_arrs[name][active_idx] = sub_aggs[name]
+        return cost_arr, agg_arrs
 
     logging.info("tiered_path_aggregate: routing on igraph backend...")
 
     def _process(tier_name: str, tier: dict | None,
-                 mask_tier: dict | None) -> tuple[dict, list[dict]] | None:
+                 mask_tier: dict | None) -> tuple[dict, dict[str, dict]] | None:
         if tier is None:
             return None
         n = len(tier)
         log_every = max(1, n // 10)
         cost_out: dict = {}
-        agg_outs: list[dict] = [{} for _ in range(n_agg)]
+        agg_outs: dict[str, dict] = {name: {} for name in names}
         for i, (orig, dests) in enumerate(tier.items(), start=1):
             dest_mask = mask_tier.get(orig) if mask_tier is not None else None
-            cost_arr, agg_arr = _per_origin(orig, dests, dest_mask)
+            cost_arr, agg_arrs = _per_origin(orig, dests, dest_mask)
             cost_out[orig] = cost_arr
-            for j in range(n_agg):
-                agg_outs[j][orig] = agg_arr[j]
+            for name in names:
+                agg_outs[name][orig] = agg_arrs[name]
             if i % log_every == 0 or i == n:
                 logging.info(f"  {tier_name}: {i:,} of {n:,} origins routed")
         return cost_out, agg_outs
@@ -691,26 +831,18 @@ def tiered_path_aggregate(
     zones_res = _process('zones_to_zones', pairs.zones_to_zones, zones_mask)
     z2r_res = _process('zones_to_regions', pairs.zones_to_regions, z2r_mask)
 
-    def _tier(res, idx):
-        """Pull tier `idx` from `_process`'s output; `None` if the tier wasn't routed."""
-        if res is None:
-            return None
-        if idx == -1:
-            return res[0]  # cost dict
-        return res[1][idx]  # aggregation dict for spec `idx`
-
     costs = TieredODNodePairs(
-        cells_to_cells=_tier(cells_res, -1) if cells_res is not None else {},
-        zones_to_zones=_tier(zones_res, -1),
-        zones_to_regions=_tier(z2r_res, -1),
+        cells_to_cells=cells_res[0] if cells_res is not None else {},
+        zones_to_zones=zones_res[0] if zones_res is not None else None,
+        zones_to_regions=z2r_res[0] if z2r_res is not None else None,
     )
     aggregations_by_name = {
-        names[j]: TieredODNodePairs(
-            cells_to_cells=_tier(cells_res, j) if cells_res is not None else {},
-            zones_to_zones=_tier(zones_res, j),
-            zones_to_regions=_tier(z2r_res, j),
+        name: TieredODNodePairs(
+            cells_to_cells=cells_res[1][name] if cells_res is not None else {},
+            zones_to_zones=zones_res[1][name] if zones_res is not None else None,
+            zones_to_regions=z2r_res[1][name] if z2r_res is not None else None,
         )
-        for j in range(n_agg)
+        for name in names
     }
     return costs, aggregations_by_name
 
