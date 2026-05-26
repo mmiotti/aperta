@@ -14,13 +14,13 @@
 # ---
 
 # %% [markdown]
-# # Swiss calibration — car edge weights against observed trip times
+# # Calibrate car edge weights against observed trip times
 #
 # Iteratively calibrates the per-edge duration formula for cars against
-# Google-Maps-derived point-to-point travel times. Uses the consolidated
-# car graph from `prepare/1_download.ipynb` (already carries per-node
-# `is_traffic_signal`, `is_degree_3`, `is_degree_4`) and the H3 cells
-# from `prepare/3_aggregate_to_cells.ipynb` (for per-node density).
+# Google-Maps-derived point-to-point travel times. All inputs come from
+# `prepare/`: the consolidated car graph (`prepare/1_download` for
+# topology + intersection / signal flags + OSM speeds) and per-edge
+# `density_norm` (`prepare/5_density`).
 #
 # **Calibration model** (see `aperta.calibration` module docstring):
 #
@@ -32,28 +32,17 @@
 #           + constant
 # ```
 #
-# `baseline_time` is the per-edge length / speed using OSM `maxspeed` +
-# per-highway-class fallback (same `HWY_SPEEDS` as `prepare/4_edge_weights`).
+# `baseline_time` is per-edge `length / speed_kph` (with `speed_kph`
+# from OSM `maxspeed` + per-highway fallback, set in `prepare/1_download`).
 # This stays unchanged across iterations — the calibration learns the
 # multiplicative correction `α` and the per-feature coefficients.
 #
-# **Features used here** (all already on the consolidated graph + cells —
-# `prepare/4_edge_weights` uses the same set):
-#
-# | Feature                | Kind               | Per-edge unit |
-# |------------------------|--------------------|---------------|
-# | `density_norm`         | multiplier         | dimensionless |
-# | `is_degree_3`          | additive_route     | "per edge ≥3-way" |
-# | `is_degree_4`          | additive_route     | "per edge ≥4-way" |
-# | `is_traffic_signal`    | additive_route     | "per signalised edge" |
-# | `density_norm` (node)  | additive_endpoint  | secs per density at orig + dest |
-# | `snap_dist_orig/_dest` | additive_endpoint  | secs per metre of first-mile |
-#
-# **Ground truth**: Google-Maps `car_pessimistic.csv` (~50 k legs), columns
-# `orig_x, orig_y, dest_x, dest_y, time_measured, dist_measured, dist_line`.
-# Origin coordinates are derived from the protected MTMC survey, so this
-# specific data file isn't public — the workflow itself is the reusable
-# part. Replacement data with the same schema would slot in directly.
+# **Ground truth**: Google-Maps `car_pessimistic.csv` (~50 k legs),
+# columns `orig_x, orig_y, dest_x, dest_y, time_measured, dist_measured,
+# dist_line`. Origin coordinates are derived from the protected MTMC
+# survey, so this specific data file isn't public — the workflow itself
+# is the reusable part. Replacement data with the same schema would slot
+# in directly.
 
 # %%
 import warnings
@@ -97,74 +86,28 @@ print(f"Ground-truth legs: {len(legs):,} "
 
 
 # %% [markdown]
-# ## 2. Baseline speed per edge (km/h)
+# ## 2. Per-edge features (from prep)
 #
-# `ox.add_edge_speeds` reads OSM `maxspeed` where available and falls back
-# to a per-highway-class default. Same dict as `prepare/4_edge_weights`.
+# All features used by the calibration formula below are already on the
+# graph from the prep notebooks:
+#
+# - `speed_kph` per edge (from `prepare/1_download`)
+# - `density_norm`, `is_degree_4`, `is_traffic_signal` per edge (from
+#   `prepare/5_density`)
+#
+# The calibration library function casts these from string-loaded
+# graphml values internally, so no manual cast is needed here. Just a
+# diagnostic.
 
 # %%
-HWY_SPEEDS = {
-    'motorway': 120, 'motorway_link': 80,
-    'trunk': 100,    'trunk_link': 60,
-    'primary': 80,   'primary_link': 50,
-    'secondary': 50, 'secondary_link': 40,
-    'tertiary': 50,  'tertiary_link': 40,
-    'unclassified': 50,
-    'residential': 30,
-    'living_street': 20,
-    'service': 30,
-    'road': 30,
-    'busway': 30,
-}
-ox.add_edge_speeds(car_graph, hwy_speeds=HWY_SPEEDS)
 speeds = np.array([float(d['speed_kph'])
                    for _, _, d in car_graph.edges(data=True)])
-print(f"Baseline edge speeds: median {np.median(speeds):.0f} km/h, "
+print(f"Baseline car edge speeds: median {np.median(speeds):.0f} km/h, "
       f"range {speeds.min():.0f}–{speeds.max():.0f} km/h.")
 
 
 # %% [markdown]
-# ## 3. Per-node density + propagate features to edges
-#
-# - **Density**: sqrt((pop+emp per km² within 1 km) / 10 000); same formula
-#   as `prepare/4_edge_weights`.
-# - **Intersection + signal flags**: already on the consolidated graph
-#   from `prepare/1_download` as integer flags (`is_degree_3` /
-#   `is_degree_4` / `is_traffic_signal`).
-#
-# For features that need to enter the calibration as a *per-edge*
-# attribute (multiplier or additive_route), we propagate the per-node value
-# to the edge via the mean of its two endpoints — same logic as
-# `prepare/4_edge_weights`.
-
-# %%
-# 3a. Per-node density.
-node_xy = gpd.GeoDataFrame(
-    {'node_id': list(car_graph.nodes)},
-    geometry=[Point(float(car_graph.nodes[n]['x']),
-                    float(car_graph.nodes[n]['y']))
-              for n in car_graph.nodes],
-    crs=CRS_METRIC,
-).set_index('node_id')
-raw_per_m2 = geo_processing.aggregate_within_radius(
-    targets=node_xy, sources=cells, radius=1000.0,
-    weight_column='pop_plus_emp', return_density=True,
-)
-node_density = np.sqrt(raw_per_m2 * 100.0)
-for nid in car_graph.nodes:
-    car_graph.nodes[nid]['density_norm'] = float(node_density.loc[nid])
-print(f"Per-node density_norm: median {node_density.median():.3f}, "
-      f"P95 {node_density.quantile(0.95):.3f}.")
-
-# 3b. Propagate per-node features to edges (mean of endpoints).
-for u, v, k, data in car_graph.edges(keys=True, data=True):
-    u_a, v_a = car_graph.nodes[u], car_graph.nodes[v]
-    for f in ('density_norm', 'is_degree_3', 'is_degree_4', 'is_traffic_signal'):
-        data[f] = 0.5 * (float(u_a.get(f, 0.0)) + float(v_a.get(f, 0.0)))
-
-
-# %% [markdown]
-# ## 4. Calibrate
+# ## 3. Calibrate
 #
 # Three feature classes enter the OLS fit:
 #
@@ -203,7 +146,7 @@ result = calibration.calibrate_edge_weights(
 
 
 # %% [markdown]
-# ## 5. Results
+# ## 4. Results
 
 # %%
 print(f"\nR² = {result.r_squared:.4f}   "
@@ -218,7 +161,7 @@ print(result.iter_log.round(4).to_string())
 
 
 # %% [markdown]
-# ## 6. Observed vs predicted
+# ## 5. Observed vs predicted
 
 # %%
 fig, axes = plt.subplots(1, 2, figsize=(13, 6))

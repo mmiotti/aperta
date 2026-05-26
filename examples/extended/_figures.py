@@ -3,11 +3,15 @@
 Pure presentation code — graph + data → matplotlib figure. Lives here
 rather than inline in each notebook so the notebook flow stays focused
 on the substantive (`what aperta does, and how`) bits. Project-specific
-styling (Swiss highway-tier line widths, capacity table, Bern crop) that
-isn't generic enough to belong in `aperta.visualization`.
+styling (highway-tier line widths, capacity table) that isn't generic
+enough to belong in `aperta.visualization`.
 
 Generic primitives — `plot_edge_values`, `add_styled_colorbar` — are in
 `aperta.visualization` and used by the wrappers here.
+
+Location-specific parameters (crop centre, zoom width, label) are
+passed in by the calling notebook rather than hardcoded here, so the
+showcase retargets cleanly when the seed location changes.
 
 Underscore prefix on the module name flags it as project-internal —
 not a tutorial example to read, just helpers the notebooks call.
@@ -49,11 +53,6 @@ CAPACITY_PER_LANE = {
     'road': 9000, 'busway': 6000,
 }
 DEFAULT_CAPACITY = 9000
-
-# Standard Bern crop window for accessibility cell maps (LV95, metres).
-BERN_CX, BERN_CY = 2_600_000, 1_199_000
-BERN_ZOOM_HALF = 3_500  # 7 × 7 km window
-
 
 def edge_highway(d) -> str | None:
     """Flatten OSM `highway` tag (may be list-valued post-merge) to a single str."""
@@ -143,11 +142,13 @@ def plot_network_map(
     ax.set_xticks([]); ax.set_yticks([])
 
 
-def plot_bern_cell_map(
+def plot_cell_map_cropped(
     ax,
     cells: gpd.GeoDataFrame,
     values: pd.Series,
     *,
+    crop_center_xy: tuple[float, float],
+    crop_half_m: float,
     cmap='viridis',
     vmin: float | None = None,
     vmax: float | None = None,
@@ -155,16 +156,19 @@ def plot_bern_cell_map(
     title: str,
     label: str = '',
 ):
-    """Plot per-cell `values` on a Bern-cropped 7 × 7 km window.
+    """Plot per-cell `values` on a square-cropped window.
 
     Square + framed (axes spines visible, ticks hidden), height-matched
-    colour bar, deterministic crop. Wraps `viz.plot_cell_values` with
-    the accessibility-notebook aesthetic.
+    colour bar. Wraps `viz.plot_cell_values` with the accessibility-
+    notebook aesthetic.
 
     Args:
         ax: target matplotlib axes.
         cells: GeoDataFrame indexed by cell_id with `geometry`.
         values: per-cell values (Series indexed by cell_id).
+        crop_center_xy: `(x, y)` centre of the crop in the cells' CRS.
+        crop_half_m: half-width of the square crop, in the cells' CRS
+            distance units. `(crop_half_m * 2)²` is the visible area.
         cmap: matplotlib colormap.
         vmin, vmax: explicit colour range. If both `None`, auto-derived
             from `values`.
@@ -185,14 +189,15 @@ def plot_bern_cell_map(
         cells, values, ax=ax, cmap=cmap, vmin=vmin, vmax=vmax,
         legend=False,
     )
-    # Restore frame, hide ticks, square aspect, crop to Bern window.
+    # Restore frame, hide ticks, square aspect, crop to requested window.
     ax.set_axis_on()
     for s in ax.spines.values():
         s.set_visible(True)
     ax.set_xticks([]); ax.set_yticks([])
     ax.set_aspect('equal')
-    ax.set_xlim(BERN_CX - BERN_ZOOM_HALF, BERN_CX + BERN_ZOOM_HALF)
-    ax.set_ylim(BERN_CY - BERN_ZOOM_HALF, BERN_CY + BERN_ZOOM_HALF)
+    cx, cy = crop_center_xy
+    ax.set_xlim(cx - crop_half_m, cx + crop_half_m)
+    ax.set_ylim(cy - crop_half_m, cy + crop_half_m)
     ax.set_title(title)
     viz.add_styled_colorbar(ax, cmap=plt.get_cmap(cmap) if isinstance(cmap, str)
                             else cmap,

@@ -14,9 +14,16 @@
 # ---
 
 # %% [markdown]
-# # Swiss prep notebook 3: Aggregate to H3 cells
+# # Prep notebook 3: Build H3 cells/zones/regions and map them to networks
 #
-# Builds the cell-level GeoDataFrame consumed by `accessibility.ipynb`.
+# Two related concerns in one notebook:
+#
+# 1. **Aggregate data to H3 cells** (and roll up to zones / regions).
+#    Sets up the geo-unit hierarchy that downstream notebooks consume.
+# 2. **Snap each unit to network nodes** for each of the three networks
+#    (walk, bike, car). Pre-computes the `node_id_*` + `snap_dist_*`
+#    columns that downstream OD-pair construction needs.
+#
 # Aggregates the four data layers prepared in notebooks 1 & 2 onto an
 # H3 hex grid:
 #
@@ -69,6 +76,8 @@ import numpy as np
 import pandas as pd
 import rasterio
 from shapely.geometry import Polygon
+
+from aperta import network_processing
 
 warnings.filterwarnings('ignore', category=FutureWarning)
 warnings.filterwarnings('ignore', category=UserWarning, module='geopandas')
@@ -283,13 +292,57 @@ regions = _build_tier('region_id', 'region_id')
 
 
 # %% [markdown]
-# ## 7. Save outputs
+# ## 7. Snap units to network nodes — per network
+#
+# For each tier (cells, zones, regions), find the nearest node on each
+# of the three networks (walk, bike, car). Result is stored as
+# per-mode columns (`node_id_walk`, `node_id_bike`, `node_id_car`,
+# plus `snap_dist_*` in metres) — keeping all three in one DataFrame
+# means downstream OD-pair construction just passes the right
+# `node_column=` argument.
+#
+# Snap distances are reused downstream as the cell-to-network-node
+# first-mile / last-mile component of trip overheads.
+
+# %%
+walk_graph = network_processing.load_consolidated_graphml(
+    PREPARED_DIR / 'walk_graph.graphml')
+bike_graph = network_processing.load_consolidated_graphml(
+    PREPARED_DIR / 'bike_graph.graphml')
+car_graph  = network_processing.load_consolidated_graphml(
+    PREPARED_DIR / 'car_graph.graphml')
+
+
+def snap_layer_to_all_networks(layer: gpd.GeoDataFrame) -> None:
+    """Mutate `layer` to add node-id + snap-distance columns for each network."""
+    centroids = layer.copy()
+    centroids['geometry'] = centroids.geometry.centroid
+    for graph, label in [(walk_graph, 'walk'),
+                         (bike_graph, 'bike'),
+                         (car_graph,  'car')]:
+        nid, dist = network_processing.snap_to_network_nodes(centroids, graph)
+        layer[f'node_id_{label}'] = nid
+        layer[f'snap_dist_{label}'] = dist
+
+
+for layer, name in [(cells, 'cells'), (zones, 'zones'), (regions, 'regions')]:
+    snap_layer_to_all_networks(layer)
+    print(f"  Snapped {name}: "
+          f"walk {layer['node_id_walk'].notna().sum():>6,} "
+          f"(median dist {layer['snap_dist_walk'].median():.0f} m), "
+          f"bike {layer['node_id_bike'].notna().sum():>6,}, "
+          f"car  {layer['node_id_car'].notna().sum():>6,}")
+
+
+# %% [markdown]
+# ## 8. Save outputs
 #
 # - `cells.gpkg` — cell-indexed GeoDataFrame with geometry + every
-#   aggregated attribute column + `zone_id` + `region_id` linkers.
+#   aggregated attribute column + `zone_id` + `region_id` linkers +
+#   `node_id_{walk,bike,car}` + `snap_dist_{walk,bike,car}`.
 #   Consumed directly by `accessibility.ipynb`.
-# - `zones.gpkg` — zone-indexed GeoDataFrame; same data columns as
-#   `cells`, sum-aggregated from cells.
+# - `zones.gpkg` — zone-indexed GeoDataFrame; same data + node-id
+#   columns as `cells`, sum-aggregated for data columns.
 # - `regions.gpkg` — region-indexed GeoDataFrame; same shape as zones.
 # - `building_to_cell.csv` — `building_id → cell_id` mapping. Used to
 #   port cell-level accessibility metrics back to individual buildings
@@ -310,7 +363,7 @@ print(f"  building_to_cell.csv    ({len(buildings):,} rows)")
 
 
 # %% [markdown]
-# ## 8. Validation + visualisation
+# ## 9. Validation
 #
 # Cross-tier validation: the sum-aggregation is exact, so per-data-column
 # totals are identical across the three tiers (and match the input
@@ -330,12 +383,16 @@ for col, input_total in [
           f"{regions[col].sum():>10,.0f}    "
           f"{input_total:>10,.0f}")
 
+
 # %% [markdown]
-# Three-tier coverage visualisation. Same data column (population) at
-# each H3 resolution — shows the progressive aggregation from
-# fine-grained cells (95k) to coarse regions (~50). Useful for
-# eyeballing tier coverage and the implicit "AOI vs destination buffer"
-# resolution trade-off in aperta's tiered OD design.
+# ## Appendix: visualisation
+#
+# Two optional figures. First: the same data (population) at all three
+# H3 tiers — shows the progressive aggregation from fine-grained cells
+# (~95k) to coarse regions (~50). Useful for eyeballing tier coverage
+# and the resolution trade-off in aperta's tiered OD design. Second:
+# per-cell triptych showing population, employment density, and total
+# POI count side by side.
 
 # %%
 fig, axes = plt.subplots(1, 3, figsize=(18, 7))
@@ -358,9 +415,6 @@ plt.suptitle('Population at three H3 tiers — aperta cells / zones / regions',
              y=1.02, fontsize=12)
 plt.tight_layout()
 plt.show()
-
-# %% [markdown]
-# Per-cell triptych: population, employment density, total POI count.
 
 # %%
 fig, axes = plt.subplots(1, 3, figsize=(18, 7))

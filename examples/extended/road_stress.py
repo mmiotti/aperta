@@ -82,6 +82,10 @@ PREPARED_DIR = Path('data/prepared')
 GROUND_TRUTH_DIR = Path('data/ground_truth')
 CRS_METRIC = 'EPSG:2056'
 
+# Short name for plot titles + prints. Keep in sync with `LOCATION_LABEL`
+# in `prepare/1_download.py`.
+LOCATION_LABEL = 'Bern'
+
 
 # %% [markdown]
 # ## 1. Load inputs
@@ -195,51 +199,20 @@ for tier_col, label in [('is_highway', 'highway'), ('is_main', 'main'),
 # %% [markdown]
 # ## 3. Build the (fixed) routing inputs
 #
-# Everything that *doesn't* depend on the three calibrated parameters
-# goes here, computed once. The expensive bits — routes, costs — are
-# reused across all parameter scans.
-#
-# Mirrors `road_stress.ipynb` sections 2–4. Could be factored into a
-# shared helper if duplication grows; for now it's cheaper to copy.
+# Everything that *doesn't* depend on calibrated parameters goes here.
+# The expensive routing happens once and gets reused across all
+# simulation runs.
 
 # %%
-HWY_SPEEDS = {
-    'motorway': 120, 'motorway_link': 80,
-    'trunk': 100,    'trunk_link': 60,
-    'primary': 80,   'primary_link': 50,
-    'secondary': 50, 'secondary_link': 40,
-    'tertiary': 50,  'tertiary_link': 40,
-    'unclassified': 50, 'residential': 30,
-    'living_street': 20, 'service': 30,
-    'road': 30, 'busway': 30,
-}
-ox.add_edge_speeds(car_graph, hwy_speeds=HWY_SPEEDS)
-
-node_xy = gpd.GeoDataFrame(
-    {'node_id': list(car_graph.nodes)},
-    geometry=[Point(float(car_graph.nodes[n]['x']),
-                    float(car_graph.nodes[n]['y']))
-              for n in car_graph.nodes],
-    crs=CRS_METRIC,
-).set_index('node_id')
-raw_per_m2 = geo_processing.aggregate_within_radius(
-    targets=node_xy, sources=cells, radius=1000.0,
-    weight_column='pop_plus_emp', return_density=True,
-)
-node_density = np.sqrt(raw_per_m2 * 100.0)
-for nid in car_graph.nodes:
-    car_graph.nodes[nid]['density_norm'] = float(node_density.loc[nid])
-
+# Initial per-edge durations — features from prep: `speed_kph` (1_download),
+# `density_norm`, `is_degree_4`, `is_traffic_signal` (5_density).
 KMH_TO_MS = 1.0 / 3.6
 INITIAL_MULT = {'density_norm': -0.45}
 INITIAL_ADD = {'is_degree_4': 2.6, 'is_traffic_signal': 4.4}
 for u, v, k, d in car_graph.edges(keys=True, data=True):
-    u_a, v_a = car_graph.nodes[u], car_graph.nodes[v]
-    for f in ('density_norm', 'is_degree_4', 'is_traffic_signal'):
-        d[f] = 0.5 * (float(u_a.get(f, 0.0)) + float(v_a.get(f, 0.0)))
     base = float(d['length']) / (float(d['speed_kph']) * KMH_TO_MS)
-    mult_term = base * sum(c * d[f] for f, c in INITIAL_MULT.items())
-    add_term = sum(c * d[f] for f, c in INITIAL_ADD.items())
+    mult_term = base * sum(c * float(d[f]) for f, c in INITIAL_MULT.items())
+    add_term = sum(c * float(d[f]) for f, c in INITIAL_ADD.items())
     d['duration_initial'] = max(base + mult_term + add_term, base * 0.2)
 
 # OD pairs (zones as cells, regions as zones — see road_stress.ipynb).
@@ -293,7 +266,6 @@ print(f"Initial lognormal (from ground-truth times): "
 # %%
 N_ORIG, N_DEST = 500, 250
 RNG_SEED = 42
-R2_WEIGHT = 2.0  # combined-loss weight: R² gets 2× the weight of slope.
 
 def simulate_flows(shape: float, scale: float,
                    trips_per_person_per_day: float = 1.5,
@@ -313,72 +285,6 @@ def simulate_flows(shape: float, scale: float,
         car_graph, nested_sample, directed=True, weights='duration_initial')
     aadt_scale = (total_pop * trips_per_person_per_day) / (n_orig * n_dest)
     return edge_bc * aadt_scale
-
-
-def optimal_scale(eval_result: dict) -> float:
-    """Scaling factor that minimises RMSE between `k·modeled` and observed.
-
-    Closed-form solution to `argmin_k Σ(k·m - o)²` = `Σ(o·m) / Σ(m²)`.
-    Used both to make the scan loss scale-invariant (see `combined_loss`)
-    and to derive the final `trips_per_person_per_day` in section 8.
-    """
-    m = eval_result['merged']
-    o = m['observed'].to_numpy()
-    mod = m['modeled'].to_numpy()
-    denom = float((mod ** 2).sum())
-    return float((o * mod).sum() / denom) if denom > 0 else 1.0
-
-
-def best_nrmse(eval_result: dict) -> float:
-    """NRMSE achievable by optimally rescaling modeled to match observed.
-
-    `NRMSE_min = RMSE(k*·m, o) / mean(o)` where `k*` is from
-    `optimal_scale`. This factors out the absolute-scale degree of
-    freedom (which `trips_per_person_per_day` covers) so scans isolate
-    the contribution of distribution shape.
-    """
-    m = eval_result['merged']
-    o = m['observed'].to_numpy()
-    mod = m['modeled'].to_numpy()
-    k = optimal_scale(eval_result)
-    rmse_min = float(np.sqrt(((k * mod - o) ** 2).mean()))
-    obs_mean = float(o.mean())
-    return rmse_min / obs_mean if obs_mean > 0 else np.inf
-
-
-def combined_loss(eval_result: dict, r2_weight: float = R2_WEIGHT) -> float:
-    """Scale-invariant combined error metric for picking the best (shape, scale).
-
-    Returns `(1 - R²) · r2_weight + NRMSE_min`, where `NRMSE_min` is the
-    NRMSE achievable after optimally rescaling modeled to match observed
-    (see `best_nrmse`). Lower is better.
-
-    Why scale-invariant. NRMSE on the raw modeled flows would conflate
-    two things: distribution-shape goodness, and whether the current
-    `trips_per_person_per_day` happens to be near-optimal for that
-    distribution. A shape with the right distribution shape but
-    "wrong" optimal trips would lose unfairly. Factoring out the
-    optimal rescaling isolates the distribution-fit signal.
-
-    Why combine R² and NRMSE_min rather than either alone:
-
-    1. **R² is scale- and shape-invariant** beyond linear relationships.
-       Two distributions can be perfectly correlated (R² = 1) yet have
-       very different shapes (e.g. one with the right rank order but
-       compressed dynamic range).
-    2. **NRMSE_min captures shape under optimal rescaling** — including
-       systematic bias, dynamic-range mismatch, and outliers. The
-       squared-error weighting makes it dominated by high-AADT edges,
-       which is what you want for traffic calibration (getting busy
-       roads right matters more than getting cul-de-sacs right).
-
-    Both terms typically land in 0.05-0.5 near the optimum, so the 2:1
-    R² weight biases toward correlation without ignoring shape.
-    """
-    r2 = eval_result['r2']
-    if np.isnan(r2) or eval_result['n_matched'] == 0:
-        return np.inf
-    return (1.0 - r2) * r2_weight + best_nrmse(eval_result)
 
 
 # %% [markdown]
@@ -433,173 +339,79 @@ plt.tight_layout(); plt.show()
 
 
 # %% [markdown]
-# ## 6. Scan the lognormal **shape** (σ)
+# ## 6. Scan the lognormal **shape** (σ) — calibration in one parameter
 #
-# Holds `scale` fixed at the prior; sweeps `shape` over a grid centred
-# on the prior value.
+# Holds `scale` fixed at the prior; sweeps `shape` over a small grid
+# centred on the prior value. Picks the value that maximises R²
+# against the counters.
 #
-# **Selection metric: combined loss** = `(1 − R²)·R2_WEIGHT + NRMSE_min`,
-# minimised, where `NRMSE_min` is the NRMSE achievable after optimally
-# rescaling modeled to match observed (see `best_nrmse`). This makes
-# the loss **scale-invariant** — what we're comparing across shapes
-# is "how good is the distribution shape, ignoring absolute volume",
-# not "how good is it at this particular trips=1.5". Trips gets
-# derived once at the end (§8).
+# **This is the simplest possible calibration**: one parameter, one
+# metric (R²), one pass. Production calibration (see
+# `aperta-lab/projects/lumos/`) does coordinate-descent over multiple
+# parameters with a scale-invariant combined loss, an inner-vs-outer
+# counter filter, and a min-RMSE vs slope=1 trade-off for the final
+# scaling. The library's `calibration.evaluate_against_counters`
+# returns all the building blocks if you want to wire something
+# fancier — `scale` and `trips_per_person_per_day` can be scanned the
+# same way as `shape`.
 
 # %%
-shape_grid = np.linspace(0.5 * shape0, 1.5 * shape0, 7)
+shape_grid = np.linspace(0.6 * shape0, 1.4 * shape0, 5)
 shape_results = []
 for s in shape_grid:
     flows = simulate_flows(s, scale0, TRIPS_PER_PERSON_PER_DAY_INIT)
     ev = calibration.evaluate_against_counters(flows, counters)
-    loss = combined_loss(ev)
-    nrmse_min = best_nrmse(ev)
-    k_opt = optimal_scale(ev)
-    shape_results.append({'shape': s, 'r2': ev['r2'], 'slope': ev['slope'],
-                          'rmse': ev['rmse'], 'nrmse_min': nrmse_min,
-                          'k_opt': k_opt, 'loss': loss})
-    print(f"  shape={s:.3f}: R²={ev['r2']:.4f}, slope={ev['slope']:.3f}, "
-          f"NRMSE_min={nrmse_min:.3f}, k*={k_opt:.3f}, loss={loss:.4f}")
+    shape_results.append({'shape': s, 'r2': ev['r2'], 'slope': ev['slope']})
+    print(f"  shape={s:.3f}: R²={ev['r2']:.4f}, slope={ev['slope']:.3f}")
 shape_df = pd.DataFrame(shape_results)
 
-best_shape_idx = shape_df['loss'].idxmin()
-shape_best = float(shape_df.loc[best_shape_idx, 'shape'])
-print(f"\nBest shape (by combined loss): {shape_best:.3f} "
-      f"(loss={shape_df['loss'].min():.4f}, "
-      f"R²={shape_df.loc[best_shape_idx, 'r2']:.4f}, "
-      f"NRMSE_min={shape_df.loc[best_shape_idx, 'nrmse_min']:.3f})")
+best_idx = shape_df['r2'].idxmax()
+shape_best = float(shape_df.loc[best_idx, 'shape'])
+scale_best = scale0  # scale unscanned in this showcase
+print(f"\nBest shape (by R²): {shape_best:.3f} "
+      f"(R²={shape_df.loc[best_idx, 'r2']:.4f}, "
+      f"slope={shape_df.loc[best_idx, 'slope']:.3f})")
 
-fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-axes[0].plot(shape_df['shape'], shape_df['r2'], 'o-', color='tab:blue', label='R²')
-axes[0].plot(shape_df['shape'], shape_df['nrmse_min'], 's-', color='tab:orange',
-             label='NRMSE_min')
-axes[0].axvline(shape0, color='gray', linestyle='--', label=f'prior ({shape0:.3f})')
-axes[0].axvline(shape_best, color='tab:red', label=f'best ({shape_best:.3f})')
-axes[0].set_xlabel('lognormal shape (σ)'); axes[0].set_ylabel('R² / NRMSE_min')
-axes[0].set_title('1D scan — components'); axes[0].legend()
-axes[1].plot(shape_df['shape'], shape_df['loss'], 'o-', color='tab:green')
-axes[1].axvline(shape0, color='gray', linestyle='--')
-axes[1].axvline(shape_best, color='tab:red')
-axes[1].set_xlabel('lognormal shape (σ)'); axes[1].set_ylabel('combined loss')
-axes[1].set_title(f'(1 − R²)·{R2_WEIGHT} + NRMSE_min')
+fig, ax = plt.subplots(figsize=(8, 5))
+ax.plot(shape_df['shape'], shape_df['r2'], 'o-', color='tab:blue')
+ax.axvline(shape0, color='gray', linestyle='--', label=f'prior ({shape0:.3f})')
+ax.axvline(shape_best, color='tab:red', label=f'best ({shape_best:.3f})')
+ax.set_xlabel('lognormal shape (σ)'); ax.set_ylabel('R² vs counters')
+ax.set_title('1D shape scan'); ax.legend()
 plt.tight_layout(); plt.show()
 
 
 # %% [markdown]
-# ## 7. Scan the lognormal **scale** (μ)
+# ## 7. Derive `trips_per_person_per_day` from the regression slope
 #
-# Uses the best `shape` from §6. Same idea — sweep, plot, pick.
+# The shape scan picked by R² alone (scale-invariant), so the
+# absolute-volume knob remains. Set `trips_per_person_per_day` to
+# remove the systematic over/under-prediction:
+#
+# ```
+# trips_new = trips_old × (1 / slope)
+# ```
+#
+# This makes the no-intercept regression slope = 1 — modeled volumes
+# match observed counters on average (weighted by observed magnitude).
+# A more careful production analysis would compare this against a
+# min-RMSE scaling and pick deliberately — see lumos.
 
 # %%
-scale_grid = np.linspace(0.5 * scale0, 1.5 * scale0, 7)
-scale_results = []
-for sc in scale_grid:
-    flows = simulate_flows(shape_best, sc, TRIPS_PER_PERSON_PER_DAY_INIT)
-    ev = calibration.evaluate_against_counters(flows, counters)
-    loss = combined_loss(ev)
-    nrmse_min = best_nrmse(ev)
-    k_opt = optimal_scale(ev)
-    scale_results.append({'scale': sc, 'r2': ev['r2'], 'slope': ev['slope'],
-                          'rmse': ev['rmse'], 'nrmse_min': nrmse_min,
-                          'k_opt': k_opt, 'loss': loss})
-    print(f"  scale={sc:.1f}: R²={ev['r2']:.4f}, slope={ev['slope']:.3f}, "
-          f"NRMSE_min={nrmse_min:.3f}, k*={k_opt:.3f}, loss={loss:.4f}")
-scale_df = pd.DataFrame(scale_results)
-
-best_scale_idx = scale_df['loss'].idxmin()
-scale_best = float(scale_df.loc[best_scale_idx, 'scale'])
-print(f"\nBest scale (by combined loss): {scale_best:.1f} "
-      f"(loss={scale_df['loss'].min():.4f}, "
-      f"R²={scale_df.loc[best_scale_idx, 'r2']:.4f}, "
-      f"NRMSE_min={scale_df.loc[best_scale_idx, 'nrmse_min']:.3f})")
-
-fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-axes[0].plot(scale_df['scale'], scale_df['r2'], 'o-', color='tab:blue', label='R²')
-axes[0].plot(scale_df['scale'], scale_df['nrmse_min'], 's-', color='tab:orange',
-             label='NRMSE_min')
-axes[0].axvline(scale0, color='gray', linestyle='--', label=f'prior ({scale0:.1f})')
-axes[0].axvline(scale_best, color='tab:red', label=f'best ({scale_best:.1f})')
-axes[0].set_xlabel('lognormal scale (μ)'); axes[0].set_ylabel('R² / NRMSE_min')
-axes[0].set_title('1D scan — components'); axes[0].legend()
-axes[1].plot(scale_df['scale'], scale_df['loss'], 'o-', color='tab:green')
-axes[1].axvline(scale0, color='gray', linestyle='--')
-axes[1].axvline(scale_best, color='tab:red')
-axes[1].set_xlabel('lognormal scale (μ)'); axes[1].set_ylabel('combined loss')
-axes[1].set_title(f'(1 − R²)·{R2_WEIGHT} + NRMSE_min')
-plt.tight_layout(); plt.show()
+flows_at_best = simulate_flows(shape_best, scale_best, TRIPS_PER_PERSON_PER_DAY_INIT)
+eval_at_best = calibration.evaluate_against_counters(flows_at_best, counters)
+trips_final = TRIPS_PER_PERSON_PER_DAY_INIT / eval_at_best['slope']
+print(f"Slope at trips={TRIPS_PER_PERSON_PER_DAY_INIT} is {eval_at_best['slope']:.3f} "
+      f"→ trips_per_person_per_day = {trips_final:.3f}")
 
 
 # %% [markdown]
-# ## 8. Derive `trips_per_person_per_day` — two options
+# ## 8. Production run + save `road_stress.csv`
 #
-# The shape/scale scans factored out absolute volume (via
-# `NRMSE_min`'s optimal-rescaling), so we still need to pick a
-# `trips_per_person_per_day`. Two principled choices:
-#
-# - **Min RMSE.** Pick `trips` to minimise squared error between
-#   modeled and observed. The mathematically optimal predictor.
-#   Closed form: `k* = Σ(o·m) / Σ(m²)`,
-#   `trips_minRMSE = trips_init × k*`.
-#
-# - **Slope = 1.** Pick `trips` so the no-intercept regression
-#   slope equals 1 — i.e. modeled has zero average bias weighted by
-#   observed magnitude. `k_slope1 = Σ(o²) / Σ(o·m) = 1 / slope`,
-#   `trips_slope1 = trips_init × k_slope1`.
-#
-# These coincide only when correlation is perfect (R² = 1). At
-# imperfect fit, **min-RMSE rescales *down* relative to slope=1**
-# (intuition: shrinking modeled toward 0 trades a systematic
-# undershoot for shorter total errors on big edges). The choice
-# depends on what you want:
-#
-# - For **prediction** (downstream models consume road_stress as
-#   their best estimate of AADT): use min-RMSE.
-# - For an **unbiased** scaling (modeled and observed totals match
-#   in a weighted sense): use slope=1.
-#
-# We compute both and let you pick.
-
-# %%
-flows_final = simulate_flows(shape_best, scale_best, TRIPS_PER_PERSON_PER_DAY_INIT)
-eval_final = calibration.evaluate_against_counters(flows_final, counters)
-k_min_rmse = optimal_scale(eval_final)
-k_slope_1 = 1.0 / eval_final['slope'] if eval_final['slope'] > 0 else np.nan
-trips_min_rmse = TRIPS_PER_PERSON_PER_DAY_INIT * k_min_rmse
-trips_slope_1 = TRIPS_PER_PERSON_PER_DAY_INIT * k_slope_1
-
-# RMSE under each option (rescaling modeled by k, recomputing RMSE).
-m = eval_final['merged']
-o = m['observed'].to_numpy()
-mod = m['modeled'].to_numpy()
-rmse_at = lambda k: float(np.sqrt(((k * mod - o) ** 2).mean()))
-print(f"With best shape={shape_best:.3f}, scale={scale_best:.1f}:")
-print(f"  R²    = {eval_final['r2']:.4f}")
-print(f"  slope = {eval_final['slope']:.3f}    (regression slope at trips=1.5)")
-print()
-print(f"  Min RMSE:  k*={k_min_rmse:.3f}  → "
-      f"trips_per_person_per_day = {trips_min_rmse:.3f}, "
-      f"RMSE = {rmse_at(k_min_rmse):.0f}")
-print(f"  Slope=1:   k= {k_slope_1:.3f}  → "
-      f"trips_per_person_per_day = {trips_slope_1:.3f}, "
-      f"RMSE = {rmse_at(k_slope_1):.0f}")
-
-# Pick which scaling to use for the production road_stress run below.
-# Default to min-RMSE (best for prediction). Flip USE_SLOPE_1 if you
-# want the unbiased-totals scaling instead.
-USE_SLOPE_1 = False
-trips_final = trips_slope_1 if USE_SLOPE_1 else trips_min_rmse
-print(f"\nUsing trips_per_person_per_day = {trips_final:.3f} "
-      f"({'slope=1' if USE_SLOPE_1 else 'min-RMSE'}) for the production run.")
-
-
-# %% [markdown]
-# ## 9. Production run + save `road_stress.csv`
-#
-# Re-runs `simulate_flows` with the calibrated `(shape, scale, trips)`
-# to produce the final per-edge AADT. Attaches as `road_stress` edge
-# attribute (needed for the map below) and writes
-# `data/prepared/road_stress.csv` for downstream notebooks
-# (calibration of edge weights, etc.).
+# Re-runs `simulate_flows` with the calibrated `(shape, trips)` to
+# produce the final per-edge AADT. Attaches as `road_stress` edge
+# attribute (for the map below) and writes `data/prepared/road_stress.csv`
+# for downstream consumers.
 
 # %%
 road_stress = simulate_flows(shape_best, scale_best, trips_final)
@@ -621,123 +433,40 @@ print(f"Saved {len(road_stress_df):,} rows to {OUTPUT_PATH}")
 
 
 # %% [markdown]
-# ## 10. Visualise — raw flows vs capacity-normalised stress
+# ## 9. Visualise — raw flows on the network
 #
-# Two side-by-side maps, both cropped to 90 % of the destination
-# polygon's bounding box. Left: raw `road_stress` (veh/day). Right:
-# `(road_stress / capacity)²` — the BPR-style feature the edge-weight
-# calibration regresses on, where capacity = `capacity_per_lane[highway]
-# · lanes_per_direction`.
+# Per-edge `road_stress` as a colour map, cropped to 90 % of the
+# destination polygon bounding box. Motorways drawn on top (sorted by
+# `HIGHWAY_RANKS`) so they stay visible at junctions; colour scale
+# clips at P99.
 #
-# **Why two maps.** The raw map foregrounds motorways because they carry
-# the most traffic in absolute terms — but a 4-lane motorway at 50k AADT
-# has more spare capacity than a 2-lane primary at 20k AADT. Normalising
-# reveals "edges actually pushed close to capacity", which is what should
-# slow them down in the routing model.
-#
-# Edge widths follow the standard highway-tier hierarchy
-# (motorway/trunk thickest, residential thinnest) so the road class
-# stays readable independent of the colour scale. Edges are drawn in
-# order of ascending `HIGHWAY_RANKS`, so motorways / trunks land *on
-# top* of the residential mesh at junctions. Colour scales clip at
-# P99 (extreme bottlenecks compress the rest of the distribution).
+# A more sophisticated visualisation is *capacity-normalised stress* —
+# `(V/C)^β` with `β` typically 2 or 4 (BPR convention). Divides
+# road_stress by `capacity_per_lane[highway] · lanes_per_direction`
+# (the per-direction lanes attribute is set by
+# `consolidate_intersections`), then raises to `β`. Useful for spotting
+# bottlenecks regardless of road class — a 4-lane motorway at 50k AADT
+# has more spare capacity than a 2-lane primary at 20k. See
+# `aperta-lab/projects/lumos/` for the production version.
 
 # %%
 import _figures as figures   # noqa: E402  — project-local plot helpers
 
-# Per-edge capacity + (V/C)². `lanes_per_direction` comes from
-# `consolidate_intersections`; fall back to 1.0 for graphmls saved
-# before that wiring landed.
-vc_sq: dict = {}
-edge_cap: dict = {}
-for u, v, k, d in car_graph.edges(keys=True, data=True):
-    aadt = float(d.get('road_stress', 0.0))
-    lpd = float(d.get('lanes_per_direction', 1.0))
-    cap = figures.CAPACITY_PER_LANE.get(
-        figures.edge_highway(d), figures.DEFAULT_CAPACITY) * lpd
-    edge_cap[(u, v, k)] = cap
-    vc = aadt / cap if cap > 0 else 0.0
-    vc_sq[(u, v, k)] = vc ** 2
-
 stress_arr = np.array([float(d.get('road_stress', 0.0))
                        for _, _, d in car_graph.edges(data=True)])
-vc_sq_arr = np.array(list(vc_sq.values()))
 xlim, ylim = figures.crop_to_polygon(dest_polygon)
 
-fig, axes = plt.subplots(1, 2, figsize=(22, 11))
+fig, ax = plt.subplots(figsize=(12, 11))
 figures.plot_network_map(
-    axes[0], car_graph, road_stress,
+    ax, car_graph, road_stress,
     cbar_label='road_stress (veh/day, clipped at P99)',
-    title=(f'Raw flow — road_stress '
+    title=(f'road_stress — {LOCATION_LABEL} + 25 km '
            f'(median {np.median(stress_arr):.0f}, '
            f'P99 {np.quantile(stress_arr, 0.99):.0f}, '
            f'max {stress_arr.max():.0f} veh/day)'),
     xlim=xlim, ylim=ylim,
 )
-figures.plot_network_map(
-    axes[1], car_graph, vc_sq,
-    cbar_label='(V/C)² (clipped at P99)',
-    title=(f'Capacity-normalised — (V/C)² '
-           f'(median {np.median(vc_sq_arr):.3f}, '
-           f'P99 {np.quantile(vc_sq_arr, 0.99):.3f}, '
-           f'max {vc_sq_arr.max():.3f})'),
-    xlim=xlim, ylim=ylim,
-)
 plt.tight_layout(); plt.show()
-
-
-# %% [markdown]
-# ## 11. Investigate the (V/C)² long tail
-#
-# A few outliers in a feature that enters the edge-weight calibration
-# OLS as a multiplier on baseline time can drag the fitted coefficient
-# and skew the calibrated edge weights. Inspect the top-N edges to
-# decide whether to leave them (true bottlenecks, OLS will downweight),
-# cap the feature at a sane V/C, or revisit the capacity table / lanes
-# parsing.
-
-# %%
-vc_lookup = {key: np.sqrt(v) for key, v in vc_sq.items()}
-
-print(f"Edges with V/C > 0.5: "
-      f"{sum(1 for v in vc_lookup.values() if v > 0.5):,} / {len(vc_lookup):,}")
-print(f"Edges with V/C > 1.0: "
-      f"{sum(1 for v in vc_lookup.values() if v > 1.0):,} / {len(vc_lookup):,}")
-print(f"Edges with V/C > 1.5: "
-      f"{sum(1 for v in vc_lookup.values() if v > 1.5):,} / {len(vc_lookup):,}")
-
-over_by_tier: dict[str, int] = {}
-for (u, v, k), vc in vc_lookup.items():
-    if vc > 1.0:
-        d = car_graph[u][v][k]
-        tier = figures.edge_highway(d) or 'unknown'
-        over_by_tier[tier] = over_by_tier.get(tier, 0) + 1
-print("\nEdges with V/C > 1, by highway tier:")
-for tier, n in sorted(over_by_tier.items(), key=lambda x: -x[1]):
-    print(f"  {tier:20s} {n:5d}")
-
-top = sorted(vc_lookup.items(), key=lambda x: -x[1])[:20]
-rows = []
-for (u, v, k), vc in top:
-    d = car_graph[u][v][k]
-    rows.append({
-        'u': u, 'v': v, 'k': k,
-        'highway': figures.edge_highway(d),
-        'lanes': d.get('lanes'),
-        'lanes_per_direction': d.get('lanes_per_direction', 1.0),
-        'road_stress': float(d.get('road_stress', 0.0)),
-        'capacity': edge_cap[(u, v, k)],
-        'V/C': vc,
-        'length_m': float(d.get('length', 0.0)),
-    })
-top_df = pd.DataFrame(rows)
-print("\nTop-20 edges by V/C:")
-print(top_df.to_string(index=False,
-                       formatters={'V/C': '{:.3f}'.format,
-                                   'road_stress': '{:.0f}'.format,
-                                   'capacity': '{:.0f}'.format,
-                                   'lanes_per_direction': '{:.1f}'.format,
-                                   'length_m': '{:.0f}'.format}))
 
 
 # %% [markdown]
@@ -751,19 +480,16 @@ print(top_df.to_string(index=False,
 # - **Output isn't consumed by `accessibility.ipynb`.** That notebook
 #   ships with published-paper edge weights instead of using estimated
 #   flows. Each showcase notebook stands alone — they aren't wired into
-#   a pipeline. Production *does* wire road_stress into the edge-weight
-#   calibration as a `(V/C)²` BPR-style feature; see
-#   [`projects/lumos/`](https://github.com/mmiotti/aperta-lab/tree/main/src/projects/lumos).
-# - **Single-pass parameter selection.** No coordinate-descent scan
-#   over the lognormal cost-decay shape / scale, no inner-vs-outer
-#   counter filter, no min-RMSE-vs-slope-1 trade-off comparison.
-#   Production tunes those carefully — the showcase shows the
-#   one-parameter-set version to keep runtime reasonable.
-# - **(V/C)² capacity normalisation lives in `calibrate_edge_weights.ipynb`
-#   if at all** — it's a downstream consumption of the `road_stress`
-#   estimate, not part of the estimation itself.
+#   a pipeline. Production *does* wire road_stress into edge-weight
+#   calibration as a `(V/C)^β` BPR-style feature.
+# - **Calibration is one parameter, one metric.** A real fit would
+#   coordinate-descent over `shape`, `scale`, `trips_per_person_per_day`
+#   with a combined scale-invariant loss + inner-vs-outer counter
+#   filter, and pick the trips scaling deliberately (min-RMSE vs
+#   slope=1 trade-off). Here we scan just `shape` and pick by R².
+# - **No long-tail diagnostics.** Capacity-normalised `(V/C)²` maps
+#   and per-edge outlier tables are useful for QA but are a deep dive.
 #
-# For an example of these pieces wired into a full production stack
-# with `aperta_lab` scaffolding (scenario configs, typed I/O, dependency
-# tracking), see
+# For an example of all the above wired into a production stack
+# (scaffolding scenarios, typed I/O, dependency tracking), see
 # [`aperta-lab/src/projects/lumos/`](https://github.com/mmiotti/aperta-lab/tree/main/src/projects/lumos).

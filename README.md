@@ -41,18 +41,29 @@ python -m unittest discover -s tests -t .
 
 aperta is organised around a six-phase workflow. Every module slots into one of these phases.
 
-1. **Load and prepare data** — networks (per mode), land-use, topography.
-2. **Map data to units** — `cells → zones → regions` aggregation hierarchy via `geo_mapping` + `network_processing.snap_to_network_nodes` / `assign_to_eligible_centroid`.
+1. **Load and prepare data** — networks (per mode), land-use rasters and points.
+2. **Map data to units + compute shared features** — build the `cells → zones → regions` aggregation hierarchy via `geo_mapping`; snap geo units to network nodes via `network_processing.snap_to_network_nodes` / `assign_to_eligible_centroid`; sample topography rasters (`topography.fetch_copernicus_dem` + `geo_processing.sample_raster_at_points`); compute per-node density via `geo_processing.aggregate_within_radius`.
 3. **Build sparse OD pairs** — `od_pairs.get_pairs` returns a `TieredODNodePairs` (cell / zone / region tiers, node-keyed). Lift to `TieredODGeoPairs` (cell/zone/region-keyed) via `od_pairs.reindex_by_geo_unit` for cross-modal alignment.
-4. **Estimate traffic flows** — `traffic_flows.nested_node_sample` + betweenness via `network_processing.get_*_betweenness*`.
-5. **Estimate travel costs** — `routing.tiered_path_costs` / `routing.tiered_path_aggregate` (Dijkstra on any networkx graph) + `overhead.add_node_overheads` / `add_geo_overheads` / `add_origin_cell_overhead`. Plus `utility.route_utility` / `add_endpoint_utility` for utility-based costs.
+4. **Estimate traffic flows** — `traffic_flows.nested_node_sample` + betweenness via `network_processing.get_*_betweenness*`. Optional calibration against observed counters via `calibration.snap_counters_to_edges` + `calibration.evaluate_against_counters`.
+5. **Estimate travel costs** — `routing.tiered_path_costs` / `routing.tiered_path_aggregate` (Dijkstra on any networkx graph) + `overhead.add_node_overheads` / `add_geo_overheads` / `add_origin_cell_overhead`. Optional calibration of per-edge weights against observed travel times via `calibration.calibrate_edge_weights`. Plus `utility.route_utility` / `add_endpoint_utility` for utility-based costs.
 6. **Calculate accessibilities** — `accessibility.count_in_bins`, `accessibility.gravity`, `accessibility.nearest_k`. Cross-modal: `od_pairs.aggregate_across_modes` on per-mode `TieredODGeoPairs`, then any accessibility primitive on the combined ODM.
 
-Two runnable examples:
+### Where to see each phase in the examples
 
-- **`tests/test_workflow.py`** — the ~150-line toy-world walk-through. Doubles as the integration test.
-- **`examples/minimal/accessibility.ipynb`** — quickstart with real OSM data (Cambridge MA, ~10 min). Hello-world of aperta.
-- **`examples/extended/`** — multi-modal accessibility for Bern + 25 km, with published-paper calibration for edge weights. Four standalone notebooks: prep, accessibility, traffic-flow estimation, edge-weight calibration. Each demonstrates one library capability on real data; each stands alone (no pipeline coupling — see [aperta-lab/projects/lumos/](https://github.com/mmiotti/aperta-lab/tree/main/src/projects/lumos) for a production-stack example).
+The extended example splits its prep across five notebooks and its analysis across three; each analysis notebook stands alone (no cross-dependencies). The minimal example does the whole workflow in one notebook.
+
+| Phase | In `examples/extended/` |
+|---|---|
+| 1. Load and prepare data | [prep/1_download.ipynb](examples/extended/prepare/1_download.ipynb), [prep/2_dasymetric_employment.ipynb](examples/extended/prepare/2_dasymetric_employment.ipynb) |
+| 2. Map data to units + features | [prep/3_unit_mapping.ipynb](examples/extended/prepare/3_unit_mapping.ipynb), [prep/4_topography.ipynb](examples/extended/prepare/4_topography.ipynb), [prep/5_density.ipynb](examples/extended/prepare/5_density.ipynb) |
+| 3. Build sparse OD pairs | first cells of [accessibility.ipynb](examples/extended/accessibility.ipynb) and [road_stress.ipynb](examples/extended/road_stress.ipynb) — each builds for its own use |
+| 4. Estimate traffic flows | [road_stress.ipynb](examples/extended/road_stress.ipynb) |
+| 5. Estimate travel costs | [calibrate_edge_weights.ipynb](examples/extended/calibrate_edge_weights.ipynb) (calibrates the model); each analysis notebook applies edge times inline |
+| 6. Calculate accessibilities | [accessibility.ipynb](examples/extended/accessibility.ipynb) |
+
+For the *full* workflow in one notebook, see [examples/minimal/accessibility.ipynb](examples/minimal/accessibility.ipynb) — single-mode, ~10-minute end-to-end Cambridge example.
+
+The toy-world end-to-end test in [tests/test_workflow.py](tests/test_workflow.py) doubles as the smallest possible walk-through (~150 lines, runs in a second).
 
 ## Quick example
 

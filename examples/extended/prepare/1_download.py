@@ -8,32 +8,55 @@
 #       format_name: percent
 #       format_version: '1.3'
 #   kernelspec:
-#     display_name: Python 3 (ipykernel)
+#     display_name: aperta
 #     language: python
 #     name: python3
 # ---
 
 # %% [markdown]
-# # Swiss prep notebook 1: Download
+# # Prep notebook 1: Download
 #
-# Downloads everything needed for the Swiss-style accessibility example into a
-# sibling `prepared/` folder. Notebooks 2 and 3 (dasymetric employment + cell
-# aggregation) and the main `accessibility.ipynb` all consume the outputs of
-# this notebook.
+# Downloads everything needed for the extended accessibility example into a
+# sibling `prepared/` folder.
 #
-# **Scope (for the first draft):** the city of Bern + a 5 km buffer (the *area
-# of interest* — where accessibility will be computed) plus a further 25 km
-# buffer (the *destination area* — where data must be available so that
-# accessibility at the AOI edge isn't clipped). At this scope (~25 km radius
-# around Bern) we are comfortably inside Switzerland, so cross-border
-# extrapolation of employment is not yet needed. Notebook 2 is designed to
-# accommodate it when the scope expands to full Switzerland later.
+# **Geographical scope:**
+#
+# This notebook seeds the analysis area from a single geocoded location
+# (`SEED_LOCATION` below — set to "Bern, Switzerland" by default), buffered
+# into an *area of interest* (AOI) where accessibility will be computed and
+# a larger *destination polygon* where data must be available so the
+# accessibility at the AOI edge isn't clipped.
+#
+# As a result, the AOI area (~300 km²) is much smaller than the total area (~4,000
+# km²), caused by the generous 30 km buffer that ensures driving accessibilities
+# are meaningful throughout the AOI. Our tiered, asymmetric origin-destination
+# matrices make use of this structure and can be used to limit routing
+# calculations to only those locations that are actually needed for the
+# accessibility analysis.
+#
+# At the default scope (~40 km radius around Bern) we are comfortably inside
+# Switzerland, so cross-border extrapolation of employment is not yet needed.
+# Notebook 2 is designed to accommodate it when the scope expands across borders.
+#
+# **Running the example for a different scope:**
+#
+# Change `SEED_LOCATION` below to any geocodable place name to retarget the
+# whole pipeline. The other notebooks read the prepared outputs, so they
+# need no changes. The main data limitation is employment, which is only
+# needed if you want to model accessibility to employment opportunities (or
+# use employment density as a predictor for something, e.g. edge weight
+# calibration). The second notebook (dasymetric employment mapping) contains
+# a routine to extrapolate employment information to anywhere on the planet,
+# learning from Swiss data. The quality of this extrapolation (and of OSM
+# input data) may vary by location.
+#
+# Intermediate files may get quite large (several GB each) for country-scale scopes.
 #
 # **Sources:**
 #
 # | Data | Source | Notes |
 # |---|---|---|
-# | Walking + driving networks | OSM via `osmnx` | `network_type='all'` / `'drive'` |
+# | Mode-specific networks | OSM via `osmnx` | `network_type='walk'` / `'bike'` / `'drive'` |
 # | Population | GHSL R2023A, 100 m, Mollweide | Single JRC tile (R4_C19 covers Switzerland) |
 # | Building footprints | OSM via `osmnx` | Tag-aware: `building=office\|retail\|...` |
 # | Points of interest | OSM via `osmnx` | Schools, hospitals, supermarkets, etc. |
@@ -74,10 +97,19 @@ warnings.filterwarnings('ignore', category=UserWarning, module='geopandas')
 PREPARED_DIR = Path('../data/prepared')
 PREPARED_DIR.mkdir(parents=True, exist_ok=True)
 
-# Swiss LV95 (EPSG:2056) is the canonical metric CRS for any spatial operation
-# inside Switzerland. We use EPSG:4326 only where external APIs require it
-# (OSMnx polygon queries, GHSL tile lookup) and reproject back.
-CRS_METRIC = 'EPSG:2056'
+# === Retargeting knobs ======================================================
+# Change these to run the example for a different city. Everything else in
+# this notebook (and all downstream notebooks that read PREPARED_DIR) adapts
+# automatically.
+SEED_LOCATION = 'Bern, Switzerland'    # passed to OSM Nominatim
+LOCATION_LABEL = 'Bern'                 # short name for plot titles + prints
+CRS_METRIC = 'EPSG:2056'                # Swiss LV95 — use the right metric
+                                        # CRS for your country (UTM zone,
+                                        # national grid, etc.)
+# ============================================================================
+
+# EPSG:4326 only for external APIs that require it (OSMnx polygon queries,
+# GHSL tile lookup); reproject back to CRS_METRIC for all spatial ops.
 CRS_GEO = 'EPSG:4326'
 CRS_MOLLWEIDE = 'ESRI:54009'   # GHSL native projection
 
@@ -86,29 +118,24 @@ CRS_MOLLWEIDE = 'ESRI:54009'   # GHSL native projection
 # ## 1. Area of interest and destination polygon
 
 # %%
-# Fetch the Bern municipality polygon via OSM Nominatim. 'Bern, Switzerland'
-# disambiguates correctly to the municipality (admin_level=8, ~52 km²);
-# Nominatim's tie-breaking happens to prefer the municipality over the
-# canton here. Sanity-check the area afterwards in case Nominatim's preferred
-# result changes — the Bern municipality is ~52 km², the canton is ~5,960 km².
-bern_gdf = ox.geocode_to_gdf('Bern, Switzerland')
-bern_lv95 = bern_gdf.to_crs(CRS_METRIC).geometry.iloc[0]
-bern_area_km2 = bern_lv95.area / 1e6
-print(f"Bern municipality area: {bern_area_km2:.1f} km²")
-assert 40 < bern_area_km2 < 70, (
-    f"Expected the Bern municipality (~52 km²) but got {bern_area_km2:.1f} km². "
-    f"Geocoder may have picked the canton (~5,960 km²) or another match — "
-    f"check `bern_gdf['display_name']` and adjust the search string."
-)
+# Fetch the seed polygon via OSM Nominatim. Nominatim's tie-breaking for
+# ambiguous names varies — at default the showcase uses 'Bern,
+# Switzerland', which resolves to the municipality (admin_level=8,
+# ~52 km²) rather than the canton (~5,960 km²). When you change
+# `SEED_LOCATION`, eyeball the area below for sanity.
+seed_gdf = ox.geocode_to_gdf(SEED_LOCATION)
+seed_polygon = seed_gdf.to_crs(CRS_METRIC).geometry.iloc[0]
+seed_area_km2 = seed_polygon.area / 1e6
+print(f"{LOCATION_LABEL} seed area: {seed_area_km2:.1f} km²")
 
 # %%
-# AOI = Bern + 5 km, smoothed. The buffer rounds the outer boundary; the
+# AOI = seed + 5 km, smoothed. The buffer rounds the outer boundary; the
 # simplify pass drops sub-200 m features that survive the buffer. Result is
 # a clean polygon with O(50) vertices.
 AOI_BUFFER_M = 5_000
 SMOOTH_TOLERANCE_M = 200
 
-aoi_polygon = bern_lv95.buffer(AOI_BUFFER_M).simplify(SMOOTH_TOLERANCE_M)
+aoi_polygon = seed_polygon.buffer(AOI_BUFFER_M).simplify(SMOOTH_TOLERANCE_M)
 print(f"AOI area:                {aoi_polygon.area / 1e6:.1f} km²")
 
 # Destination polygon = AOI + 25 km. This is what we fetch raw data for.
@@ -136,22 +163,22 @@ gpd.GeoSeries([dest_polygon], crs=CRS_METRIC).plot(
 gpd.GeoSeries([aoi_polygon], crs=CRS_METRIC).plot(
     ax=ax, color='gold', alpha=0.5, edgecolor='darkorange', linewidth=1.0,
 )
-gpd.GeoSeries([bern_lv95], crs=CRS_METRIC).plot(
+gpd.GeoSeries([seed_polygon], crs=CRS_METRIC).plot(
     ax=ax, color='red', alpha=0.8,
 )
 # Carto Positron — a neutral grey/white basemap that doesn't compete with
 # the overlay colours. `r='@2x'` requests retina tiles (sharper on HiDPI
 # displays). `crs=` lets contextily pull tiles in EPSG:3857 and reproject
-# them to match our LV95 axes — no need to reproject the overlays.
+# them to match our metric-CRS axes — no need to reproject the overlays.
 cx.add_basemap(
     ax,
     source=cx.providers.CartoDB.Positron(r='@2x'),
     crs=CRS_METRIC,
 )
 ax.set_title(
-    'Bern accessibility scope\n'
-    'red = Bern municipality · gold = AOI (Bern + 5 km) · '
-    'blue = destination area (AOI + 25 km)'
+    f'{LOCATION_LABEL} accessibility scope\n'
+    f'red = seed ({LOCATION_LABEL}) · gold = AOI (seed + 5 km) · '
+    f'blue = destination area (AOI + 25 km)'
 )
 ax.set_axis_off()
 plt.tight_layout()
@@ -294,72 +321,37 @@ car_graph = graphs['drive']
 
 
 # %% [markdown]
-# ### Before/after consolidation — visual check on Bern centre
+# ### Per-edge speeds for the car graph (OSM `maxspeed` + fallback)
 #
-# 4 × 4 km zoom centred on (2,600,000 E / 1,199,000 N). Two columns
-# (car / walk), two rows (raw / consolidated). Obstacle markers in
-# the raw plots are the shared set extracted once from the raw car
-# graph (same in both raw panels — same source); in the consolidated
-# plots they're the per-node `is_*` flags after spatial reattachment.
+# Reads each car edge's OSM `maxspeed` tag and falls back to a per-
+# highway-class default for the (many) edges without one. The resulting
+# `speed_kph` attribute on every car edge is consumed by the edge-time
+# formula in `accessibility.ipynb` / `calibrate_edge_weights.ipynb` /
+# `road_stress.ipynb`. Idempotent — safe to re-run on a cached graphml.
+#
+# Walk and bike use a constant per-mode speed set inline downstream,
+# so no per-edge speed is needed for them.
 
 # %%
-_ZOOM_CX, _ZOOM_CY = 2_600_000, 1_199_000
-_ZOOM_HALF = 2_000
-
-_OBSTACLE_STYLE = {
-    'traffic_signal': {'color': '#d62728', 'marker': 'o', 'size': 30, 'label': 'traffic signal'},
-    'stop':           {'color': '#ff7f0e', 'marker': 's', 'size': 25, 'label': 'stop'},
-    'yield':          {'color': '#1f77b4', 'marker': '^', 'size': 25, 'label': 'yield'},
-    'roundabout':     {'color': '#2ca02c', 'marker': 'D', 'size': 40, 'label': 'roundabout'},
+HWY_SPEEDS = {
+    'motorway': 120, 'motorway_link': 80,
+    'trunk': 100,    'trunk_link': 60,
+    'primary': 80,   'primary_link': 50,
+    'secondary': 50, 'secondary_link': 40,
+    'tertiary': 50,  'tertiary_link': 40,
+    'unclassified': 50,
+    'residential': 30,
+    'living_street': 20,
+    'service': 30,
+    'road': 30,
+    'busway': 30,
 }
-
-def _raw_obstacles(_g) -> dict[str, list[tuple[float, float]]]:
-    """The shared obstacle set (extracted once from the raw car graph,
-    reused for every consolidation). Same dots appear in both raw panels
-    so the before/after comparison shows topology change, not source
-    change. The `_g` arg is ignored — only here for API symmetry with
-    `_consolidated_obstacles`."""
-    return {**shared_obstacles, 'roundabout': shared_roundabouts}
-
-def _consolidated_obstacles(g: 'ox.graph') -> dict[str, list[tuple[float, float]]]:
-    """Pull obstacle locations from per-node `is_*` flags on the consolidated graph."""
-    out = {name: [] for name in _OBSTACLE_STYLE}
-    for _, d in g.nodes(data=True):
-        for obs_name in _OBSTACLE_STYLE:
-            if d.get(f'is_{obs_name}', 0) == 1.0:
-                out[obs_name].append((d['x'], d['y']))
-    return out
-
-def _plot_panel(ax, graph, obstacles, title):
-    ox.plot_graph(graph, ax=ax, node_size=0, edge_color='#999',
-                  edge_linewidth=0.5, bgcolor='white', show=False, close=False)
-    for obs_name, style in _OBSTACLE_STYLE.items():
-        pts = obstacles.get(obs_name, [])
-        if not pts:
-            continue
-        xs, ys = zip(*pts)
-        ax.scatter(xs, ys, s=style['size'], c=style['color'],
-                   marker=style['marker'], edgecolors='black', linewidths=0.4,
-                   label=f"{style['label']} ({len(pts)})", zorder=5)
-    ax.set_xlim(_ZOOM_CX - _ZOOM_HALF, _ZOOM_CX + _ZOOM_HALF)
-    ax.set_ylim(_ZOOM_CY - _ZOOM_HALF, _ZOOM_CY + _ZOOM_HALF)
-    ax.set_title(title, fontsize=11)
-    ax.set_aspect('equal')
-    ax.legend(loc='lower left', fontsize=8, framealpha=0.9)
-
-fig, axes = plt.subplots(2, 2, figsize=(13, 13))
-_plot_panel(axes[0, 0], raw_graphs['drive'], _raw_obstacles(raw_graphs['drive']),
-            'Car — raw OSMnx (obstacles from OSM tags)')
-_plot_panel(axes[0, 1], raw_graphs['walk'], _raw_obstacles(raw_graphs['walk']),
-            'Walk — raw OSMnx (obstacles from OSM tags)')
-_plot_panel(axes[1, 0], graphs['drive'], _consolidated_obstacles(graphs['drive']),
-            f"Car — consolidated (tol={CONSOLIDATION_TOLERANCE['drive']} m, "
-            'obstacles re-attached)')
-_plot_panel(axes[1, 1], graphs['walk'], _consolidated_obstacles(graphs['walk']),
-            f"Walk — consolidated (tol={CONSOLIDATION_TOLERANCE['walk']} m, "
-            'obstacles re-attached)')
-plt.tight_layout()
-plt.show()
+ox.add_edge_speeds(car_graph, hwy_speeds=HWY_SPEEDS)
+ox.save_graphml(car_graph, PREPARED_DIR / 'car_graph.graphml')
+car_speeds = np.array([float(d['speed_kph'])
+                       for _, _, d in car_graph.edges(data=True)])
+print(f"Car edge speeds applied. Median {np.median(car_speeds):.0f} km/h, "
+      f"range {car_speeds.min():.0f}–{car_speeds.max():.0f} km/h.")
 
 
 # %% [markdown]
@@ -439,20 +431,20 @@ if not GHSL_POP_CLIPPED_PATH.exists():
         dst.write(pop_clipped)
 
 # %%
-# Quick sanity check: at this scope (~30 km radius around Bern, ≈3,500 km²)
-# total population should land in the ~1-1.3 M range (Bern agglomeration
-# ≈ 420 k, plus much of Bern-Mittelland and slivers of Solothurn /
-# Fribourg / Aargau in the 25 km buffer). Sense-check; not a tight
-# expectation.
+# Quick sanity check: at the default scope (~40 km radius, ≈4,000 km²
+# around a mid-sized European city) total population should land in the
+# ~1-1.3 M range. Adjust the assert bounds if your seed location is in
+# a much larger or much smaller agglomeration.
 with rasterio.open(GHSL_POP_CLIPPED_PATH) as src:
     pop = src.read(1)
 total_pop = float(pop[pop > 0].sum())
 print(f"GHSL clipped: {pop.shape[0]} × {pop.shape[1]} pixels; "
       f"total population ≈ {total_pop:,.0f}")
 assert 200_000 < total_pop < 2_000_000, (
-    f"Total population {total_pop:,.0f} is out of expected range for the "
-    f"Bern area — GHSL tile may not cover Switzerland. Check the tile "
-    f"row/column (current: {GHSL_TILE_ROW}_{GHSL_TILE_COL})."
+    f"Total population {total_pop:,.0f} is out of the expected range. "
+    f"Either the GHSL tile doesn't cover your seed location (check the "
+    f"tile row/column: {GHSL_TILE_ROW}_{GHSL_TILE_COL}), or your scope "
+    f"is much larger / smaller than the default Bern showcase."
 )
 
 
@@ -492,13 +484,13 @@ print(buildings['building'].value_counts().head(10).to_string())
 
 
 # %% [markdown]
-# ## 5. POIs (selected amenities, shops, transit, leisure)
+# ## 5. POIs (selected amenities and leisure locations)
 #
 # These are used directly as accessibility destinations (one point = one
-# opportunity, optionally weighted) and do NOT go through dasymetric mapping
-# — the OSM tags ARE the ground truth for sector-specific locations.
-# Dasymetric mapping is reserved for the aggregate "all jobs" / tertiary
-# employment layer (notebook 2).
+# opportunity, optionally weighted). OSM tags are assumed to be the ground
+# truth for sector-specific locations. They are not subject to dasymetric
+# mapping - dasymmetric mapping is reserved for the aggregate "all jobs" / 
+# tertiary employment layer (notebook 2).
 #
 # **Category map.** Each user-defined category bundles one or more
 # `'key:value'` OSM tag pairs, each with an optional weight (default 1.0).
@@ -507,8 +499,8 @@ print(buildings['building'].value_counts().head(10).to_string())
 # weighted accessibility metrics. Categories with weight = 1 across the
 # board are simple counts.
 #
-# This map is structured like the one used in the legacy LUMOS prep so it
-# can be carried over as a starting point; trim or extend it as needed.
+# In this example, we consider three categories of POIs. In a full accessibility
+# analysis for all common trip purposes, you may want to add to or change the list.
 
 # %%
 POI_CATEGORIES = {
@@ -518,52 +510,13 @@ POI_CATEGORIES = {
         ('shop:bakery',      0.5),
         ('shop:farm',        0.5),
     ],
-    'poi_errands_services': [
-        ('amenity:pharmacy',    1.5),
-        ('amenity:post_office', 1.0),
-        ('amenity:bank',        1.0),
-        ('shop:doityourself',   1.0),
-        ('shop:garden_centre',  1.0),
-        ('shop:hairdresser',    1.0),
-        ('shop:kiosk',          1.0),
-    ],
-    'poi_education': [
-        ('amenity:kindergarten', 0.5),
+    'poi_education_children': [
+        ('amenity:kindergarten', 1.0),
         ('amenity:school', 1.0),
-        ('amenity:university', 5.0),
-        ('amenity:college',    5.0),
     ],
-    'poi_health': [
-        ('amenity:pharmacy', 0.5),
-        ('amenity:clinic',   2.0),
-        ('amenity:hospital', 10.0),
-    ],
-    'poi_leisure_gastronomy': [
-        ('amenity:restaurant',  0.8),
-        ('amenity:cafe',        1.5),
-        ('amenity:bar',         1.5),
-        ('amenity:pub',         1.5),
-        ('amenity:ice_cream',   1.0),
-    ],
-    'poi_leisure_active': [
-        ('leisure:sports_centre',   2.0),
-        ('leisure:fitness_centre',  2.0),
-        ('leisure:pitch',           0.2),
-        ('leisure:park',            0.5),
-        ('leisure:playground',      0.5),
-        ('leisure:swimming_area',   1.0),
-    ],
-    # Hiking start-points / waypoints. `information=guidepost` covers the
-    # iconic yellow Swiss trail signposts (the primary CH signal — many
-    # thousand in Switzerland). `highway=trailhead` is the explicit
-    # "trail starts here" tag but rare in CH (mostly a North-American
-    # convention). Alpine huts double as both start- and end-points of
-    # longer hikes — higher weight reflects "destination" value.
     'poi_leisure_hiking': [
         ('information:guidepost',   1.0),
         ('highway:trailhead',       1.0),
-        ('tourism:alpine_hut',      1.5),
-        ('tourism:wilderness_hut',  1.0),
     ],
 }
 
@@ -601,3 +554,73 @@ for p in sorted(PREPARED_DIR.iterdir()):
         sz = p.stat().st_size
         size_str = f"{sz/1e6:.1f} MB" if sz > 1e6 else f"{sz/1e3:.1f} KB"
         print(f"  {p.name:50s} {size_str:>10s}")
+
+
+# %% [markdown]
+# ## Appendix: visual check — before / after consolidation
+#
+# Optional diagnostic. 4 × 4 km zoom centred on the AOI centroid, with
+# two columns (car / walk) and two rows (raw / consolidated). Obstacle
+# markers in the raw plots are the shared set extracted once from the
+# raw car graph (same in both raw panels — same source); in the
+# consolidated plots they're the per-node `is_*` flags after spatial
+# reattachment.
+#
+# This is what `network_processing.consolidate_intersections` actually
+# does — visually. Skippable if you trust the consolidation step.
+
+# %%
+_ZOOM_CX, _ZOOM_CY = aoi_polygon.centroid.x, aoi_polygon.centroid.y
+_ZOOM_HALF = 2_000
+
+_OBSTACLE_STYLE = {
+    'traffic_signal': {'color': '#d62728', 'marker': 'o', 'size': 30, 'label': 'traffic signal'},
+    'stop':           {'color': '#ff7f0e', 'marker': 's', 'size': 25, 'label': 'stop'},
+    'yield':          {'color': '#1f77b4', 'marker': '^', 'size': 25, 'label': 'yield'},
+    'roundabout':     {'color': '#2ca02c', 'marker': 'D', 'size': 40, 'label': 'roundabout'},
+}
+
+def _raw_obstacles(_g) -> dict[str, list[tuple[float, float]]]:
+    """The shared obstacle set (extracted once from the raw car graph,
+    reused for every consolidation). Same dots appear in both raw panels."""
+    return {**shared_obstacles, 'roundabout': shared_roundabouts}
+
+def _consolidated_obstacles(g: 'ox.graph') -> dict[str, list[tuple[float, float]]]:
+    """Pull obstacle locations from per-node `is_*` flags on the consolidated graph."""
+    out = {name: [] for name in _OBSTACLE_STYLE}
+    for _, d in g.nodes(data=True):
+        for obs_name in _OBSTACLE_STYLE:
+            if d.get(f'is_{obs_name}', 0) == 1.0:
+                out[obs_name].append((d['x'], d['y']))
+    return out
+
+def _plot_panel(ax, graph, obstacles, title):
+    ox.plot_graph(graph, ax=ax, node_size=0, edge_color='#999',
+                  edge_linewidth=0.5, bgcolor='white', show=False, close=False)
+    for obs_name, style in _OBSTACLE_STYLE.items():
+        pts = obstacles.get(obs_name, [])
+        if not pts:
+            continue
+        xs, ys = zip(*pts)
+        ax.scatter(xs, ys, s=style['size'], c=style['color'],
+                   marker=style['marker'], edgecolors='black', linewidths=0.4,
+                   label=f"{style['label']} ({len(pts)})", zorder=5)
+    ax.set_xlim(_ZOOM_CX - _ZOOM_HALF, _ZOOM_CX + _ZOOM_HALF)
+    ax.set_ylim(_ZOOM_CY - _ZOOM_HALF, _ZOOM_CY + _ZOOM_HALF)
+    ax.set_title(title, fontsize=11)
+    ax.set_aspect('equal')
+    ax.legend(loc='lower left', fontsize=8, framealpha=0.9)
+
+fig, axes = plt.subplots(2, 2, figsize=(13, 13))
+_plot_panel(axes[0, 0], raw_graphs['drive'], _raw_obstacles(raw_graphs['drive']),
+            'Car — raw OSMnx (obstacles from OSM tags)')
+_plot_panel(axes[0, 1], raw_graphs['walk'], _raw_obstacles(raw_graphs['walk']),
+            'Walk — raw OSMnx (obstacles from OSM tags)')
+_plot_panel(axes[1, 0], graphs['drive'], _consolidated_obstacles(graphs['drive']),
+            f"Car — consolidated (tol={CONSOLIDATION_TOLERANCE['drive']} m, "
+            'obstacles re-attached)')
+_plot_panel(axes[1, 1], graphs['walk'], _consolidated_obstacles(graphs['walk']),
+            f"Walk — consolidated (tol={CONSOLIDATION_TOLERANCE['walk']} m, "
+            'obstacles re-attached)')
+plt.tight_layout()
+plt.show()

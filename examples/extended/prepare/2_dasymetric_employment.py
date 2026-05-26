@@ -67,12 +67,12 @@
 #    we have. Simple, conservative; assumes uniform within-muni
 #    distribution (it isn't, but the bias is small at our scope).
 #
-# **Cross-border note.** All munis at the Bern + 25 km scope are inside
-# Switzerland, so we don't need cross-border extrapolation yet. The
-# notebook is structured to make the future extension easy: the fitted
-# per-OSM-tag coefficients are saved separately and could be applied to
-# non-Swiss OSM buildings (which have no BFS anchor) when the scope
-# expands.
+# **Cross-border note.** All munis at the default Bern + 25 km scope are
+# inside Switzerland, so we don't need cross-border extrapolation yet.
+# The notebook is structured to make the future extension easy: the
+# fitted per-OSM-tag coefficients are saved separately and could be
+# applied to non-Swiss OSM buildings (which have no BFS anchor) when the
+# scope expands.
 
 # %%
 import warnings
@@ -248,9 +248,9 @@ print(f"  Marginal sliver (≤1 %):"
 # ## 4. Join buildings to municipalities
 #
 # Each building is assigned to the muni containing its centroid. At the
-# Bern + 25 km scope every building should land inside a Swiss muni;
-# assertion enforces this and will be relaxed when the scope expands
-# across the border.
+# default Bern + 25 km scope every building should land inside a Swiss
+# muni; assertion enforces this and will be relaxed when the scope
+# expands across the border.
 
 # %%
 # Build a points GeoDataFrame from the building centroids for the sjoin.
@@ -268,7 +268,7 @@ print(f"Buildings: {len(buildings):,}, unmatched (no Swiss muni): "
       f"{unmatched:,} ({unmatched/len(buildings)*100:.2f} %)")
 assert unmatched / len(buildings) < 0.01, (
     f"More than 1 % of buildings have no muni assignment ({unmatched:,}). "
-    f"At the Bern scope this shouldn't happen — when expanding scope across "
+    f"At the default Bern scope this shouldn't happen — when expanding across "
     f"the border, switch to the cross-border-coefficient path documented "
     f"in the notebook header.")
 

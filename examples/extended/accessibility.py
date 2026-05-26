@@ -14,26 +14,30 @@
 # ---
 
 # %% [markdown]
-# # Swiss accessibility — multi-modal × multi-scale
+# # Multi-modal accessibility — extended example
 #
-# Production-scale accessibility analysis for Bern + 25 km on public data.
-# Combines all four `prepare/` notebooks into a full accessibility
-# computation across **5 mode-variants** × **3 destination types** plus
-# **cross-modal logsum** aggregation — the multi-scale × multi-modal
-# combination that motivates the aperta library.
+# Default scope: Bern + 25 km. Change `LOCATION_LABEL` and the crop
+# constants below to retarget plots; the underlying data is whatever
+# `prepare/1_download` produced (driven by `SEED_LOCATION` there).
 #
-# Inputs (all from `prepare/`):
+# Tutorial-scope accessibility analysis across three modes (walk, bike,
+# car) on real OSM data, with published-paper edge-weight coefficients
+# applied inline (Miotti et al., *Transportation*). One representative
+# variant per mode for clarity. Ends with a cross-modal logsum that
+# combines all three modes into one accessibility surface.
 #
-# - 3 networks (`walk_graph`, `bike_graph`, `car_graph`) each carrying
-#   per-edge travel-time attributes for 5 (mode, variant) combinations:
-#   `walk_time_s`, `bike_time_s`, `ebike_time_s`,
-#   `car_time_s_offpeak`, `car_time_s_peak`.
-# - H3 cells (res 10), zones (res 8), regions (res 6) with
-#   `population`, `employment_*`, `poi_*` columns.
-# - Coefficient table at `coefficients/edge_weights_and_overhead.csv`
-#   (the `overhead_*` rows for first/last-mile cost would go here too —
-#   deferred to a later iteration to keep this notebook focused on the
-#   routing → accessibility pipeline).
+# **Inputs** (all from `prepare/`):
+#
+# - 3 consolidated networks (`walk_graph`, `bike_graph`, `car_graph`)
+#   carrying per-edge features from prep: `speed_kph`,
+#   `density_norm`, `elev_gain`, `elev_loss`, `is_degree_4`,
+#   `is_traffic_signal`. Edge travel times are computed inline in
+#   section 2 below by applying published coefficients to these
+#   features.
+# - H3 cells (res 10), zones (res 8), regions (res 6) with `population`,
+#   `employment_*`, `poi_*` columns, plus pre-snapped
+#   `node_id_{walk,bike,car}` / `snap_dist_*` from
+#   `prepare/3_unit_mapping`.
 #
 # **Three destinations**, picked to span the temporal-decay spectrum:
 #
@@ -43,15 +47,13 @@
 # | Grocery shopping     | `poi_errands_groceries` | sharp (frequent)    |
 # | Hiking POIs          | `poi_leisure_hiking`    | slow (destination)  |
 #
-# **Five mode-variants:**
+# **Three modes** (one published variant each):
 #
-# | Mode           | Variant   | Edge attribute        | Distance mask |
-# |----------------|-----------|-----------------------|---------------|
-# | walk           | —         | `walk_time_s`         | < 5 km        |
-# | bike           | regular   | `bike_time_s`         | < 25 km       |
-# | bike           | e-bike 25 | `ebike_time_s`        | < 25 km       |
-# | car            | off-peak  | `car_time_s_offpeak`  | none          |
-# | car            | peak      | `car_time_s_peak`     | none          |
+# | Mode           | Edge attribute       | Distance mask |
+# |----------------|----------------------|---------------|
+# | walk           | `walk_time_s`        | < 5 km        |
+# | bike (regular) | `bike_time_s`        | < 25 km       |
+# | car (off-peak) | `car_time_s_offpeak` | none          |
 
 # %%
 import warnings
@@ -79,6 +81,14 @@ warnings.filterwarnings('ignore', category=UserWarning, module='geopandas')
 PREPARED_DIR = Path('data/prepared')
 CRS_METRIC = 'EPSG:2056'
 
+# === Plot retargeting knobs =================================================
+# Keep in sync with `SEED_LOCATION` / `LOCATION_LABEL` in `prepare/1_download.py`.
+# The crop is used by the per-mode / cross-modal map sections at the end.
+LOCATION_LABEL = 'Bern'
+MAP_CROP_CENTER_XY = (2_600_000, 1_199_000)   # LV95; centred on Bern
+MAP_CROP_HALF_M = 3_500                        # 7 × 7 km window
+# ============================================================================
+
 
 # %% [markdown]
 # ## 1. Load networks + geo units
@@ -88,17 +98,17 @@ walk_graph = network_processing.load_consolidated_graphml(PREPARED_DIR / 'walk_g
 bike_graph = network_processing.load_consolidated_graphml(PREPARED_DIR / 'bike_graph.graphml')
 car_graph = network_processing.load_consolidated_graphml(PREPARED_DIR / 'car_graph.graphml')
 
-# `ox.load_graphml` returns edge attributes as strings — cast the time
-# columns we need back to float so routing / arithmetic works.
-TIME_COLS = {
-    walk_graph: ['walk_time_s', 'length'],
-    bike_graph: ['bike_time_s', 'ebike_time_s', 'length'],
-    car_graph:  ['car_time_s_offpeak', 'car_time_s_peak', 'length'],
-}
-for g, cols in TIME_COLS.items():
+# `ox.load_graphml` returns edge attributes as strings (except those
+# registered in `CONSOLIDATED_EDGE_DTYPES`). Cast the features we use
+# in the edge-weight formula below back to float.
+FEATURE_COLS = ('length', 'speed_kph', 'density_norm',
+                'elev_gain', 'elev_loss',
+                'is_degree_3', 'is_degree_4', 'is_traffic_signal')
+for g in (walk_graph, bike_graph, car_graph):
     for _, _, d in g.edges(data=True):
-        for c in cols:
-            d[c] = float(d[c])
+        for c in FEATURE_COLS:
+            if c in d:
+                d[c] = float(d[c])
 
 print(f"Walk: {walk_graph.number_of_nodes():>7,} nodes / "
       f"{walk_graph.number_of_edges():>7,} edges")
@@ -128,8 +138,8 @@ for d in DESTINATIONS:
 
 # %%
 # Origin / destination split — origins are only cells inside the AOI
-# (Bern + 5 km from `prepare/1_download`), but every cell in the dest
-# polygon (Bern + 25 km) remains a valid destination. This dramatically
+# (seed + 5 km from `prepare/1_download`), but every cell in the dest
+# polygon (AOI + 25 km) remains a valid destination. This dramatically
 # cuts routing cost: each Dijkstra is one-to-many, so the cost scales
 # with origin count, not destination count.
 aoi_polygon = gpd.read_file(PREPARED_DIR / 'aoi_polygon.gpkg').geometry.iloc[0]
@@ -140,37 +150,95 @@ print(f"\nOrigin cells: {ORIG_MASK.sum():,} of {len(cells):,} "
 
 
 # %% [markdown]
-# ## 2. Snap geo units to nodes — per network
+# ## 2. Apply published edge-weight coefficients → per-edge travel times
 #
-# Each of the 5 geo-units × 3 networks pairing needs a snap. We store
-# the result as a per-mode column (`node_id_walk`, `node_id_bike`,
-# `node_id_car`) on `cells`, `zones`, `regions` — keeping all three in
-# the same DataFrame means downstream calls just pass the right
-# `node_column=` and there's no data duplication.
+# **Coefficients from Miotti et al., *Transportation*, 20XX**, hardcoded
+# inline for visibility. One representative variant per mode (walk,
+# regular bike, off-peak car).
+#
+# **Formula** — per directed edge `u → v` of length `L` m:
+#
+# ```
+# effective_kph = max(base_speed_kph · (1 + β_density · density_norm), floor_kph)
+# duration_s    = L / (effective_kph / 3.6)
+#               + α_up   · elev_gain                     (m climbed u→v)
+#               + α_down · elev_loss                     (m descended u→v)
+#               + β_intersection_4 · is_degree_4         (∈ {0, 0.5, 1})
+#               + β_traffic_signal · is_traffic_signal   (∈ {0, 0.5, 1})
+# ```
+#
+# Bike additionally caps the downhill speed at 50 km/h — without it,
+# the negative `α_down` makes short steep descents produce
+# negative-duration edges (Dijkstra silently churns).
+#
+# The simplifications vs the paper (also documented in the
+# "what this notebook does NOT do" footer):
+#
+# - One variant per mode (no e-bike, no peak/night car).
+# - `β_intersection` (3-way) absent — published 9-row schema only has
+#   the 4-way coefficient.
 
 # %%
-def snap_layer_to_all_networks(layer: gpd.GeoDataFrame) -> None:
-    """Mutate `layer` to add node-id + snap-distance columns for each network.
+def apply_edge_times(graph, attr_name: str, *,
+                     base_speed_kph: float | None,
+                     alpha_up: float, alpha_down: float,
+                     beta_density: float,
+                     beta_intersection_4: float, beta_traffic_signal: float,
+                     floor_kph: float = 1.0,
+                     max_downhill_kph: float | None = None) -> None:
+    """Apply the published-coefficient formula and write to `attr_name`.
 
-    Snap distances are reused later as the cell-to-network-node first-mile
-    component of trip overheads (section 8).
+    `base_speed_kph=None` means "read per-edge `speed_kph`" (used for car).
+    `max_downhill_kph` caps the implied speed on edges where the slope
+    bonus would otherwise drive duration negative (used for bike).
     """
-    centroids = layer.copy()
-    centroids['geometry'] = centroids.geometry.centroid
-    for graph, label in [(walk_graph, 'walk'),
-                         (bike_graph, 'bike'),
-                         (car_graph,  'car')]:
-        nid, dist = network_processing.snap_to_network_nodes(centroids, graph)
-        layer[f'node_id_{label}'] = nid
-        layer[f'snap_dist_{label}'] = dist
+    min_dur_per_m = (None if max_downhill_kph is None
+                     else 1.0 / (max_downhill_kph / 3.6))
+    for _, _, _, data in graph.edges(keys=True, data=True):
+        base_kph = data['speed_kph'] if base_speed_kph is None else base_speed_kph
+        effective_kph = max(base_kph * (1 + beta_density * data['density_norm']),
+                            floor_kph)
+        base_dur = data['length'] / (effective_kph / 3.6)
+        slope_pen = alpha_up * data['elev_gain'] + alpha_down * data['elev_loss']
+        intersection_pen = (beta_intersection_4 * data['is_degree_4']
+                            + beta_traffic_signal * data['is_traffic_signal'])
+        total = base_dur + slope_pen + intersection_pen
+        if min_dur_per_m is not None:
+            total = max(total, data['length'] * min_dur_per_m)
+        data[attr_name] = total
 
-for layer, name in [(cells, 'cells'), (zones, 'zones'), (regions, 'regions')]:
-    snap_layer_to_all_networks(layer)
-    print(f"  Snapped {name}: "
-          f"walk {layer['node_id_walk'].notna().sum():>6,} "
-          f"(median dist {layer['snap_dist_walk'].median():.0f} m), "
-          f"bike {layer['node_id_bike'].notna().sum():>6,}, "
-          f"car  {layer['node_id_car'].notna().sum():>6,}")
+
+# Walk — slow, no density slowdown, intersection penalties zero in the
+# paper (pedestrians don't wait at signals in the same way).
+apply_edge_times(walk_graph, 'walk_time_s',
+                 base_speed_kph=5.0,
+                 alpha_up=2.4, alpha_down=0.1, beta_density=0.0,
+                 beta_intersection_4=0.0, beta_traffic_signal=0.0)
+
+# Bike (regular) — steeper climbs, slight downhill bonus (capped at
+# 50 km/h to avoid negative durations on steep descents).
+apply_edge_times(bike_graph, 'bike_time_s',
+                 base_speed_kph=18.0,
+                 alpha_up=3.1, alpha_down=-0.3, beta_density=0.0,
+                 beta_intersection_4=7.0, beta_traffic_signal=1.0,
+                 max_downhill_kph=50.0)
+
+# Car (off-peak) — per-edge baseline from OSM `maxspeed`, density
+# slowdown (urban friction), intersection + signal penalties.
+apply_edge_times(car_graph, 'car_time_s_offpeak',
+                 base_speed_kph=None,
+                 alpha_up=0.0, alpha_down=0.0, beta_density=-0.20,
+                 beta_intersection_4=6.0, beta_traffic_signal=10.0,
+                 floor_kph=15.0)
+
+for label, graph, attr in [('walk', walk_graph, 'walk_time_s'),
+                            ('bike', bike_graph, 'bike_time_s'),
+                            ('car',  car_graph,  'car_time_s_offpeak')]:
+    times = np.array([d[attr] for _, _, d in graph.edges(data=True)])
+    lengths = np.array([d['length'] for _, _, d in graph.edges(data=True)])
+    implied_kph = (lengths / times) * 3.6
+    print(f"  {label:5s} {attr:20s}: median edge time {np.median(times):>6.1f} s, "
+          f"implied speed {np.median(implied_kph):.1f} km/h")
 
 
 # %% [markdown]
@@ -445,8 +513,8 @@ for label, _, _, _, _ in ROUTING_PLAN:
 #
 # Plot only origin cells (destination-only cells have no accessibility
 # value and would otherwise show as a grey halo). All maps are square,
-# framed, with a height-matched colour bar, and cropped to a 7 × 7 km
-# window centred on Bern.
+# framed, with a height-matched colour bar, and cropped to a square
+# window centred on `MAP_CROP_CENTER_XY` (set at the top of this notebook).
 
 # %%
 import _figures as figures   # noqa: E402  — project-local plot helpers
@@ -456,8 +524,9 @@ ORIG_CELLS = cells.loc[ORIG_MASK]
 fig, axes = plt.subplots(3, 3, figsize=(18, 18))
 for row, (label, _, _, _, _) in enumerate(ROUTING_PLAN):
     for col, d in enumerate(DESTINATIONS):
-        figures.plot_bern_cell_map(
+        figures.plot_cell_map_cropped(
             axes[row, col], ORIG_CELLS, ACC[(label, d)].loc[ORIG_MASK],
+            crop_center_xy=MAP_CROP_CENTER_XY, crop_half_m=MAP_CROP_HALF_M,
             title=f'{label} × {d}')
 plt.tight_layout()
 plt.show()
@@ -499,8 +568,9 @@ logsum_acc = accessibility.gravity(
 
 fig, axes = plt.subplots(1, 3, figsize=(18, 6))
 for col, d in enumerate(DESTINATIONS):
-    figures.plot_bern_cell_map(
+    figures.plot_cell_map_cropped(
         axes[col], ORIG_CELLS, logsum_acc[('logsum', d)].loc[ORIG_MASK],
+        crop_center_xy=MAP_CROP_CENTER_XY, crop_half_m=MAP_CROP_HALF_M,
         title=f'Cross-modal logsum (walk+bike+car off-peak) × {d}')
 plt.tight_layout()
 plt.show()
