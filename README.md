@@ -42,15 +42,15 @@ python -m unittest discover -s tests -t .
 aperta is organised around a six-phase workflow. Every module slots into one of these phases.
 
 1. **Load and prepare data** — networks (per mode), land-use rasters and points.
-2. **Map data to units + compute shared features** — build the `cells → zones → regions` aggregation hierarchy via `geo_mapping`; snap geo units to network nodes via `network_processing.snap_to_network_nodes` / `assign_to_eligible_centroid`; sample topography rasters (`topography.fetch_copernicus_dem` + `geo_processing.sample_raster_at_points`); compute per-node density via `geo_processing.cross_sum_within_radius`.
-3. **Build sparse OD pairs** — `od_pairs.get_pairs` returns a `TieredODNodePairs` (cell / zone / region tiers, node-keyed). Lift to `TieredODGeoPairs` (cell/zone/region-keyed) via `od_pairs.reindex_by_geo_unit` for cross-modal alignment.
+2. **Map data to units + compute shared features** — build the `cells → zones` aggregation hierarchy; snap geo units to network nodes via `network_processing.snap_to_network_nodes` / `assign_to_eligible_centroid`; sample topography rasters (`topography.fetch_copernicus_dem` + `geo_processing.sample_raster_at_points`); compute per-node density via `geo_processing.cross_sum_within_radius`.
+3. **Build sparse OD pairs** — `od_pairs.get_pairs` returns a `TieredODNodePairs` with three tiers (`cells_to_cells` / `cells_to_zones` / `zones_to_zones`, node-keyed) — the middle tier preserves per-cell origin precision at zone-aggregated dest cost. Lift to `TieredODGeoPairs` (cell/zone-keyed) via `od_pairs.reindex_by_geo_unit` for cross-modal alignment.
 4. **Estimate traffic flows** — `traffic_flows.nested_node_sample` + betweenness via `network_processing.get_*_betweenness*`. Optional calibration against observed counters via `calibration.snap_counters_to_edges` + `calibration.evaluate_against_counters`.
 5. **Estimate travel costs** — `routing.tiered_path_costs` / `routing.tiered_path_aggregate` (Dijkstra on any networkx graph) + `overhead.add_node_overheads` / `add_geo_overheads` / `add_origin_cell_overhead`. Optional calibration of per-edge weights against observed travel times via `calibration.calibrate_edge_weights`. Plus `utility.route_utility` / `add_endpoint_utility` for utility-based costs.
 6. **Calculate accessibilities** — `accessibility.count_in_bins`, `accessibility.gravity`, `accessibility.nearest_k`. Cross-modal: `od_pairs.aggregate_across_modes` on per-mode `TieredODGeoPairs`, then any accessibility primitive on the combined ODM.
 
 ### Where to see each phase in the examples
 
-The extended example splits its prep across five notebooks and its analysis across three; each analysis notebook stands alone (no cross-dependencies). The minimal example does the whole workflow in one notebook.
+The extended example splits its prep across five notebooks and its analysis across three; each analysis notebook stands alone (no cross-dependencies). The minimal and walkthrough examples each do the whole workflow in one notebook (at different depths).
 
 | Phase | In `examples/extended/` |
 |---|---|
@@ -64,7 +64,7 @@ The extended example splits its prep across five notebooks and its analysis acro
 Runnable examples, in increasing depth:
 
 - [examples/minimal/accessibility.ipynb](examples/minimal/accessibility.ipynb) — what aperta does in ~40 lines using only OpenStreetMap. Cambridge MA, ~10 s.
-- [examples/walkthrough/accessibility.ipynb](examples/walkthrough/accessibility.ipynb) — guided tour of every primitive; multi-modal walk + car, cross-modal logsum, path-first per-edge feature aggregation. Central Paris, ~15 min end-to-end.
+- [examples/walkthrough/accessibility.ipynb](examples/walkthrough/accessibility.ipynb) — guided tour of every primitive; multi-modal walk + bike, cross-modal logsum, path-first per-edge feature aggregation. Central Paris, ~1 min end-to-end.
 - [examples/extended/](examples/extended/) — production-scale Bern + 25 km: prep pipeline, calibration against observed travel times, traffic-flow estimation, accessibility analysis. ~30 min.
 
 The toy-world end-to-end test in [tests/test_workflow.py](tests/test_workflow.py) doubles as the smallest possible walk-through (~150 lines, runs in a second).
@@ -109,7 +109,7 @@ Runnable end-to-end version: [examples/minimal/accessibility.ipynb](examples/min
 | `routing` | Shortest paths on `networkx` graphs via `scipy.sparse.csgraph.dijkstra`. Edge-weighting helpers, single-source / one-to-one primitives, tiered OD routing (`tiered_path_costs`, `tiered_path_aggregate` with per-edge `PathAggregation` and per-node `NodeAggregation` feature aggregation along realised paths), pure path-walker primitive `aggregate_along_paths` (for prebuilt path lists), intrazonal-cost flooring. |
 | `accessibility` | `count_in_bins` (cumulative), `gravity` (decay-based), `nearest_k` (cost to nearest k). Outputs per-node or per-cell depending on input ODM class. |
 | `utility` | Linear utility specs (`Utility`, `RouteFeature`) and pipeline (`route_utility`, `add_endpoint_utility`) for utility-based costs; consumed by `accessibility.gravity` with an exp decay for logsum accessibility. |
-| `overhead` | First/last-mile overheads on cost ODMs. `add_node_overheads` (node-keyed); `add_geo_overheads` / `add_origin_cell_overhead` (geo-keyed); `aggregate_dest_overhead_per_*` helpers for zone/region-tier last-mile. |
+| `overhead` | First/last-mile overheads on cost ODMs. `add_node_overheads` (node-keyed); `add_geo_overheads` / `add_origin_cell_overhead` (geo-keyed); `aggregate_dest_overhead_per_*` helpers for zone-tier last-mile. |
 | `traffic_flows` | Traffic-volume estimation via cost-weighted nested-node sampling (`nested_node_sample`). |
 | `calibration` | OLS calibration of per-edge weights (`calibrate_edge_weights`) against observed point-to-point travel times; bearing-aware traffic-counter snapping (`snap_counters_to_edges`) + counter-fit evaluation (`evaluate_against_counters`) for traffic-flow calibration. |
 | `network_processing` | Network helpers — `consolidate_intersections` (OSMnx-output cleanup with obstacle re-attachment), `get_nested_edge_betweenness` (sampled edge-usage counts from a `nested_node_sample`), `snap_to_network_nodes`, `assign_to_eligible_centroid`, `aggregate_edges_to_nodes`, `lanes_per_direction`. |

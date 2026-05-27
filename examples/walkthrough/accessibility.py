@@ -20,7 +20,7 @@
 # example: walking accessibility to supermarkets across Central Paris
 # (arrondissements 1–7 — the historic core of the city: Louvre, Bourse,
 # Marais, Latin Quarter, Saint-Germain, Invalides, ~14 km²). It takes
-# ~10–15 minutes on a laptop. All data is pulled from public sources
+# ~1 minute on a laptop. All data is pulled from public sources
 # (OpenStreetMap via OSMnx; Uber's H3 grid system); no authentication or
 # external downloads beyond `pip install` are needed.
 #
@@ -743,8 +743,14 @@ print(f"Bike overhead per cell: mean {cells['bike_overhead_s'].mean():.1f}s, "
 # %%
 bike_pairs = od_pairs.get_pairs(
     cells, r_cells=R_CELLS, node_column='bike_node_id',
-    zones=zones, r_zones=R_ZONES,
+    zones=zones, r_zones=R_ZONES, r_medium=R_MEDIUM,
 )
+# Note: `r_medium` is passed explicitly so the bike ODM has the SAME
+# three-tier structure as the walk ODM. `aggregate_across_modes` (below)
+# requires consistent tier structure across modes — without an explicit
+# `r_medium`, the bike call would auto-infer `r_medium = min(r_cells * 10,
+# r_zones) = r_zones`, collapsing the far tier and crashing the cross-modal
+# call.
 bike_times = routing.tiered_path_costs(bike_pairs, bike_graph, weight='bike_time_s')
 bike_pairs_geo, bike_times_geo = od_pairs.reindex_by_geo_unit(
     bike_pairs, bike_times, cells,
