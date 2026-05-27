@@ -420,17 +420,27 @@ def get_pairs(
     *,
     zones: gpd.GeoDataFrame | None = None,
     r_zones: float | None = None,
+    r_medium: float | None = None,
     zones_centroids: gpd.GeoSeries | None = None,
     orig_cells: pd.Series | np.ndarray | None = None,
     dest_cells: pd.Series | np.ndarray | None = None,
     dest_zones: pd.Series | np.ndarray | None = None,
 ) -> TieredODPairs:
-    """Build a tiered OD-pair table with cells_to_cells + zones_to_zones tiers.
+    """Build a tiered OD-pair table with cells_to_cells + cells_to_zones +
+    zones_to_zones tiers.
 
-    Phase A version: emits only `cells_to_cells` (close) and `zones_to_zones`
-    (far) tiers. The third tier `cells_to_zones` (cell origin → zone dest at
-    medium distance) is added in Phase B; it appears as `None` in this
-    transitional state. See module docstring for the architectural design.
+    Tier classification uses ZONE-PAIR distance (for clean mutual exclusion):
+
+        d(Z, Z') < r_cells           → cells_to_cells (close)
+        r_cells ≤ d(Z, Z') < r_medium → cells_to_zones (medium — cell origin, zone dest)
+        r_medium ≤ d(Z, Z') < r_zones → zones_to_zones (far — zone origin, zone dest)
+        else                          → drop
+
+    The middle tier preserves cell-origin precision (different cells in the
+    same zone get separate per-origin dest arrays) while aggregating dests
+    at zone level. Important when zone diameter is meaningful relative to
+    the medium-tier radius — cell variation within a zone is ~10% of trip
+    cost at ~10 km medium-tier distances.
 
     Required input contract:
         cells:   GeoDataFrame; `node_column` must give the network node for each
@@ -440,12 +450,19 @@ def get_pairs(
 
     Args:
         cells: cell-level GeoDataFrame.
-        r_cells: per-zone-pair distance threshold (CRS units, typically metres) for
-            cell tier. Zone pairs closer than this emit per-cell OD pairs.
+        r_cells: per-zone-pair distance threshold (CRS units, typically metres)
+            for the cell tier. Zone pairs closer than this emit per-cell OD pairs.
         node_column: column name on cells/zones holding the network node ID.
-        zones: optional zones GeoDataFrame to enable the zone tier.
-        r_zones: per-zone-pair distance threshold for the zone tier. Required
-            iff `zones` is given.
+        zones: optional zones GeoDataFrame to enable the medium and far tiers.
+        r_zones: per-zone-pair OUTER distance threshold for the far
+            (`zones_to_zones`) tier. Required iff `zones` is given.
+        r_medium: per-zone-pair distance threshold separating the middle
+            (`cells_to_zones`) and far (`zones_to_zones`) tiers. Must satisfy
+            `r_cells ≤ r_medium ≤ r_zones`. **Optional**: when `None`,
+            auto-inferred as `min(r_cells * 10, r_zones)` — a reasonable
+            default for the typical case where the medium-tier sweet spot is
+            ~10× the cell-tier radius (e.g. r_cells=1 km, r_medium=10 km, for
+            car). Set explicitly to control the medium-vs-far storage trade-off.
         zones_centroids: optional custom zone centroids (e.g. population-weighted).
             Falls back to `zones.geometry.centroid`.
 
@@ -455,24 +472,22 @@ def get_pairs(
             them. `None` (default) treats every cell as an origin.
         dest_cells: optional boolean mask aligned with `cells.index`. When
             provided, only cells where `True` are emitted as cell-tier
-            destinations (other cells can still be routed TO, just not at
-            cell-tier resolution). `None` = every cell is a valid cell-tier
-            destination.
+            destinations (other cells can still be routed TO at zone tier).
+            `None` = every cell is a valid cell-tier destination.
         dest_zones: optional boolean mask aligned with `zones.index`. When
-            provided, only zones where `True` are emitted as zone-tier
-            destinations. `None` = every zone is a valid zone-tier dest.
+            provided, only zones where `True` are emitted as middle- or
+            far-tier destinations. `None` = every zone is valid.
 
         The mask filters are critical for **large-area analyses**: when most
         of the area has no opportunity-of-interest (e.g. supermarkets exist in
         ~1% of cells), filtering to relevant destinations drops OD-pair counts
-        by 1-2 orders of magnitude and routing time accordingly. For small
-        areas like the minimal example, the filters can usually be left as
-        `None`.
+        by 1-2 orders of magnitude and routing time accordingly.
 
     Returns:
-        `TieredODPairs` with `cells_to_cells` always populated and
-        `zones_to_zones` if `zones` is given. `cells_to_zones` is currently
-        always `None` (will be populated in Phase B).
+        `TieredODPairs` with `cells_to_cells` always populated, plus
+        `cells_to_zones` and `zones_to_zones` if `zones` is given (either may
+        be empty / absent if the corresponding annulus is empty — e.g. when
+        `r_medium == r_zones`, the far tier is empty).
     """
     _validate_inputs(cells, node_column, zones, r_zones)
     cells_with_node = cells[cells[node_column].notna()]
@@ -491,6 +506,16 @@ def get_pairs(
             dest_node_set=dest_cell_node_set,
         )
     assert r_zones is not None
+
+    # Auto-infer r_medium if not provided. Default: min(r_cells × 10, r_zones).
+    # See module docstring + memory `aperta-flat-refactor-plan` for the
+    # rationale (~10× r_cells is the storage / precision sweet spot).
+    if r_medium is None:
+        r_medium = min(r_cells * 10.0, r_zones)
+    if not (r_cells <= r_medium <= r_zones):
+        raise ValueError(
+            f"`r_medium` must satisfy `r_cells` ({r_cells}) ≤ `r_medium` "
+            f"({r_medium}) ≤ `r_zones` ({r_zones}).")
 
     # --- Setup ---
     if zones_centroids is None:
@@ -511,23 +536,29 @@ def get_pairs(
     )
     n_zones = len(zone_ids)
 
-    # --- Pre-compute cell-tier zone pairs (per-zone-pair, d(Z, Z') < r_cells) ---
-    # `cell_tier_dests[i]` is the array of zone indices j where (Z_i, Z_j) is cell-tier
-    # (includes j == i — same-zone is always cell-tier).
-    logging.info(f"get_pairs: tiered pass over {n_zones:,} zones...")
+    # --- Per-zone-pair tier classification ---
+    # For each origin zone i, precompute three arrays of dest zone indices —
+    # one per tier — mutually exclusive based on Euclidean zone-pair distance.
+    # `cell_tier_dests[i]` includes j == i (same-zone always cell-tier).
+    logging.info(f"get_pairs: tiered pass over {n_zones:,} zones "
+                 f"(r_cells={r_cells}, r_medium={r_medium}, r_zones={r_zones})...")
     log_every = max(1, n_zones // 10)
     cell_tier_dests: list[np.ndarray] = []
+    c2z_tier_dests: list[np.ndarray] = []
+    z2z_tier_dests: list[np.ndarray] = []
     for i in range(n_zones):
         d = np.hypot(zone_xy[:, 0] - zone_xy[i, 0], zone_xy[:, 1] - zone_xy[i, 1])
-        mask = d < r_cells
-        mask[i] = True
-        cell_tier_dests.append(np.where(mask)[0])
+        cell_mask = d < r_cells
+        cell_mask[i] = True
+        cell_tier_dests.append(np.where(cell_mask)[0])
+        c2z_mask = (d >= r_cells) & (d < r_medium)
+        c2z_tier_dests.append(np.where(c2z_mask)[0])
+        z2z_mask = (d >= r_medium) & (d < r_zones)
+        z2z_tier_dests.append(np.where(z2z_mask)[0])
 
     # --- Identify zones that contain at least one origin cell ---
     # When `orig_cells` filter is active, we skip zones that contribute no
-    # origin nodes — they have no cells_to_cells / zones_to_zones OD pairs
-    # since there's nothing to route FROM. Without the filter, every zone is
-    # potentially an origin (current behaviour).
+    # origin nodes — they have no OD pairs since there's nothing to route FROM.
     if orig_node_set is not None:
         zones_with_origin: set = {
             zone_ids[i] for i in range(n_zones)
@@ -537,7 +568,16 @@ def get_pairs(
     else:
         zones_with_origin = None  # signals "every zone"
 
-    # --- Emit cells_to_cells ---
+    # Pre-compute per-zone-index "is this zone an eligible destination?" mask
+    # (used by middle + far tiers).
+    zone_nodes_arr = np.array(zone_nodes, dtype=object)
+    if dest_zone_node_set is not None:
+        zone_is_dest = np.array(
+            [zone_nodes[i] in dest_zone_node_set for i in range(n_zones)], dtype=bool)
+    else:
+        zone_is_dest = None
+
+    # --- Emit cells_to_cells (close: d(Z, Z') < r_cells) ---
     cells_to_cells: defaultdict = defaultdict(set)
     for i in range(n_zones):
         if i and i % log_every == 0:
@@ -563,16 +603,41 @@ def get_pairs(
             for orig in origin_nodes:
                 cells_to_cells[orig].update(dest_set)
 
-    # --- Emit zones_to_zones ---
+    # --- Emit cells_to_zones (medium: r_cells ≤ d(Z, Z') < r_medium) ---
+    # Cell origin → zone dest. Cells in the same zone share the same dest
+    # zone set (since tier classification is zone-pair-based) — but the
+    # cell-keyed origin lets routing produce per-cell cost arrays.
+    cells_to_zones: defaultdict = defaultdict(set)
+    for i in range(n_zones):
+        if i and i % log_every == 0:
+            logging.info(f"  cells_to_zones: {i:,} of {n_zones:,} origin zones")
+        if zones_with_origin is not None and zone_ids[i] not in zones_with_origin:
+            continue
+        origin_nodes = cells_in_zone.get(zone_ids[i], np.array([]))
+        if orig_node_set is not None:
+            origin_nodes = np.array(
+                [n for n in origin_nodes if n in orig_node_set], dtype=origin_nodes.dtype)
+        if len(origin_nodes) == 0:
+            continue
+        dest_zone_idx = c2z_tier_dests[i]
+        if zone_is_dest is not None and len(dest_zone_idx):
+            dest_zone_idx = dest_zone_idx[zone_is_dest[dest_zone_idx]]
+        if len(dest_zone_idx) == 0:
+            continue
+        dest_zones_for_origin = zone_nodes_arr[dest_zone_idx]
+        valid_dests = {
+            n for n in dest_zones_for_origin.tolist()
+            if not (isinstance(n, float) and np.isnan(n))
+        }
+        if not valid_dests:
+            continue
+        for orig in origin_nodes:
+            cells_to_zones[orig].update(valid_dests)
+
+    # --- Emit zones_to_zones (far: r_medium ≤ d(Z, Z') < r_zones) ---
+    # Zone origin → zone dest. Per-zone-origin (not per-cell) — heavy
+    # aggregation, dominates storage savings at long distances.
     zones_to_zones: defaultdict = defaultdict(set)
-    zone_nodes_arr = np.array(zone_nodes, dtype=object)
-    # Pre-compute per-zone-index "is this zone an eligible destination?" mask
-    # if dest_zones filter is active.
-    if dest_zone_node_set is not None:
-        zone_is_dest = np.array(
-            [zone_nodes[i] in dest_zone_node_set for i in range(n_zones)], dtype=bool)
-    else:
-        zone_is_dest = None
     for i in range(n_zones):
         if i and i % log_every == 0:
             logging.info(f"  zones_to_zones: {i:,} of {n_zones:,} origin zones")
@@ -581,29 +646,28 @@ def get_pairs(
         origin_zone_node = zone_nodes[i]
         if pd.isna(origin_zone_node):
             continue
-        # cell-tier mask for origin i
-        cell_mask = np.zeros(n_zones, dtype=bool)
-        cell_mask[cell_tier_dests[i]] = True
-        # zone-tier eligible (excluding cell-tier overlap)
-        d = np.hypot(zone_xy[:, 0] - zone_xy[i, 0], zone_xy[:, 1] - zone_xy[i, 1])
-        zone_eligible = (d < r_zones) & ~cell_mask
-        zone_eligible[i] = False
-        if zone_is_dest is not None:
-            zone_eligible = zone_eligible & zone_is_dest
-        dest_nodes_for_zone = zone_nodes_arr[zone_eligible]
-        # Filter out NaN dest nodes.
+        dest_zone_idx = z2z_tier_dests[i]
+        if zone_is_dest is not None and len(dest_zone_idx):
+            dest_zone_idx = dest_zone_idx[zone_is_dest[dest_zone_idx]]
+        if len(dest_zone_idx) == 0:
+            continue
+        dest_zones_for_zone = zone_nodes_arr[dest_zone_idx]
         valid_dests = [
-            n for n in dest_nodes_for_zone.tolist() if not (isinstance(n, float) and np.isnan(n))
+            n for n in dest_zones_for_zone.tolist()
+            if not (isinstance(n, float) and np.isnan(n))
         ]
         if valid_dests:
             zones_to_zones[origin_zone_node].update(valid_dests)
 
     return TieredODNodePairs(
         cells_to_cells={k: np.asarray(list(v)) for k, v in cells_to_cells.items()},
-        cells_to_zones=None,  # Phase B will populate this medium tier.
+        cells_to_zones=(
+            {k: np.asarray(list(v)) for k, v in cells_to_zones.items()}
+            if cells_to_zones else None
+        ),
         zones_to_zones=(
             {k: np.asarray(list(v)) for k, v in zones_to_zones.items()}
-            if zones is not None else None
+            if zones_to_zones else None
         ),
     )
 

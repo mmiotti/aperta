@@ -919,5 +919,135 @@ class AggregateAcrossModesTestCase(unittest.TestCase):
                 {'walk': (walk_node, walk_node_costs)}, aggregator='min')
 
 
+class CellsToZonesMiddleTierTestCase(unittest.TestCase):
+    """Phase B: `cells_to_zones` middle tier (cell origin, zone dest, for
+    zone-pair distances in [r_cells, r_medium)). Validates the new three-tier
+    design with cells_to_cells + cells_to_zones + zones_to_zones.
+
+    Toy world: 6 cells in 3 zones on a line, with zone centroids at x = 0.5,
+    5.5, 12.5. Zone-pair distances: d(ZA, ZB) = 5, d(ZB, ZC) = 7,
+    d(ZA, ZC) = 12.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cell_data = [
+            ('a0', 0.0, 0.0, 'ZA'), ('a1', 1.0, 0.0, 'ZA'),
+            ('b0', 5.0, 0.0, 'ZB'), ('b1', 6.0, 0.0, 'ZB'),
+            ('c0', 12.0, 0.0, 'ZC'), ('c1', 13.0, 0.0, 'ZC'),
+        ]
+        cls.cells = gpd.GeoDataFrame(
+            {
+                'cell_id': [r[0] for r in cell_data],
+                'node_id': [r[0] for r in cell_data],
+                'zone_id': [r[3] for r in cell_data],
+            },
+            geometry=[Point(r[1], r[2]) for r in cell_data],
+        ).set_index('cell_id')
+        zone_data = [('ZA', 0.5), ('ZB', 5.5), ('ZC', 12.5)]
+        cls.zones = gpd.GeoDataFrame(
+            {'zone_id': [r[0] for r in zone_data],
+             'node_id': [r[0] for r in zone_data]},
+            geometry=[Point(r[1], 0.0) for r in zone_data],
+        ).set_index('zone_id')
+
+    def test_tier_classification_by_zone_pair_distance(self):
+        """All three tiers populate correctly based on zone-pair distance.
+
+        With r_cells=2, r_medium=8, r_zones=15:
+          - ZA-ZA, ZB-ZB, ZC-ZC (d=0) → cells_to_cells (same-zone)
+          - ZA-ZB (5), ZB-ZC (7) in [2, 8) → cells_to_zones
+          - ZA-ZC (12) in [8, 15) → zones_to_zones
+        """
+        pairs = get_pairs(self.cells, r_cells=2.0, node_column='node_id',
+                          zones=self.zones, r_zones=15.0, r_medium=8.0)
+        # cells_to_cells: each cell has only its same-zone partner + self.
+        self.assertEqual(set(pairs.cells_to_cells['a0']), {'a0', 'a1'})
+        self.assertEqual(set(pairs.cells_to_cells['b0']), {'b0', 'b1'})
+        self.assertEqual(set(pairs.cells_to_cells['c0']), {'c0', 'c1'})
+        # cells_to_zones: a0/a1 → ZB; b0/b1 → ZA, ZC; c0/c1 → ZB.
+        assert pairs.cells_to_zones is not None
+        self.assertEqual(set(pairs.cells_to_zones['a0']), {'ZB'})
+        self.assertEqual(set(pairs.cells_to_zones['a1']), {'ZB'})
+        self.assertEqual(set(pairs.cells_to_zones['b0']), {'ZA', 'ZC'})
+        self.assertEqual(set(pairs.cells_to_zones['c0']), {'ZB'})
+        # zones_to_zones: ZA ↔ ZC only.
+        assert pairs.zones_to_zones is not None
+        self.assertEqual(set(pairs.zones_to_zones['ZA']), {'ZC'})
+        self.assertEqual(set(pairs.zones_to_zones['ZC']), {'ZA'})
+        self.assertNotIn('ZB', pairs.zones_to_zones)  # ZB has no far-tier dests
+
+    def test_r_medium_auto_inference(self):
+        """Default r_medium = min(r_cells * 10, r_zones)."""
+        # r_cells=1, r_zones=100 → auto r_medium = min(10, 100) = 10
+        # d(ZA, ZB) = 5 < 10 → cells_to_zones
+        # d(ZB, ZC) = 7 < 10 → cells_to_zones
+        # d(ZA, ZC) = 12 >= 10 → zones_to_zones
+        pairs = get_pairs(self.cells, r_cells=1.0, node_column='node_id',
+                          zones=self.zones, r_zones=100.0)
+        assert pairs.cells_to_zones is not None
+        assert pairs.zones_to_zones is not None
+        self.assertEqual(set(pairs.cells_to_zones['a0']), {'ZB'})
+        self.assertEqual(set(pairs.zones_to_zones['ZA']), {'ZC'})
+
+    def test_r_medium_equals_r_zones_drops_far_tier(self):
+        """When r_medium == r_zones, the far tier is empty (and absent)."""
+        pairs = get_pairs(self.cells, r_cells=1.0, node_column='node_id',
+                          zones=self.zones, r_zones=15.0, r_medium=15.0)
+        # All non-same-zone pairs are cells_to_zones; zones_to_zones is None.
+        self.assertIsNone(pairs.zones_to_zones)
+        assert pairs.cells_to_zones is not None
+        self.assertEqual(set(pairs.cells_to_zones['a0']), {'ZB', 'ZC'})
+
+    def test_r_medium_equals_r_cells_drops_middle_tier(self):
+        """When r_medium == r_cells, the middle tier is empty (and absent)."""
+        pairs = get_pairs(self.cells, r_cells=2.0, node_column='node_id',
+                          zones=self.zones, r_zones=15.0, r_medium=2.0)
+        self.assertIsNone(pairs.cells_to_zones)
+        # All non-same-zone pairs go to zones_to_zones.
+        assert pairs.zones_to_zones is not None
+        self.assertEqual(set(pairs.zones_to_zones['ZA']), {'ZB', 'ZC'})
+
+    def test_invalid_r_medium_raises(self):
+        """`r_medium` must satisfy r_cells ≤ r_medium ≤ r_zones."""
+        with self.assertRaisesRegex(ValueError, "r_medium"):
+            get_pairs(self.cells, r_cells=2.0, node_column='node_id',
+                      zones=self.zones, r_zones=10.0, r_medium=20.0)
+        with self.assertRaisesRegex(ValueError, "r_medium"):
+            get_pairs(self.cells, r_cells=5.0, node_column='node_id',
+                      zones=self.zones, r_zones=10.0, r_medium=2.0)
+
+    def test_mutual_exclusion_no_double_counting(self):
+        """No (origin, dest) pair appears in more than one tier."""
+        pairs = get_pairs(self.cells, r_cells=2.0, node_column='node_id',
+                          zones=self.zones, r_zones=15.0, r_medium=8.0)
+        # For each cell origin, count: same-cell dests across cells_to_cells
+        # and cells_to_zones (translated to zones).
+        assert pairs.cells_to_zones is not None
+        for cell_origin in pairs.cells_to_cells:
+            cell_dests = set(pairs.cells_to_cells[cell_origin].tolist())
+            cell_dest_zones = {self.cells.loc[c, 'zone_id'] for c in cell_dests}
+            c2z_dest_zones = (set(pairs.cells_to_zones[cell_origin].tolist())
+                              if cell_origin in pairs.cells_to_zones else set())
+            # Cell-tier dest zones and c2z dest zones must not overlap.
+            self.assertFalse(
+                cell_dest_zones & c2z_dest_zones,
+                f"Origin {cell_origin}: overlap between cell-tier dest zones "
+                f"{cell_dest_zones} and cells_to_zones {c2z_dest_zones}.")
+
+    def test_cells_in_same_zone_share_c2z_dest_set(self):
+        """Cells in the same zone get the same cells_to_zones dest zones
+        (since tier classification is zone-pair-based, all cells in zone Z
+        see the same medium-tier dest zones)."""
+        pairs = get_pairs(self.cells, r_cells=2.0, node_column='node_id',
+                          zones=self.zones, r_zones=15.0, r_medium=8.0)
+        assert pairs.cells_to_zones is not None
+        # a0 and a1 (both in ZA) have identical dest zone sets.
+        self.assertEqual(
+            set(pairs.cells_to_zones['a0']),
+            set(pairs.cells_to_zones['a1']),
+        )
+
+
 if __name__ == '__main__':
     unittest.main()
