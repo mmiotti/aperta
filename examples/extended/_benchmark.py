@@ -149,12 +149,14 @@ def run_pandana(graph, time_attr, cells, node_col, weight_col, t_metric):
 
 
 def run_aperta_tiered(graph, time_attr, cells, zones, regions, node_col,
-                      weight_col, r_cells_m, r_zones_m, r_regions_m, t_metric):
+                      weight_col, r_cells_m, r_zones_m, r_regions_m, t_metric,
+                      cutoff_s=None):
     """Cells (+ optional zones + optional regions) as tiered origins / dests.
 
     Pass `regions=None, r_regions_m=None` for the 2-tier walk case; pass all
-    three for the 3-tier car case. Returns `(acc, total_s, n_origins)` where
-    `n_origins` is the number of unique cell-tier snap nodes Dijkstra ran from.
+    three for the 3-tier car case. With `cutoff_s` set, routing uses scipy
+    (cutoff in weight units = seconds for time-weighted edges); otherwise
+    igraph (no cutoff). Returns `(acc, total_s, n_origins)`.
     """
     t0 = time.time()
     pairs = od_pairs.get_pairs(
@@ -162,7 +164,8 @@ def run_aperta_tiered(graph, time_attr, cells, zones, regions, node_col,
         zones=zones, r_zones=r_zones_m,
         regions=regions, r_regions=r_regions_m,
     )
-    times = routing.tiered_path_costs(pairs, graph, weight=time_attr)
+    times = routing.tiered_path_costs(pairs, graph, weight=time_attr,
+                                       cutoff=cutoff_s)
     pairs_geo, times_geo = od_pairs.reindex_by_geo_unit(
         pairs, times, cells,
         cell_node_column=node_col,
@@ -291,7 +294,7 @@ def main():
         print(f"construct {t_c:5.1f}s  precompute {t_p:6.1f}s  "
               f"set+aggregate {t_a:5.1f}s  → total {t_c+t_p+t_a:6.1f}s")
 
-        print(f"  Aperta tiered ...", end=' ', flush=True)
+        print(f"  Aperta tiered (igraph) ...", end=' ', flush=True)
         _, t, n_origins = run_aperta_tiered(
             graph, attr, mode_cells, mode_zones, mode_regions, node_col,
             'employment_total',
@@ -299,6 +302,15 @@ def main():
             cfg['metric_t_s'])
         print(f"({n_origins:,} unique snap-node origins from {len(mode_cells):,} cells)  "
               f"→ {t:6.1f} s")
+
+        print(f"  Aperta tiered (scipy, cutoff={cfg['metric_t_s']}s) ...",
+              end=' ', flush=True)
+        _, t, _ = run_aperta_tiered(
+            graph, attr, mode_cells, mode_zones, mode_regions, node_col,
+            'employment_total',
+            cfg['r_cells_m'], cfg['r_zones_m'], r_regions_m,
+            cfg['metric_t_s'], cutoff_s=cfg['metric_t_s'])
+        print(f"→ {t:6.1f} s")
 
         print(f"  Aperta all-nodes ...", end=' ', flush=True)
         _, t, n_origins = run_aperta_all_nodes(
