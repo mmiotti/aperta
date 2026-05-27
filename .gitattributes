@@ -1,3 +1,8 @@
 *.ipynb filter=nbstripout
 *.zpln filter=nbstripout
 *.ipynb diff=ipynb
+
+# Exception: example notebooks ship with outputs intact so figures
+# render on GitHub without re-execution (reviewer on-ramp). Other
+# notebooks (pipeline, research) continue to be stripped on commit.
+examples/**/*.ipynb -filter

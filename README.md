@@ -153,14 +153,21 @@ nbstripout --install
 The filter then runs transparently on every commit — `git diff` and
 `git log` on .ipynb files show only code + markdown changes.
 
+**Exception**: notebooks under [`examples/`](examples/) are exempt from
+the filter and ship with their outputs intact, so figures render
+directly on GitHub. Before committing changes to an example notebook,
+execute it end-to-end (in VSCode / Jupyter, or via
+`jupytext --sync --execute <file>`) so the committed outputs reflect
+the current code.
+
 Notebooks here are jupytext-paired: each `.ipynb` has a `.py` shadow
 under the same basename. Edits in either form propagate to the other
-via `jupytext --sync <file>`. Only the .py shadow needs to be human-
-readable in code review; the .ipynb travels for the GitHub-rendered
-view.
+via `jupytext --sync <file>`. The `.py` shadow is the human-readable
+form for code review; the `.ipynb` carries the executed outputs.
 
-If you skip the `nbstripout --install` step, your commits will include
-output cells (large diffs, slow GitHub renders). Just install it.
+If you skip the `nbstripout --install` step, your commits to non-
+example notebooks will include output cells (large diffs, slow GitHub
+renders). Just install it.
 
 ## License
 
