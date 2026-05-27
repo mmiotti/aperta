@@ -115,7 +115,7 @@ Runnable end-to-end version: [examples/minimal/accessibility.ipynb](examples/min
 | `network_processing` | Network helpers — `consolidate_intersections` (OSMnx-output cleanup with obstacle re-attachment), `get_nested_edge_betweenness` (sampled edge-usage counts from a `nested_node_sample`), `snap_to_network_nodes`, `assign_to_eligible_centroid`, `aggregate_edges_to_nodes`, `lanes_per_direction`. |
 | `geo_processing` | Geometry helpers — hectare and H3 grids, bearings, `sum_within_radius` (same-set neighbourhood sum) and `cross_sum_within_radius` (cross-set buffer aggregation), both via scipy KDTree. |
 | `geo_mapping` | Spatial-join wrappers — `map_points_to_polygons`, `map_polygons_to_points`, `map_points_to_points`, `map_points_to_filtered_lines`. |
-| `geo_units` | Registry of the 5 canonical aperta units (`cells`, `zones`, `regions`, `nodes`, `edges`) and their `id_col` conventions. |
+| `geo_units` | Registry of the 4 canonical aperta units (`cells`, `zones`, `nodes`, `edges`) and their `id_col` conventions. |
 | `osm_helpers` | OSM data fetching + per-edge categorisation via `osmnx` (`fetch_network`, `fetch_pois`, `categorize_edges`). Requires `aperta[osm]`. |
 | `topography` | Copernicus GLO-30 DEM download + raster sampling (`fetch_copernicus_dem`). Requires `aperta[topo]`. |
 | `visualization` | Plot helpers — `plot_cell_values` (single-panel choropleth), `plot_cell_values_comparison` (multi-panel with shared scale), `plot_tiered_destinations` (origin-cell tier viz), `plot_edge_values` (LineCollection-based with sort/z-order control), `add_styled_colorbar`. |

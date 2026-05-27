@@ -2,21 +2,20 @@
 Registry of geographical units recognized by `aperta.data` for shapes, properties,
 and ODMs.
 
-Five canonical units, organized in two groups:
+Four canonical units, organized in two groups:
 
-  AGGREGATION units (`cells`, `zones`, `regions`):
+  AGGREGATION units (`cells`, `zones`):
       The library-canonical hierarchy. Input data (land use, car ownership rates,
-      etc.) maps to these. Each transition `cells → zones → regions` is a
-      many-to-one aggregation.
+      etc.) maps to these. `cells → zones` is a many-to-one aggregation.
 
   NETWORK units (`nodes`, `edges`):
       Belong to a specific network instance (driving, walking, transit). Names
       are universal even though the underlying graphs may differ per mode.
 
 Anything else (municipalities, cantons, buildings, locations, …) is *project-
-specific source data* that gets mapped into one of the five canonical units
+specific source data* that gets mapped into one of the four canonical units
 during preparation — usually in `preparation/<country>/...` or in the project's
-first prep script. The library knows about the five and only the five.
+first prep script. The library knows about the four and only the four.
 
 Each unit declares its **id_col** — the canonical name of the ID column / index
 name for DataFrames keyed by that unit. Convention is "singular + _id" (e.g.
@@ -33,15 +32,10 @@ CANONICAL_UNITS: dict[str, dict[str, str]] = {
                 'description': "Finest spatial unit (typically 100-150m square or hexagonal grid). "
                                "The smallest analysis unit and the only level routed cell-to-cell."},
     'zones':   {'tier': 'aggregation', 'id_col': 'zone_id',
-                'description': "Intermediate aggregation — one zone contains many cells. "
+                'description': "Coarser aggregation — one zone contains many cells. "
                                "Often corresponds to traffic analysis zones (TAZ) in transport modeling, "
                                "but any sensible mid-scale partition of the study area works "
                                "(e.g. census tracts, municipalities)."},
-    'regions': {'tier': 'aggregation', 'id_col': 'region_id',
-                'description': "Coarsest aggregation — one region contains many zones. "
-                               "Often a political / statistical macro-unit (cantons in Switzerland, "
-                               "NUTS-2 in Europe). Used as the fallback resolution for long-distance "
-                               "OD pairs where cell- or zone-level precision isn't needed."},
     'nodes':   {'tier': 'network',     'id_col': 'node_id',
                 'description': "Network nodes (graph vertices) — typically OSM nodes for the mode's "
                                "routable network."},
@@ -50,7 +44,7 @@ CANONICAL_UNITS: dict[str, dict[str, str]] = {
                                "routable network."},
 }
 
-AGGREGATION_HIERARCHY: list[str] = ['cells', 'zones', 'regions']
+AGGREGATION_HIERARCHY: list[str] = ['cells', 'zones']
 
 
 def is_known(unit: str) -> bool:
