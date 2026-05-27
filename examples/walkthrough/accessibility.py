@@ -574,80 +574,7 @@ plt.show()
 
 
 # %% [markdown]
-# ## 10. Path-first: per-edge feature aggregation along realised routes
-#
-# Everything above used aperta's *cost* primitive — routing returns one scalar
-# (travel time) per OD pair, and the accessibility metrics aggregate those
-# scalars. But aperta is also **path-first**: `routing.tiered_path_aggregate`
-# routes shortest paths and aggregates any per-edge attribute along each
-# realised path, returning per-OD-pair scalars. Memory cost is the same as
-# `tiered_path_costs` (paths are processed per-origin and discarded after
-# aggregation).
-#
-# Concrete demo: for each OD pair, compute the **mean road class** of the
-# edges traversed. OSM tags each road with a `highway` value (`residential`,
-# `secondary`, `primary`, …); we map those to a 1–5 ordinal "road class"
-# where higher = busier / less-pedestrian-friendly. Aggregated by mean
-# along the route, this gives "how pedestrian-friendly are the streets
-# I walk through on average?" — a route-aware quality metric that
-# cumulative-opportunity / gravity / nearest-*k* cannot express, because
-# they only see the OD cost, not the geometry of the route itself.
-
-# %%
-# `edge_road_class` was defined back in §4 for the tiered zone-snapping —
-# we reuse it here as the per-edge attribute to aggregate along realised
-# routes. `PathAggregation` matches the `Bin` / `Decay` namedtuple style
-# used elsewhere in aperta: a named spec consisting of an attribute
-# extractor and an aggregator.
-costs, path_aggs = routing.tiered_path_aggregate(
-    pairs, graph, weight='walk_time_s',
-    edge_aggregations=[
-        routing.PathAggregation('mean_road_class', edge_road_class, 'mean'),
-    ],
-)
-mean_road_class_odm = path_aggs['mean_road_class']
-print(mean_road_class_odm)
-
-# %% [markdown]
-# `mean_road_class_odm` is a `TieredODPairs` of the same shape as `times` —
-# one scalar per OD pair, but now representing a route-geometry feature instead
-# of a travel cost. To visualise per origin, take the unweighted mean across
-# cell-tier destinations. (For a more focused metric, you could weight by
-# `supermarkets` and only consider routes to supermarket cells; left as an
-# exercise to keep this section short.)
-
-# %%
-per_origin_road_class = pd.Series(
-    {origin: np.nanmean(values)
-     for origin, values in mean_road_class_odm.cells_to_cells.items()},
-    name='mean_road_class_on_walks',
-)
-# Map node-indexed values back to cell-indexed (many cells can share a node).
-per_cell_road_class = cells['node_id'].map(per_origin_road_class)
-
-viz.plot_cell_values(
-    cells, per_cell_road_class,
-    cmap='magma',
-    title='Mean OSM road class along\nshortest-path walking routes '
-          '(1 = pedestrian, 5 = primary)',
-    overlays=[(supermarkets,
-               {'color': 'cyan', 'markersize': 10, 'edgecolor': 'black'})],
-)
-plt.tight_layout()
-plt.show()
-
-
-# %% [markdown]
-# This demonstrates the path-first design concretely: any per-edge feature
-# you can attach to graph edges — surface type, gradient, perceived safety,
-# pollution exposure, lit-vs-unlit, cycling-infrastructure presence — can
-# be aggregated along realised routes with the same primitive, producing
-# a per-OD or per-origin metric that captures *what the route is like*,
-# not just how long it takes.
-
-
-# %% [markdown]
-# ## 11. Adding a bike mode (separate network + intersection-aware edge times)
+# ## 10. Adding a bike mode (separate network + intersection-aware edge times)
 #
 # Cycling-walking is the canonical "soft modes" pair for accessibility
 # analyses in dense European city centres — cycling-infrastructure
@@ -659,9 +586,9 @@ plt.show()
 #
 # This section adds the bike mode end-to-end in the **time domain** —
 # fetch network, intersection-aware edge times, overhead, route, lift
-# to geo-keyed form, bake overhead. The bike *utility* spec (with a
-# route-feature) lands later in §14, after we've introduced utilities
-# generally.
+# to geo-keyed form, bake overhead. A per-edge bike-friendliness score
+# (used as a route-feature in the utility section later) is computed
+# in §11. The walk + bike utilities + cross-modal logsum follow in §13.
 #
 # Two new ingredients beyond the walking template:
 #
@@ -677,7 +604,7 @@ plt.show()
 #    — exactly the cross-modal effect demonstrated in §12.
 
 # %% [markdown]
-# ### 11.1 Fetch and snap the bike network
+# ### 10.1 Fetch and snap the bike network
 #
 # Same `.to_undirected()` step we used for the walking graph: OSMnx
 # returns a `MultiDiGraph` that respects OSM `oneway=*` tags, which would
@@ -729,7 +656,7 @@ zones['bike_node_id'], _ = network_processing.assign_to_eligible_centroid(
 )
 
 # %% [markdown]
-# ### 11.2 Intersection-aware edge times
+# ### 10.2 Intersection-aware edge times
 #
 # Each edge's bike-time is its `length / bike_speed` baseline plus a flat
 # per-edge penalty — in a simplified OSMnx graph (every degree-2 node
@@ -754,7 +681,7 @@ for u, v, k, data in bike_graph.edges(keys=True, data=True):
     data['bike_time_s'] = base_time + INTERSECTION_PENALTY_S
 
 # %% [markdown]
-# ### 11.3 Bike overhead (unlock + walk-to-bike)
+# ### 10.3 Bike overhead (unlock + walk-to-bike)
 #
 # Per-cell origin overhead = walk-to-bike + fixed setup time. No
 # density-dependent term (unlike cars, bikes don't need to "find
@@ -770,7 +697,7 @@ print(f"Bike overhead per cell: mean {cells['bike_overhead_s'].mean():.1f}s, "
       f"{cells['bike_overhead_s'].quantile(0.95):.1f}]")
 
 # %% [markdown]
-# ### 11.4 Route, lift to geo, bake overhead
+# ### 10.4 Route, lift to geo, bake overhead
 #
 # Same three-step pattern as the walking pipeline (§6, §7): route on the
 # bike graph → reindex to geo-keyed form → bake per-cell origin overhead
@@ -799,6 +726,102 @@ bike_times_geo = overhead.add_origin_cell_overhead(
     bike_times_geo, bike_pairs_geo, cells, 'bike_overhead_s',
 )
 print(bike_times_geo)
+
+
+# %% [markdown]
+# ## 11. Path-first: per-edge feature aggregation along realised routes
+#
+# Everything above used aperta's *cost* primitive — routing returns one
+# scalar (travel time) per OD pair, and the accessibility metrics aggregate
+# those scalars. But aperta is also **path-first**:
+# `routing.tiered_path_aggregate` routes shortest paths and aggregates any
+# per-edge attribute along each realised path, returning per-OD-pair
+# scalars. Memory cost is the same as `tiered_path_costs` (paths are
+# processed per-origin and discarded after aggregation).
+#
+# Concrete use case on the bike network we just built: a **bike-friendliness
+# score** along each shortest cycling route. We tag each edge 1 (busy
+# primary road) to 5 (dedicated cycleway), combining road tier and OSM
+# cycleway-infrastructure tags. Aggregated by mean along the route, this
+# answers "from this cell, how bike-friendly are the typical routes I'd
+# ride?" — a route-quality metric the cost-only metrics in §8/§9 cannot
+# express, because they see only OD time, not route geometry.
+#
+# Same primitive applies to any per-edge feature: gradient, surface type,
+# perceived safety, pollution exposure, lit-vs-unlit. Whatever you can
+# attach to an edge, you can aggregate along realised routes. The bike
+# score plays a second role in §13: it enters the bike utility as a
+# `RouteFeature`, so cyclists value bike-friendly routes proportionally
+# in the discrete-choice accessibility metric.
+
+# %%
+def edge_bike_score(u, v, data) -> float:
+    """Per-edge bike-friendliness, 1 (worst) to 5 (best for cycling).
+
+    Combines road tier (quieter = better) with OSM bicycle-infrastructure
+    tags. Dedicated cycleways score 5 outright; otherwise the base score
+    comes from road tier (inverse of `edge_road_class`: pedestrian = 5,
+    residential = 4, ..., primary/motorway = 1), with a +1 / +2 bonus
+    for cycleway lane / track on the road, capped at 5.
+    """
+    h = data.get('highway')
+    if isinstance(h, list):
+        h = h[0] if h else None
+    # Dedicated bike infrastructure wins outright.
+    if h == 'cycleway' or data.get('bicycle') == 'designated':
+        return 5.0
+    # Base score = inverse of road tier (1..5 → 5..1).
+    base = 6 - int(edge_road_class(u, v, data))
+    # Bonus for any cycleway infrastructure tagged on this road.
+    cw = (data.get('cycleway')
+          or data.get('cycleway:left')
+          or data.get('cycleway:right'))
+    if isinstance(cw, list):
+        cw = cw[0] if cw else None
+    if cw in ('track', 'opposite_track'):
+        bonus = 2
+    elif cw:                  # 'lane', 'shared', 'opposite_lane', etc.
+        bonus = 1
+    else:
+        bonus = 0
+    return float(min(5, base + bonus))
+
+
+# `PathAggregation` matches the `Bin` / `Decay` namedtuple style used
+# elsewhere in aperta: a named spec consisting of an attribute extractor
+# and an aggregator. `tiered_path_aggregate` returns both the per-pair
+# costs and the per-pair aggregated features — same single routing pass.
+_costs, path_aggs = routing.tiered_path_aggregate(
+    bike_pairs, bike_graph, weight='bike_time_s',
+    edge_aggregations=[
+        routing.PathAggregation('bike_score_avg', edge_bike_score, 'mean'),
+    ],
+)
+bike_score_odm = path_aggs['bike_score_avg']
+print(bike_score_odm)
+
+# %% [markdown]
+# Visualise per origin: unweighted mean across cell-tier destinations.
+# (For a more focused metric, you could weight by `supermarkets` and only
+# consider routes to supermarket cells; left as an exercise.)
+
+# %%
+per_origin_bike_score = pd.Series(
+    {origin: np.nanmean(values)
+     for origin, values in bike_score_odm.cells_to_cells.items()},
+    name='mean_bike_score_on_rides',
+)
+per_cell_bike_score = cells['bike_node_id'].map(per_origin_bike_score)
+
+viz.plot_cell_values(
+    cells, per_cell_bike_score, cmap='viridis',
+    title='Mean bike-friendliness score along\nshortest bike routes '
+          '(1 = primary road, 5 = cycleway)',
+    overlays=[(supermarkets,
+               {'color': 'red', 'markersize': 10, 'edgecolor': 'black'})],
+)
+plt.tight_layout()
+plt.show()
 
 
 # %% [markdown]
@@ -871,11 +894,15 @@ plt.show()
 
 
 # %% [markdown]
-# ## 13. Utility-based accessibility (walking)
+# ## 13. Utility-based accessibility & cross-modal logsum
 #
-# Building on the path-first primitive: define a per-mode *utility* function
-# combining travel cost and per-edge route features, then derive
-# discrete-choice-style accessibility metrics from it.
+# Discrete-choice-style accessibility: define a per-mode *utility* function
+# combining travel cost, per-edge route features, and endpoint features,
+# then derive the canonical *logsum* accessibility from it. Cycling is the
+# more interesting case (it carries a route-feature term for bike-
+# friendliness from §11), so we lead with bike; walking, a simpler
+# cost-only spec, follows. We then combine both modes into a single
+# cross-modal logsum.
 #
 # A linear utility per OD pair:
 #
@@ -885,20 +912,36 @@ plt.show()
 #          + Σ_o β_o · feature_o(i)                  (origin features)
 #          + Σ_d β_d · feature_d(j)                  (destination features)
 #
-# For walking, the simplest possible spec: a small fixed constant
-# (representing the trivial setup cost of just leaving the building) and a
-# strong negative time coefficient (every minute of walking really costs
-# you something).
+# ### 13.1 Bike utility with a route-feature
 #
-#     U_walk = −2 − 1 · (t_walk / 60)
+#     U_bike = −7 − 0.7 · (t_bike / 60) + 1.0 · mean_bike_score_on_path
 #
-# Time in seconds is divided by 60 so the coefficient is per *minute* of
-# walking — a more interpretable unit than per-second.
+# - **Constant −7**: Alternative-specific constant. Non-trivial setup before any trip (walk to bike,
+#   unlock, helmet).
+# - **Time coefficient −0.7 / minute**: time costs disutility, but less
+#   per minute than walking (−1, below). Cycling time is less unpleasant
+#   minute-for-minute.
+# - **Route-feature coefficient +1.0 on mean bike-friendliness score**:
+#   `edge_bike_score` from §11 (1 = busy primary, 5 = cycleway), averaged
+#   along the realised route. Positive coefficient = bike-friendlier
+#   routes raise utility.
+#
+# `RouteFeature` triggers `tiered_path_aggregate` internally — one
+# routing pass returns both the cost and the per-OD-pair averaged bike
+# score along the realised path.
 
 # %%
-walking_utility = utility.Utility(
-    constant=-2.0,
-    cost_coefficient=-1.0 / 60.0,    # utils per second (= −1 per minute walking)
+bike_utility = utility.Utility(
+    constant=-7.0,
+    cost_coefficient=-0.7 / 60.0,    # utils per second (= −0.7 per minute)
+    route_features=[
+        utility.RouteFeature(
+            name='bike_score_avg',
+            attribute=edge_bike_score,
+            coefficient=1.0,
+            aggregator='mean',
+        ),
+    ],
 )
 
 # %% [markdown]
@@ -907,155 +950,28 @@ walking_utility = utility.Utility(
 # internally so the routing pass is shared across the cost and all features.
 
 # %%
-route_u = utility.route_utility(
-    pairs, graph, cost_weight='walk_time_s', utility=walking_utility,
+bike_route_u = utility.route_utility(
+    bike_pairs, bike_graph, cost_weight='bike_time_s', utility=bike_utility,
 )
-route_u
 
 # %% [markdown]
 # **Step 2**: add the constant + origin + destination components. This
 # example has neither origin nor destination features in the utility (the
 # destination "attractiveness" enters via the supermarket weight in the
-# gravity step below), so this just adds the −2 constant.
+# gravity step below), so this just adds the −4 constant.
 
 # %%
-full_u = utility.add_endpoint_utility(route_u, pairs, walking_utility, cells=cells)
-
-# %% [markdown]
-# **Step 3**: gravity-on-utility with the `exp` decay = expected sum of
-# attractiveness across destinations, weighted by `exp(utility)`. Taking the
-# log of that sum gives the canonical *logsum accessibility* — the
-# discrete-choice expected utility from the choice set.
-#
-# Lift to geo-keyed form, then bake the per-cell utility overhead
-# (`β_cost · walk_overhead_s`) into the utility ODM via
-# `add_origin_cell_overhead`. Units match (utils + utils), no per-call
-# overhead kwarg needed.
-
-# %%
-# Lift full_u (node-keyed) to geo-keyed using the SAME `pairs_geo` we
-# already built in §7 (origins / dests are the same cells).
-_, full_u_geo = od_pairs.reindex_by_geo_unit(
-    pairs, full_u, cells,
-    cell_node_column='node_id',
-    zones=zones, zone_node_column='node_id',
-)
-cells['util_overhead'] = walking_utility.cost_coefficient * cells['walk_overhead_s']
-full_u_geo = overhead.add_origin_cell_overhead(
-    full_u_geo, pairs_geo, cells, 'util_overhead',
-)
-
-# Custom Decay: gravity expects `exp(-β · cost)`, but utility is "more = better"
-# (not a cost). Plain `np.exp` applied to utility gives the correct exp(U).
-exp_utility_decay = accessibility.Decay('exp_u', np.exp)
-
-gravity_u = accessibility.gravity(
-    full_u_geo, {'supermarkets': sm_weights}, cell_to_zone, exp_utility_decay,
-)
-# Σ_j supermarkets_j · exp(U_ij), per origin cell.
-
-logsum_accessibility = np.log(gravity_u[('exp_u', 'supermarkets')]).rename('logsum_acc')
-logsum_accessibility.head()
-
-# %% [markdown]
-# Logsum is in the same units as utility (utils). It can be negative when the
-# accessible attractiveness is low — that's expected for cells far from any
-# supermarket or that face long walking-times on busy streets. *Less negative
-# = better access.*
-#
-# Note: when there are no reachable supermarkets at all from an origin, the
-# gravity sum is 0 and `log(0) = -inf`. Visualise these as missing cells.
-
-# %%
-# `plot_cell_values` replaces `-inf` (no-reachable cells) with NaN by default.
-viz.plot_cell_values(
-    cells, logsum_accessibility,
-    title=('Logsum accessibility to supermarkets (walking)\n'
-           'utility = −2 − 1·(time/60); less negative = better access'),
-    overlays=[(supermarkets,
-               {'color': 'red', 'markersize': 10, 'edgecolor': 'black'})],
-)
-plt.tight_layout()
-plt.show()
-
-
-# %% [markdown]
-# ## 14. Bike utility with a route-feature
-#
-#     U_bike = −4 − 0.7 · (t_bike / 60) + 0.7 · mean_bike_score_on_path
-#
-# - **Constant −4**: non-trivial setup before any trip (walk to bike,
-#   unlock, helmet — bigger than walking's −2).
-# - **Time coefficient −0.7 / minute**: time costs disutility, but less
-#   per minute than walking (−1). Cycling time is less unpleasant than
-#   walking time minute-for-minute.
-# - **Route-feature coefficient +0.7 on mean bike-friendliness score**:
-#   the score is 1 (worst) to 5 (best), combining road tier and OSM
-#   cycleway infrastructure tags. Highest scores require either a
-#   dedicated cycle path or a quiet road with explicit bike provision;
-#   busy roads with no infrastructure score 1. Positive coefficient =
-#   bike-friendlier routes raise utility.
-#
-# `RouteFeature` triggers `tiered_path_aggregate` internally — one
-# routing pass returns both the cost and the per-OD-pair averaged
-# bike score along the realised path. The bike network, snapping, and
-# `bike_pairs` were already built in §11; the utility step reuses them.
-
-# %%
-def edge_bike_score(u, v, data) -> float:
-    """Per-edge bike-friendliness, 1 (worst) to 5 (best for cycling).
-
-    Combines road tier (quieter = better) with OSM bicycle-infrastructure
-    tags. Dedicated cycleways score 5 outright; otherwise the base score
-    comes from road tier (inverse of `edge_road_class`: pedestrian = 5,
-    residential = 4, ..., primary/motorway = 1), with a +1 / +2 bonus
-    for cycleway lane / track on the road, capped at 5.
-    """
-    h = data.get('highway')
-    if isinstance(h, list):
-        h = h[0] if h else None
-    # Dedicated bike infrastructure wins outright.
-    if h == 'cycleway' or data.get('bicycle') == 'designated':
-        return 5.0
-    # Base score = inverse of road tier (1..5 → 5..1).
-    base = 6 - int(edge_road_class(u, v, data))
-    # Bonus for any cycleway infrastructure tagged on this road.
-    cw = (data.get('cycleway')
-          or data.get('cycleway:left')
-          or data.get('cycleway:right'))
-    if isinstance(cw, list):
-        cw = cw[0] if cw else None
-    if cw in ('track', 'opposite_track'):
-        bonus = 2
-    elif cw:                  # 'lane', 'shared', 'opposite_lane', etc.
-        bonus = 1
-    else:
-        bonus = 0
-    return float(min(5, base + bonus))
-
-
-bike_utility = utility.Utility(
-    constant=-4.0,
-    cost_coefficient=-0.7 / 60.0,    # utils per second (= −0.7 per minute)
-    route_features=[
-        utility.RouteFeature(
-            name='bike_score_avg',
-            attribute=edge_bike_score,
-            coefficient=0.7,
-            aggregator='mean',
-        ),
-    ],
-)
-bike_route_u = utility.route_utility(
-    bike_pairs, bike_graph, cost_weight='bike_time_s', utility=bike_utility,
-)
 bike_full_u = utility.add_endpoint_utility(
     bike_route_u, bike_pairs, bike_utility, cells=cells,
 )
 
-# Lift to geo-keyed form (pairs_geo from §11 would be identical, so we
-# discard the one returned here); bake the per-cell bike origin overhead
-# in utility units (β_cost · bike_overhead_s).
+# %% [markdown]
+# **Step 3**: lift to geo-keyed form, then bake the per-cell bike origin
+# overhead into the utility ODM via `add_origin_cell_overhead`. Units
+# already match (utils + utils) because we pre-multiply `bike_overhead_s`
+# by `β_cost`, so no per-call overhead-conversion is needed.
+
+# %%
 _, bike_full_u_geo = od_pairs.reindex_by_geo_unit(
     bike_pairs, bike_full_u, cells,
     cell_node_column='bike_node_id',
@@ -1066,9 +982,73 @@ bike_full_u_geo = overhead.add_origin_cell_overhead(
     bike_full_u_geo, bike_pairs_geo, cells, 'bike_util_overhead',
 )
 
+# %% [markdown]
+# ### 13.2 Walking utility (cost-only)
+#
+#     U_walk = −3 − 1 · (t_walk / 60)
+#
+# Smaller constant (−3 vs −7) reflects walking's lower setup cost; stronger
+# time coefficient (−1 vs −0.7 per minute) reflects that a minute of walking
+# is more onerous than a minute of cycling. No route feature → the pipeline
+# is identical to bike but skips the per-edge aggregation pass.
+
+# %%
+walking_utility = utility.Utility(
+    constant=-3.0,
+    cost_coefficient=-1.0 / 60.0,
+)
+route_u = utility.route_utility(
+    pairs, graph, cost_weight='walk_time_s', utility=walking_utility,
+)
+full_u = utility.add_endpoint_utility(route_u, pairs, walking_utility, cells=cells)
+_, full_u_geo = od_pairs.reindex_by_geo_unit(
+    pairs, full_u, cells,
+    cell_node_column='node_id',
+    zones=zones, zone_node_column='node_id',
+)
+cells['util_overhead'] = walking_utility.cost_coefficient * cells['walk_overhead_s']
+full_u_geo = overhead.add_origin_cell_overhead(
+    full_u_geo, pairs_geo, cells, 'util_overhead',
+)
 
 # %% [markdown]
-# ## 15. Cross-modal logsum accessibility (walk + bike, utility domain)
+# ### 13.3 Per-mode logsum accessibility
+#
+# Gravity-on-utility with the `exp` decay = expected sum of attractiveness
+# across destinations, weighted by `exp(utility)`. Taking the log of that
+# sum gives the canonical *logsum accessibility* — the discrete-choice
+# expected utility from the choice set.
+#
+# Logsum is in the same units as utility (utils). It can be negative when
+# the accessible attractiveness is low — that's expected for cells far from
+# any supermarket or facing long travel times. *Less negative = better
+# access.* When no destinations are reachable, the gravity sum is 0 and
+# `log(0) = -inf`; viz treats these as missing.
+
+# %%
+# Custom decay: gravity expects `exp(-β · cost)`, but utility is "more = better"
+# (not a cost). Plain `np.exp` applied to utility gives the correct exp(U).
+exp_utility_decay = accessibility.Decay('exp_u', np.exp)
+
+# Walk-only logsum.
+gravity_u_walk = accessibility.gravity(
+    full_u_geo, {'supermarkets': sm_weights}, cell_to_zone, exp_utility_decay,
+)
+walk_logsum = np.log(gravity_u_walk[('exp_u', 'supermarkets')]).rename('walk_logsum')
+
+# Bike-only logsum. Destination weights aligned to bike_pairs_geo: same cells
+# as the walk weights, but the per-origin reachable sets differ.
+sm_weights_bike = od_pairs.dest_values_geo(
+    'supermarkets', bike_pairs_geo, cells, zones=zones,
+)
+gravity_u_bike = accessibility.gravity(
+    bike_full_u_geo, {'supermarkets': sm_weights_bike}, cell_to_zone,
+    exp_utility_decay,
+)
+bike_logsum = np.log(gravity_u_bike[('exp_u', 'supermarkets')]).rename('bike_logsum')
+
+# %% [markdown]
+# ### 13.4 Cross-modal logsum (walk + bike, utility domain)
 #
 # The canonical cross-modal logsum accessibility:
 #
@@ -1076,19 +1056,18 @@ bike_full_u_geo = overhead.add_origin_cell_overhead(
 #
 # Combine the per-mode utility ODMs into a single combined ODM via
 # `aggregate_across_modes` with a custom utility-domain logsum aggregator,
-# then apply gravity-on-utility + log to get one logsum scalar per origin.
+# then apply gravity-on-utility + log.
 #
 # **Note on equivalence with the per-mode shortcut.** Unlike the
 # cross-modal nearest-*k* in §12 (where the in-loop min was load-bearing),
 # the gravity-on-utility logsum is algebraically `ln(Σ_m G_im)` where
 # `G_im = Σ_j W_j · exp(U_ijm)` is the per-mode gravity-on-utility — i.e.
-# you could compute per-mode logsum accessibilities and then `log` the sum
-# of `exp`s, and get the same answer (a sum-order swap). The in-loop
-# pattern below is here for API consistency with §12, dest-set-union
-# handling, and skipping an `exp → log → exp → log` round-trip — not
-# because the equivalence breaks. For cumulative-opportunity or nearest-*k*
-# cross-modal accessibility the in-loop aggregation is the *only*
-# mathematically correct path.
+# `log(exp(walk_logsum) + exp(bike_logsum))` gives the same answer (a
+# sum-order swap). The in-loop pattern below is here for API consistency
+# with §12, dest-set-union handling, and skipping an `exp → log → exp →
+# log` round-trip. For cumulative-opportunity or nearest-*k* cross-modal
+# accessibility the in-loop aggregation is the *only* mathematically
+# correct path.
 
 # %%
 def logsum_utility(stacked: np.ndarray) -> np.ndarray:
@@ -1105,23 +1084,16 @@ def logsum_utility(stacked: np.ndarray) -> np.ndarray:
         return np.log(sum_exp)
 
 
-# Combine the walk + bike utility ODMs at the geo-unit level.
 combined_u_pairs, combined_u = od_pairs.aggregate_across_modes(
     {'walk': (pairs_geo, full_u_geo),
      'bike': (bike_pairs_geo, bike_full_u_geo)},
     aggregator=logsum_utility,
 )
-print(combined_u_pairs)
 
-# Destination weights aligned to the UNION dest set (combined_u_pairs may
-# include cells reachable from some origins by bike but not by walk, or
-# vice versa — sm_weights from §7 was built against `pairs_geo` only).
+# Destination weights aligned to the UNION dest set across modes.
 sm_weights_combined = od_pairs.dest_values_geo(
     'supermarkets', combined_u_pairs, cells, zones=zones,
 )
-
-# Gravity-on-utility: Σ_j W_j · exp(combined_u_ij) = Σ_j W_j · Σ_m exp(U_ijm).
-# Then log → canonical cross-modal logsum accessibility per cell.
 gravity_combined = accessibility.gravity(
     combined_u, {'supermarkets': sm_weights_combined}, cell_to_zone,
     exp_utility_decay,
@@ -1129,33 +1101,36 @@ gravity_combined = accessibility.gravity(
 cross_modal_logsum = np.log(
     gravity_combined[('exp_u', 'supermarkets')]
 ).rename('cross_modal_logsum')
-cross_modal_logsum.head()
 
 # %% [markdown]
-# Visualisation: side-by-side walking-only logsum (from §13) and the
-# cross-modal walking-or-cycling logsum, on a shared colour scale. Cells
-# where neither mode reaches any supermarket appear as missing.
+# Side-by-side: walk-only, bike-only, and cross-modal walk-or-bike logsum,
+# on a shared colour scale. Cells where no mode reaches any supermarket
+# appear as missing.
 
 # %%
 viz.plot_cell_values_comparison(
     cells,
-    {'Walking-only logsum': logsum_accessibility,
-     'Cross-modal logsum (walking or cycling)': cross_modal_logsum},
+    {'Walking only': walk_logsum,
+     'Cycling only': bike_logsum,
+     'Cross-modal (walk + bike)': cross_modal_logsum},
     suptitle='Logsum accessibility to supermarkets — less negative = better',
     overlays=[(supermarkets,
                {'color': 'red', 'markersize': 10, 'edgecolor': 'black'})],
 )
 plt.show()
 
-
 # %% [markdown]
-# The cross-modal map is uniformly *less negative* (better) than walking-only
-# — adding a second mode can only expand reachability. The gap is largest in
-# cells far from any supermarket: walking-only sees long travel times (very
-# negative utility, very small contribution to the gravity sum), but cycling
-# brings them within practical reach. In dense central cells with many
-# walkable supermarkets, the walking utility already dominates the modal
-# sum and the cross-modal addition is small.
+# The cross-modal map is uniformly *less negative* (better) than either
+# single-mode map — adding a second mode can only expand reachability. The gap
+# between walking-only and cross-modal is largest in cells far from any
+# supermarket: walking sees long travel times (very negative utility, very small
+# contribution to the gravity sum), but cycling brings them within practical
+# reach. In dense central cells with many walkable supermarkets, the walking
+# utility already dominates the modal sum and the cross-modal addition is small.
+# In addition, we see the cycling infrastructure quality (mean bike score on
+# routes) take effect: cycling utility, and therefore combined utility, is
+# strongest and most homogeneous in the northeastern part of the city, where the
+# mean bike-friendliness along routes was highest.
 #
 # Architectural notes:
 #
@@ -1175,3 +1150,6 @@ plt.show()
 #   analysis would add them via `add_geo_overheads(dest_cell=...,
 #   dest_zone=...)` on each per-mode utility ODM before aggregation, using
 #   mode-specific utils-per-second conversions.
+
+# %% [markdown]
+#
