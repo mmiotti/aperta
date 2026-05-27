@@ -156,12 +156,24 @@ print(f"{len(cells):,} cells in {len(zones):,} zones")
 # manually (re-add specific way IDs that bridge the gap) or use a custom
 # filter that respects `sidewalk=*` tags. We use `'all'` here as the
 # pragmatic compromise.
+#
+# A second consideration is **directedness**. `graph_from_place` returns
+# a `MultiDiGraph` with directed edges that respect one-way tags — fine
+# for cars, but wrong for walking (pedestrians ignore one-ways). We
+# convert to undirected after projecting. Without this step, a small
+# number of cells whose snap-node sits on a one-way street's exit terminus
+# end up with almost no reachable destinations, producing zero
+# accessibility outliers that compress the colour scale on every map.
 
 # %%
 # Network. `graph_from_place` returns a MultiDiGraph clipped to the place
-# polygon. See the note above on `network_type='all'` vs `'walk'`.
+# polygon. See the note above on `network_type='all'` vs `'walk'`, and on
+# the undirected conversion.
 graph = ox.graph_from_place(PLACE, network_type='all', simplify=True)
 graph = ox.project_graph(graph, to_crs=boundary_proj_crs)
+# Pedestrians can walk either way on one-way streets; undirect after
+# projecting (project_graph returns MultiDiGraph regardless of input).
+graph = graph.to_undirected()
 print(f"Network: {graph.number_of_nodes():,} nodes, {graph.number_of_edges():,} edges")
 
 # %%
@@ -666,10 +678,36 @@ plt.show()
 
 # %% [markdown]
 # ### 11.1 Fetch and snap the bike network
+#
+# Same `.to_undirected()` step we used for the walking graph: OSMnx
+# returns a `MultiDiGraph` that respects OSM `oneway=*` tags, which would
+# otherwise leave a handful of cells whose snap-node sits at a one-way
+# exit terminus with almost no reachable destinations.
+#
+# **Jurisdiction caveat:** undirecting assumes bikes can ride against
+# any one-way street. That holds in Paris, Brussels, Amsterdam etc.
+# (general contraflow cycling allowance) but is too permissive for
+# strict jurisdictions (much of the US, parts of Germany). For a
+# production analysis the cleaner pattern is to keep the graph directed
+# AND re-snap cells away from problem nodes by restricting snap targets
+# to the largest strongly-connected component:
+#
+# ```python
+# import networkx as nx
+# main_scc = max(nx.strongly_connected_components(bike_graph), key=len)
+# cells['bike_node_id'], _ = network_processing.assign_to_eligible_centroid(
+#     cells, bike_graph, eligible_node_ids=main_scc,
+# )
+# ```
+#
+# Or use OSM tags (`oneway:bicycle=no`, `cycleway:left=opposite_lane`,
+# `bicycle:backward=yes`) to pre-filter edges so the bike-graph is
+# directed-but-jurisdiction-correct. Both options are out of scope here.
 
 # %%
 bike_graph = ox.graph_from_place(PLACE, network_type='bike', simplify=True)
 bike_graph = ox.project_graph(bike_graph, to_crs=boundary_proj_crs)
+bike_graph = bike_graph.to_undirected()   # bikes assumed to ignore one-ways
 print(f"Bike network: {bike_graph.number_of_nodes():,} nodes, "
       f"{bike_graph.number_of_edges():,} edges")
 

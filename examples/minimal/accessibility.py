@@ -48,7 +48,7 @@ crs = boundary.estimate_utm_crs()
 graph = ox.project_graph(
     ox.graph_from_place(PLACE, network_type='walk', simplify=True),
     to_crs=crs,
-)
+).to_undirected()  # pedestrians ignore one-ways
 
 # %% [markdown]
 # ## 2. H3 cells (origins) + supermarkets (destinations)
