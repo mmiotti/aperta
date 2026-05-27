@@ -55,8 +55,6 @@ class CountInBinsTestCase(unittest.TestCase):
     def setUp(self):
         self.costs, self.w_pop, self.w_emp, self.c2z = _toy_inputs()
         self.bins = [Bin('short', 0, 300), Bin('medium', 300, 1000), Bin('long', 1000, 6000)]
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_output_shape_and_index(self):
         df = count_in_bins(self.costs, {'pop': self.w_pop}, self.c2z, self.bins)
         self.assertEqual(list(df.index), ['a', 'b'])
@@ -64,8 +62,6 @@ class CountInBinsTestCase(unittest.TestCase):
         self.assertEqual(df.columns.names, ['bin', 'property'])
         self.assertEqual(list(df.columns),
                          [('short', 'pop'), ('medium', 'pop'), ('long', 'pop')])
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_single_property_known_values(self):
         df = count_in_bins(self.costs, {'pop': self.w_pop}, self.c2z, self.bins)
         # a: short = 10+20 = 30; medium = 30; long = 100+200 = 300
@@ -76,8 +72,6 @@ class CountInBinsTestCase(unittest.TestCase):
         self.assertEqual(df.loc['b', ('short', 'pop')], 5.0)
         self.assertEqual(df.loc['b', ('medium', 'pop')], 7.0)
         self.assertEqual(df.loc['b', ('long', 'pop')], 300.0)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_multi_property_amortized_same_result(self):
         """Adding a second property should not change the first's values."""
         single = count_in_bins(self.costs, {'pop': self.w_pop}, self.c2z, self.bins)
@@ -88,8 +82,6 @@ class CountInBinsTestCase(unittest.TestCase):
         # And the new property's values are correct: a-medium-emp = 3; a-long-emp = 50+60 = 110.
         self.assertEqual(multi.loc['a', ('medium', 'emp')], 3.0)
         self.assertEqual(multi.loc['a', ('long', 'emp')], 110.0)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_half_open_boundary(self):
         """Bin is `[lo, hi)`: a destination at exactly `lo` is in; at `hi` is out."""
         costs = TieredODNodePairs(cells_to_cells={'a': np.array([300., 600.])})
@@ -99,8 +91,6 @@ class CountInBinsTestCase(unittest.TestCase):
         # 300 falls in the first bin (lo-inclusive); 600 falls in the second.
         self.assertEqual(df.loc['a', ('lo_inclusive', 'w')], 1.0)
         self.assertEqual(df.loc['a', ('hi_inclusive', 'w')], 1.0)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_non_finite_costs_dropped(self):
         """`np.inf` / `np.nan` costs never match any finite bin."""
         costs = TieredODNodePairs(cells_to_cells={'a': np.array([100., np.inf, np.nan, 200.])})
@@ -110,8 +100,6 @@ class CountInBinsTestCase(unittest.TestCase):
         # Only the two finite-cost rows contribute (1 + 1 = 2). The 9-valued
         # rows at inf/NaN cost are dropped, not counted toward 'any'.
         self.assertEqual(df.loc['a', ('any', 'w')], 2.0)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_cell_only_no_zone_tier(self):
         """Works when `zones_to_zones` is `None` (cells-only tiered pairs)."""
         costs = TieredODNodePairs(cells_to_cells={'a': np.array([100., 500.])})
@@ -120,8 +108,6 @@ class CountInBinsTestCase(unittest.TestCase):
         df = count_in_bins(costs, {'w': w}, {'a': None}, bins)
         self.assertEqual(df.loc['a', ('short', 'w')], 1.0)
         self.assertEqual(df.loc['a', ('long', 'w')], 2.0)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_origin_with_no_matches_zero(self):
         """An origin whose dests miss every bin gets all-zero output, not NaN."""
         costs = TieredODNodePairs(cells_to_cells={'a': np.array([5000., 6000.])})
@@ -130,25 +116,23 @@ class CountInBinsTestCase(unittest.TestCase):
         df = count_in_bins(costs, {'w': w}, {'a': None}, bins)
         self.assertEqual(df.loc['a', ('short', 'w')], 0.0)
         self.assertFalse(df.isna().any().any())
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_three_tiers_all_contribute(self):
-        """Cell + zone + region tiers all stitched and counted correctly."""
+        """Cell + middle + far tiers all stitched and counted correctly."""
         costs = TieredODNodePairs(
             cells_to_cells={'a': np.array([100., 200.])},
-            zones_to_zones={'Z': np.array([1500.])},
-            zones_to_regions={'Z': np.array([10_000.])},
+            cells_to_zones={'a': np.array([1500.])},   # cell origin → zone dest
+            zones_to_zones={'Z': np.array([10_000.])},  # zone origin → zone dest
         )
         w = TieredODNodePairs(
             cells_to_cells={'a': np.array([1., 2.])},
-            zones_to_zones={'Z': np.array([10.])},
-            zones_to_regions={'Z': np.array([100.])},
+            cells_to_zones={'a': np.array([10.])},
+            zones_to_zones={'Z': np.array([100.])},
         )
         bins = [Bin('short', 0, 300), Bin('medium', 300, 5000), Bin('long', 5000, 100_000)]
         df = count_in_bins(costs, {'w': w}, {'a': 'Z'}, bins)
         self.assertEqual(df.loc['a', ('short', 'w')], 3.0)    # 1 + 2 cell-tier
-        self.assertEqual(df.loc['a', ('medium', 'w')], 10.0)  # zone-tier
-        self.assertEqual(df.loc['a', ('long', 'w')], 100.0)   # region-tier
+        self.assertEqual(df.loc['a', ('medium', 'w')], 10.0)  # middle (cells_to_zones)
+        self.assertEqual(df.loc['a', ('long', 'w')], 100.0)   # far (zones_to_zones)
 
 
 class CountInBinsGeoKeyedTestCase(unittest.TestCase):
@@ -229,16 +213,12 @@ class GravityTestCase(unittest.TestCase):
 
     def setUp(self):
         self.costs, self.w_pop, self.w_emp, self.c2z = _toy_inputs()
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_output_shape_and_index(self):
         df = gravity(self.costs, {'pop': self.w_pop}, self.c2z, exp_decay('d', 0.001))
         self.assertEqual(list(df.index), ['a', 'b'])
         self.assertEqual(df.index.name, 'node')
         self.assertEqual(df.columns.names, ['decay', 'property'])
         self.assertEqual(list(df.columns), [('d', 'pop')])
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_single_decay_known_values(self):
         """Hand-computed exponential decay sum across all tiers for origin 'a'."""
         beta = 0.001
@@ -252,8 +232,6 @@ class GravityTestCase(unittest.TestCase):
             + 200 * np.exp(-beta * 5000)
         )
         self.assertAlmostEqual(df.loc['a', ('d', 'pop')], expected_a)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_multiple_decays_share_stitching(self):
         """Calling with N decays gives N independent columns; values match per-decay calls."""
         decays = [exp_decay('slow', 0.0005), exp_decay('fast', 0.005)]
@@ -262,8 +240,6 @@ class GravityTestCase(unittest.TestCase):
             single = gravity(self.costs, {'pop': self.w_pop}, self.c2z, d)
             pd.testing.assert_series_equal(
                 multi[(d.name, 'pop')], single[(d.name, 'pop')], check_names=False)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_multi_property_amortized_same_result(self):
         """Adding a second property does not change the first's column."""
         d = exp_decay('d', 0.001)
@@ -271,8 +247,6 @@ class GravityTestCase(unittest.TestCase):
         multi = gravity(self.costs, {'pop': self.w_pop, 'emp': self.w_emp}, self.c2z, d)
         pd.testing.assert_series_equal(
             single[('d', 'pop')], multi[('d', 'pop')], check_names=False)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_power_decay_constructor(self):
         """`power_decay` produces `c**(-beta)`. Check against hand computation."""
         beta = 1.0
@@ -281,8 +255,6 @@ class GravityTestCase(unittest.TestCase):
         df = gravity(costs, {'w': w}, {'a': None}, power_decay('inv', beta))
         # 1/1 + 1/2 + 1/4 = 1.75
         self.assertAlmostEqual(df.loc['a', ('inv', 'w')], 1.75)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_custom_decay_callable(self):
         """Decay can be any vectorised callable."""
         # Linear decay: f(c) = max(0, 1 - c/threshold).
@@ -293,8 +265,6 @@ class GravityTestCase(unittest.TestCase):
         df = gravity(costs, {'w': w}, {'a': None}, decay)
         # f(0)=1, f(500)=0.5, f(1000)=0, f(2000)=0  → sum = 1.5
         self.assertAlmostEqual(df.loc['a', ('linear', 'w')], 1.5)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_non_finite_costs_dropped(self):
         """`np.inf` / `np.nan` costs contribute zero to the gravity sum."""
         costs = TieredODNodePairs(cells_to_cells={'a': np.array([0., np.inf, np.nan, 100.])})
@@ -302,8 +272,6 @@ class GravityTestCase(unittest.TestCase):
         df = gravity(costs, {'w': w}, {'a': None}, exp_decay('d', 0.0))
         # exp(0) = 1 for the two finite-cost entries; inf/nan dropped.
         self.assertAlmostEqual(df.loc['a', ('d', 'w')], 2.0)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_power_decay_with_zero_cost_does_not_corrupt(self):
         """power-law decay produces inf at c=0; defensive drop keeps the sum finite."""
         # Without intrazonal-cost handling, a self-pair at cost 0 would give inf.
@@ -317,32 +285,26 @@ class GravityTestCase(unittest.TestCase):
             df = gravity(costs, {'w': w}, {'a': None}, power_decay('inv', 1.0))
         # Defensive drop: 1/1 + 1/2 = 1.5; the c=0 entry is dropped.
         self.assertAlmostEqual(df.loc['a', ('inv', 'w')], 1.5)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_three_tiers_all_contribute(self):
-        """Cell + zone + region tiers all stitched and gravity-weighted correctly."""
+        """Cell + middle + far tiers all stitched and gravity-weighted correctly."""
         costs = TieredODNodePairs(
             cells_to_cells={'a': np.array([100., 200.])},
-            zones_to_zones={'Z': np.array([1500.])},
-            zones_to_regions={'Z': np.array([10_000.])},
+            cells_to_zones={'a': np.array([1500.])},
+            zones_to_zones={'Z': np.array([10_000.])},
         )
         w = TieredODNodePairs(
             cells_to_cells={'a': np.array([1., 2.])},
-            zones_to_zones={'Z': np.array([10.])},
-            zones_to_regions={'Z': np.array([100.])},
+            cells_to_zones={'a': np.array([10.])},
+            zones_to_zones={'Z': np.array([100.])},
         )
         beta = 0.001
         df = gravity(costs, {'w': w}, {'a': 'Z'}, exp_decay('d', beta))
         expected = (1 * np.exp(-beta * 100) + 2 * np.exp(-beta * 200)
                     + 10 * np.exp(-beta * 1500) + 100 * np.exp(-beta * 10_000))
         self.assertAlmostEqual(df.loc['a', ('d', 'w')], expected)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_empty_decays_raises(self):
         with self.assertRaisesRegex(ValueError, "decays.*non-empty"):
             gravity(self.costs, {'pop': self.w_pop}, self.c2z, [])
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_geo_keyed_overhead_shifts_decay(self):
         """Geo-keyed: per-cell overhead baked via `add_origin_cell_overhead`
         shifts every cost; for exp decay that's a uniform multiplicative
@@ -400,16 +362,12 @@ class NearestKTestCase(unittest.TestCase):
 
     def setUp(self):
         self.costs, self.w_pop, self.w_emp, self.c2z = _toy_inputs()
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_output_shape_and_index(self):
         df = nearest_k(self.costs, {'pop': self.w_pop}, self.c2z, ks=[1, 3])
         self.assertEqual(list(df.index), ['a', 'b'])
         self.assertEqual(df.index.name, 'node')
         self.assertEqual(df.columns.names, ['k', 'property'])
         self.assertEqual(list(df.columns), [(1, 'pop'), (3, 'pop')])
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_k_equals_one_is_cost_of_nearest_opportunity(self):
         """k=1: cost of the first (lowest-cost) weight-unit — the nearest opportunity."""
         df = nearest_k(self.costs, {'pop': self.w_pop}, self.c2z, ks=1)
@@ -417,8 +375,6 @@ class NearestKTestCase(unittest.TestCase):
         # 'b': nearest dest at cost 150 has weight 5 — first opportunity at cost 150.
         self.assertEqual(df.loc['a', (1, 'pop')], 100.0)
         self.assertEqual(df.loc['b', (1, 'pop')], 150.0)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_cost_mean_unit_weights(self):
         """With weight=1 at every dest, `cost_mean` is just the arithmetic mean of the k cheapest costs."""
         costs = TieredODNodePairs(cells_to_cells={'a': np.array([100., 200., 300., 400.])})
@@ -428,8 +384,6 @@ class NearestKTestCase(unittest.TestCase):
         self.assertEqual(df.loc['a', (2, 'w')], 150.0)  # (100 + 200) / 2
         self.assertEqual(df.loc['a', (3, 'w')], 200.0)  # (100 + 200 + 300) / 3
         self.assertEqual(df.loc['a', (4, 'w')], 250.0)  # (100 + 200 + 300 + 400) / 4
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_cost_mean_multi_unit_destination(self):
         """A destination with weight=3 contributes 3 weight-units at the same cost."""
         costs = TieredODNodePairs(cells_to_cells={'a': np.array([100., 200.])})
@@ -441,8 +395,6 @@ class NearestKTestCase(unittest.TestCase):
         self.assertEqual(df.loc['a', (3, 'w')], 100.0)
         # k = 4: 3 units at 100 + 1 unit at 200 → mean = (300 + 200) / 4 = 125.
         self.assertEqual(df.loc['a', (4, 'w')], 125.0)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_cost_mean_fractional_boundary(self):
         """When k boundary lands mid-destination, partial contribution from that destination."""
         costs = TieredODNodePairs(cells_to_cells={'a': np.array([10., 100.])})
@@ -450,8 +402,6 @@ class NearestKTestCase(unittest.TestCase):
         # k = 3: 2 units at 10 + 1 unit at 100 → mean = (20 + 100) / 3 ≈ 40.
         df = nearest_k(costs, {'w': w}, {'a': None}, ks=[3])
         self.assertAlmostEqual(df.loc['a', (3, 'w')], 40.0)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_cost_at_k_aggregator(self):
         """`cost_at_k` returns the cost where cumulative weight first reaches k."""
         costs = TieredODNodePairs(cells_to_cells={'a': np.array([100., 200., 300., 400.])})
@@ -462,8 +412,6 @@ class NearestKTestCase(unittest.TestCase):
         self.assertEqual(df.loc['a', (2, 'w')], 200.0)
         self.assertEqual(df.loc['a', (3, 'w')], 300.0)
         self.assertEqual(df.loc['a', (4, 'w')], 400.0)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_cost_at_k_with_multi_unit_destination(self):
         """cost_at_k locks to the destination that pushed cum_weight over k."""
         costs = TieredODNodePairs(cells_to_cells={'a': np.array([100., 200.])})
@@ -474,8 +422,6 @@ class NearestKTestCase(unittest.TestCase):
         self.assertEqual(df.loc['a', (2, 'w')], 100.0)
         self.assertEqual(df.loc['a', (3, 'w')], 100.0)
         self.assertEqual(df.loc['a', (4, 'w')], 200.0)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_k_exceeds_available_returns_nan(self):
         """If total positive weight < k, return NaN — the k-th opportunity is unreachable."""
         costs = TieredODNodePairs(cells_to_cells={'a': np.array([100., 200.])})
@@ -485,8 +431,6 @@ class NearestKTestCase(unittest.TestCase):
         self.assertEqual(df.loc['a', (2, 'w')], 150.0)
         self.assertTrue(np.isnan(df.loc['a', (3, 'w')]))
         self.assertTrue(np.isnan(df.loc['a', (100, 'w')]))
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_zero_weight_destinations_excluded(self):
         """Destinations with weight 0 don't count toward k, even if their cost is lowest."""
         costs = TieredODNodePairs(cells_to_cells={'a': np.array([100., 200., 300.])})
@@ -495,8 +439,6 @@ class NearestKTestCase(unittest.TestCase):
         # Nearest unit is at cost 200 (weight 1); next at cost 300 (weight 1).
         self.assertEqual(df.loc['a', (1, 'w')], 200.0)
         self.assertEqual(df.loc['a', (2, 'w')], 250.0)  # (200 + 300) / 2
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_no_positive_weights_returns_nan(self):
         """An origin with no positive-weight destinations gets NaN everywhere."""
         costs = TieredODNodePairs(cells_to_cells={'a': np.array([100., 200.])})
@@ -504,8 +446,6 @@ class NearestKTestCase(unittest.TestCase):
         df = nearest_k(costs, {'w': w}, {'a': None}, ks=[1, 5])
         self.assertTrue(np.isnan(df.loc['a', (1, 'w')]))
         self.assertTrue(np.isnan(df.loc['a', (5, 'w')]))
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_non_finite_costs_excluded(self):
         """`inf` / `nan` costs are never the nearest, regardless of weight."""
         costs = TieredODNodePairs(cells_to_cells={'a': np.array([100., np.inf, 200., np.nan])})
@@ -514,8 +454,6 @@ class NearestKTestCase(unittest.TestCase):
         # Only two finite-cost destinations: 100 (w=1), 200 (w=1).
         self.assertEqual(df.loc['a', (1, 'w')], 100.0)
         self.assertEqual(df.loc['a', (2, 'w')], 150.0)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_multi_property(self):
         """Different properties give independent cost_means against the same sort."""
         df = nearest_k(self.costs, {'pop': self.w_pop, 'emp': self.w_emp}, self.c2z, ks=[2])
@@ -525,19 +463,17 @@ class NearestKTestCase(unittest.TestCase):
         #   1 unit from dest 1 (cost 200) → mean = (100 + 200) / 2 = 150.
         self.assertEqual(df.loc['a', (2, 'pop')], 100.0)
         self.assertEqual(df.loc['a', (2, 'emp')], 150.0)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_three_tiers_sort_across(self):
-        """Sort spans across cell / zone / region tiers with proper weight accumulation."""
+        """Sort spans across cell / middle / far tiers with proper weight accumulation."""
         costs = TieredODNodePairs(
             cells_to_cells={'a': np.array([2000., 100.])},
-            zones_to_zones={'Z': np.array([1000., 500.])},
-            zones_to_regions={'Z': np.array([10_000.])},
+            cells_to_zones={'a': np.array([500.])},      # middle tier (cell origin)
+            zones_to_zones={'Z': np.array([1000., 10_000.])},
         )
         w = TieredODNodePairs(
             cells_to_cells={'a': np.array([100., 1.])},
-            zones_to_zones={'Z': np.array([20., 10.])},
-            zones_to_regions={'Z': np.array([1000.])},
+            cells_to_zones={'a': np.array([10.])},
+            zones_to_zones={'Z': np.array([20., 1000.])},
         )
         # Sort by cost: 100 (w=1), 500 (w=10), 1000 (w=20), 2000 (w=100), 10000 (w=1000).
         # cum_w: 1, 11, 31, 131, 1131.
@@ -548,8 +484,6 @@ class NearestKTestCase(unittest.TestCase):
         self.assertEqual(df.loc['a', (1, 'w')], 100.0)
         self.assertAlmostEqual(df.loc['a', (2, 'w')], 300.0)
         self.assertAlmostEqual(df.loc['a', (3, 'w')], (100 + 500 * 2) / 3)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_geo_keyed_overhead_shifts_cost(self):
         """Geo-keyed: with one cell per zone, per-cell overhead = per-zone-mean
         overhead, so cell + zone tier shift by the same amount → cost_mean
@@ -600,13 +534,9 @@ class NearestKTestCase(unittest.TestCase):
         np.testing.assert_array_almost_equal(
             df.loc['c2'].values, df.loc['c1'].values + 100.0)
         self.assertEqual(df.index.name, 'cell')
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_unknown_aggregator_raises(self):
         with self.assertRaisesRegex(ValueError, "Unknown aggregator"):
             nearest_k(self.costs, {'pop': self.w_pop}, self.c2z, ks=[1], aggregator='nope')
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_invalid_k_raises(self):
         with self.assertRaisesRegex(ValueError, "> 0"):
             nearest_k(self.costs, {'pop': self.w_pop}, self.c2z, ks=[0, 1])

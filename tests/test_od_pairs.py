@@ -3,27 +3,33 @@
 Run with:
     cd src && python -m unittest tests.test_od_pairs
 
-The new contract:
+The contract:
     `get_pairs` returns a `TieredODPairs` dataclass with up to three OD dicts —
-    `cells_to_cells`, `zones_to_zones`, `zones_to_regions` — each at its tier's
-    resolution. Tier assignment is per-region-pair (with same-region as implicit
-    zone tier and promotion when any cross-region cell-tier crossing exists).
-    Cell tier is per-zone-pair (only thing that uses zone-centroid distance).
+    `cells_to_cells`, `cells_to_zones`, `zones_to_zones` — at increasing
+    levels of aggregation. Tier assignment is per-ZONE-pair (uses zone-centroid
+    distance for clean mutual exclusion); the middle tier preserves per-cell
+    origin precision.
 
-Synthetic-world fixture: a 3×3 cell grid grouped into 3 zones and 2 regions:
+Synthetic-world fixture: a 3×3 cell grid grouped into 3 zones:
 
     cells (unit spacing, integer coords):
-        C6 C7 C8        zones: Z0 = {C0..C3}    regions: R0 = {Z0, Z1}
-        C3 C4 C5               Z1 = {C4, C5}             R1 = {Z2}
+        C6 C7 C8        zones: Z0 = {C0..C3}
+        C3 C4 C5               Z1 = {C4, C5}
         C0 C1 C2               Z2 = {C6, C7, C8}
 
     Cell Ci is mapped to network node Ni at the same coords.
     Zone Zk → representative network node ZNk at the zone centroid.
-    Region Rk → representative network node RNk at the region centroid.
+
+Zone *polygon centroids* (what tier classification uses):
+    Z0 → (1.0, 0.0)    Z1 → (1.0, 1.0)    Z2 → (1.0, 2.0)
+Zone-pair distances: d(Z0, Z1) = 1.0, d(Z1, Z2) = 1.0, d(Z0, Z2) = 2.0.
+
+(The network nodes ZN0/ZN1/ZN2 are placed elsewhere — at (1, 0.5), (1, 1),
+(1, 2) — and only matter for tests that exercise `get_euclidian_dists` etc.)
 
 Populations: each cell `Ci` has `population = (i + 1) * 100` (total = 4500).
-Zones and regions are aggregated through the cell→zone→region mapping so the
-conservation invariant is testable.
+Zones are aggregated through the cell→zone mapping so the conservation
+invariant is testable.
 """
 import logging
 import unittest
@@ -59,12 +65,11 @@ def _square(x: float, y: float) -> Polygon:
                     (x + 0.5, y + 0.5), (x - 0.5, y + 0.5)])
 
 
-def _build_world() -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame]:
+def _build_world() -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame]:
     cell_coords = [(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1), (0, 2), (1, 2), (2, 2)]
     node_specs = (
         [(f'N{i}', float(x), float(y)) for i, (x, y) in enumerate(cell_coords)]
         + [('ZN0', 1.0, 0.5), ('ZN1', 1.0, 1.0), ('ZN2', 1.0, 2.0)]
-        + [('RN0', 1.0, 0.5), ('RN1', 1.0, 2.0)]
     )
     nodes = gpd.GeoDataFrame(
         [{'node_id': nid, 'geometry': Point(x, y)} for nid, x, y in node_specs],
@@ -82,23 +87,15 @@ def _build_world() -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame
     cells = gpd.GeoDataFrame(cell_rows, crs='EPSG:2056').set_index('cell_id')
 
     zones = gpd.GeoDataFrame([
-        {'zone_id': 'Z0', 'node_id': 'ZN0', 'region_id': 'R0',
+        {'zone_id': 'Z0', 'node_id': 'ZN0',
          'geometry': Polygon([(-0.5, -0.5), (2.5, -0.5), (2.5, 0.5), (-0.5, 0.5)])},
-        {'zone_id': 'Z1', 'node_id': 'ZN1', 'region_id': 'R0',
+        {'zone_id': 'Z1', 'node_id': 'ZN1',
          'geometry': Polygon([(-0.5, 0.5), (2.5, 0.5), (2.5, 1.5), (-0.5, 1.5)])},
-        {'zone_id': 'Z2', 'node_id': 'ZN2', 'region_id': 'R1',
+        {'zone_id': 'Z2', 'node_id': 'ZN2',
          'geometry': Polygon([(-0.5, 1.5), (2.5, 1.5), (2.5, 2.5), (-0.5, 2.5)])},
     ], crs='EPSG:2056').set_index('zone_id')
     zones['population'] = cells.groupby('zone_id')['population'].sum()
-
-    regions = gpd.GeoDataFrame([
-        {'region_id': 'R0', 'node_id': 'RN0',
-         'geometry': Polygon([(-0.5, -0.5), (2.5, -0.5), (2.5, 1.5), (-0.5, 1.5)])},
-        {'region_id': 'R1', 'node_id': 'RN1',
-         'geometry': Polygon([(-0.5, 1.5), (2.5, 1.5), (2.5, 2.5), (-0.5, 2.5)])},
-    ], crs='EPSG:2056').set_index('region_id')
-    regions['population'] = zones.groupby('region_id')['population'].sum()
-    return nodes, cells, zones, regions
+    return nodes, cells, zones
 
 
 # -------------------- helpers --------------------
@@ -119,25 +116,19 @@ class CellsOnlyTestCase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.nodes, cls.cells, cls.zones, cls.regions = _build_world()
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
+        cls.nodes, cls.cells, cls.zones = _build_world()
     def test_returns_only_cells_tier(self):
         pairs = get_pairs(self.cells, r_cells=0.5, node_column='node_id')
         self.assertIsInstance(pairs, TieredODPairs)
+        self.assertIsNone(pairs.cells_to_zones)
         self.assertIsNone(pairs.zones_to_zones)
-        self.assertIsNone(pairs.zones_to_regions)
         for cn in self.cells['node_id']:
             self.assertIn(cn, pairs.cells_to_cells[cn].tolist())
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_per_cell_distance(self):
         pairs = get_pairs(self.cells, r_cells=1.01, node_column='node_id')
         self.assertCountEqual(pairs.cells_to_cells['N0'].tolist(), ['N0', 'N1', 'N3'])
         self.assertCountEqual(pairs.cells_to_cells['N4'].tolist(),
                               ['N1', 'N3', 'N4', 'N5', 'N7'])
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_symmetric(self):
         pairs = get_pairs(self.cells, r_cells=1.5, node_column='node_id')
         ok, bad = _is_symmetric(pairs.cells_to_cells)
@@ -145,120 +136,70 @@ class CellsOnlyTestCase(unittest.TestCase):
 
 
 class TieredAssignmentTestCase(unittest.TestCase):
-    """Per-region-pair tier classification with intra-region/same-zone carve-outs."""
+    """Per-zone-pair tier classification by zone-centroid distance.
+
+    With our toy world: d(Z0, Z1)=0.5, d(Z1, Z2)=1.0, d(Z0, Z2)=1.5.
+    """
 
     @classmethod
     def setUpClass(cls):
-        cls.nodes, cls.cells, cls.zones, cls.regions = _build_world()
+        cls.nodes, cls.cells, cls.zones = _build_world()
 
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_same_zone_always_cell_tier(self):
-        # r_cells=0: only same-zone carve-out fires.
+        # r_cells=0.0: only the same-zone carve-out fires.
         pairs = get_pairs(self.cells, r_cells=0.0, node_column='node_id',
                           zones=self.zones, r_zones=0.0)
         for orig in ['N0', 'N1', 'N2', 'N3']:
             self.assertCountEqual(pairs.cells_to_cells[orig].tolist(),
                                   ['N0', 'N1', 'N2', 'N3'])
 
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
-    def test_same_region_always_zone_tier(self):
-        # Same-region (Z0, Z1 both in R0) → always zone-tier regardless of r_zones.
+    def test_cells_to_zones_when_pair_in_middle_band(self):
+        # r_cells=0, r_medium=3.0, r_zones=3.0 → all non-same-zone pairs
+        # (d ∈ {1, 1, 2}) land in the middle tier; far tier empty.
         pairs = get_pairs(self.cells, r_cells=0.0, node_column='node_id',
-                          zones=self.zones, r_zones=0.0,
-                          regions=self.regions, r_regions=0.0)
+                          zones=self.zones, r_zones=3.0, r_medium=3.0)
+        assert pairs.cells_to_zones is not None
+        # N0 (cell C0 in Z0) → should reach ZN1 and ZN2 at middle tier.
+        self.assertCountEqual(pairs.cells_to_zones['N0'].tolist(), ['ZN1', 'ZN2'])
+        self.assertIsNone(pairs.zones_to_zones)
+
+    def test_zones_to_zones_when_pair_in_far_band(self):
+        # r_cells=0, r_medium=0 → no middle tier; r_zones=3.0 → all
+        # non-same-zone pairs land in the far tier.
+        pairs = get_pairs(self.cells, r_cells=0.0, node_column='node_id',
+                          zones=self.zones, r_zones=3.0, r_medium=0.0)
         assert pairs.zones_to_zones is not None
-        self.assertIn('ZN1', pairs.zones_to_zones['ZN0'].tolist())
-        self.assertIn('ZN0', pairs.zones_to_zones['ZN1'].tolist())
-        # Z2 in different region; r_regions=0 → no link from Z0/Z1 to Z2 anywhere.
-        self.assertNotIn('ZN2', pairs.zones_to_zones.get('ZN0', np.array([])).tolist())
+        # ZN0 (Z0) → reaches ZN1 and ZN2 at far tier.
+        self.assertCountEqual(pairs.zones_to_zones['ZN0'].tolist(), ['ZN1', 'ZN2'])
+        self.assertIsNone(pairs.cells_to_zones)
 
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
-    def test_cross_region_zone_tier_when_regions_close(self):
-        # R0 centroid (1, 0.5), R1 centroid (1, 2.0). d(R0, R1) = 1.5.
-        # r_zones=2.0 → R0, R1 close enough; all (Z⊂R0, Z'⊂R1) zone-tier.
+    def test_far_tier_dropped_when_outside_r_zones(self):
+        # r_zones=0 → no zone-pair is in the outer annulus.
         pairs = get_pairs(self.cells, r_cells=0.0, node_column='node_id',
-                          zones=self.zones, r_zones=2.0,
-                          regions=self.regions, r_regions=10.0)
-        assert pairs.zones_to_zones is not None
-        # ZN0 should now reach ZN2 (cross-region zone-tier).
-        self.assertIn('ZN2', pairs.zones_to_zones['ZN0'].tolist())
-        # No region-tier emission for (R0, R1) since they're at zone-tier.
-        assert pairs.zones_to_regions is not None
-        self.assertNotIn('RN1', pairs.zones_to_regions.get('ZN0', np.array([])).tolist())
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
-    def test_region_tier_when_regions_far(self):
-        # d(R0, R1) = 1.5. r_zones=1.0 (R0/R1 not close enough), r_regions=2.0 (covers).
-        pairs = get_pairs(self.cells, r_cells=0.0, node_column='node_id',
-                          zones=self.zones, r_zones=1.0,
-                          regions=self.regions, r_regions=2.0)
-        assert pairs.zones_to_regions is not None
-        # All zones in R0 should reach R1 (per-zone).
-        self.assertCountEqual(pairs.zones_to_regions['ZN0'].tolist(), ['RN1'])
-        self.assertCountEqual(pairs.zones_to_regions['ZN1'].tolist(), ['RN1'])
-        # And the (only) zone in R1 should reach R0.
-        self.assertCountEqual(pairs.zones_to_regions['ZN2'].tolist(), ['RN0'])
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
-    def test_region_tier_dropped_when_too_far(self):
-        # r_regions=0 → nothing cross-region.
-        pairs = get_pairs(self.cells, r_cells=0.0, node_column='node_id',
-                          zones=self.zones, r_zones=0.0,
-                          regions=self.regions, r_regions=0.0)
-        assert pairs.zones_to_regions is not None
-        self.assertEqual(len(pairs.zones_to_regions), 0)
+                          zones=self.zones, r_zones=0.0, r_medium=0.0)
+        self.assertIsNone(pairs.zones_to_zones)
+        self.assertIsNone(pairs.cells_to_zones)
 
 
-class PromotionTestCase(unittest.TestCase):
-    """If any cross-region (Z, Z') is cell-tier, the whole (R, R') is promoted to
-    zone-tier (instead of region-tier) — preserves conservation exactly.
+class SymmetryTestCase(unittest.TestCase):
+    """Tiered output is symmetric within node-keyed tiers (cells_to_cells and
+    zones_to_zones). The middle tier mixes cell-node and zone-node keys, so
+    symmetry doesn't apply per-key — only its overall coverage is symmetric.
     """
 
     @classmethod
     def setUpClass(cls):
-        cls.nodes, cls.cells, cls.zones, cls.regions = _build_world()
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
-    def test_cross_region_cell_tier_promotes_to_zone_tier(self):
-        # Without promotion: with r_cells big enough to span R0-R1 (e.g. cells C5
-        # in Z1⊂R0 at (2, 1) and C8 in Z2⊂R1 at (2, 2) have d=1.0), AND r_zones too
-        # small for the regions, (R0, R1) would land in region tier with C5-C8 also
-        # at cell tier → double-count.
-        # With promotion: (R0, R1) is forced to zone tier; cells get clean coverage.
+        cls.nodes, cls.cells, cls.zones = _build_world()
+    def test_node_keyed_tiers_symmetric(self):
+        # r_cells=1.5 catches d(Z0,Z1)=d(Z1,Z2)=1.0; r_medium=1.5 (=r_cells,
+        # drops middle tier); r_zones=2.5 catches d(Z0,Z2)=2.0 in far tier.
         pairs = get_pairs(self.cells, r_cells=1.5, node_column='node_id',
-                          zones=self.zones, r_zones=0.5,  # too small for d(R0,R1)=1.5
-                          regions=self.regions, r_regions=10.0)
+                          zones=self.zones, r_zones=2.5, r_medium=1.5)
+        ok_c, bad_c = _is_symmetric(pairs.cells_to_cells)
+        self.assertTrue(ok_c, f'cells_to_cells asymmetric at {bad_c}')
         assert pairs.zones_to_zones is not None
-        assert pairs.zones_to_regions is not None
-        # Promotion fired: ZN0 should reach ZN2 at zone tier (not RN1 at region tier).
-        self.assertIn('ZN2', pairs.zones_to_zones['ZN0'].tolist())
-        # No region-tier emission for the promoted pair.
-        self.assertNotIn('RN1', pairs.zones_to_regions.get('ZN0', np.array([])).tolist())
-
-
-class SymmetryTestCase(unittest.TestCase):
-    """Tiered output is inherently symmetric across all three tiers."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.nodes, cls.cells, cls.zones, cls.regions = _build_world()
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
-    def test_three_tiers_symmetric(self):
-        pairs = get_pairs(self.cells, r_cells=1.5, node_column='node_id',
-                          zones=self.zones, r_zones=2.5,
-                          regions=self.regions, r_regions=10.0)
-        for name, d in [('cells', pairs.cells_to_cells),
-                        ('zones', pairs.zones_to_zones),
-                        ('zones_to_regions', pairs.zones_to_regions)]:
-            if d is None:
-                continue
-            ok, bad = _is_symmetric(d)
-            # Note: zones_to_regions can be asymmetric in general (different node
-            # spaces) but here zone nodes and region nodes are disjoint sets, so
-            # the symmetry check only catches issues within cells/zones tiers.
-            if name in ('cells', 'zones'):
-                self.assertTrue(ok, f'{name} asymmetric at {bad}')
+        ok_z, bad_z = _is_symmetric(pairs.zones_to_zones)
+        self.assertTrue(ok_z, f'zones_to_zones asymmetric at {bad_z}')
 
 
 class CustomZoneCentroidsTestCase(unittest.TestCase):
@@ -266,7 +207,7 @@ class CustomZoneCentroidsTestCase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.nodes, cls.cells, cls.zones, cls.regions = _build_world()
+        cls.nodes, cls.cells, cls.zones = _build_world()
 
     def test_custom_centroids_change_cell_tier(self):
         # Move Z1's centroid far out so (Z0, Z1) is no longer cell-tier.
@@ -294,7 +235,6 @@ class SharedNodeDedupTestCase(unittest.TestCase):
         }, index=pd.Index(['C0', 'C1', 'C2'], name='cell_id'), crs='EPSG:2056')
         zones = gpd.GeoDataFrame({
             'node_id': ['ZN0', 'ZN1'],
-            'region_id': ['R0', 'R0'],
             'population': [30, 30],
             'geometry': [Point(0.05, 0), Point(1, 0)],
         }, index=pd.Index(['Z0', 'Z1'], name='zone_id'), crs='EPSG:2056')
@@ -313,18 +253,25 @@ class DestValuesTestCase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.nodes, cls.cells, cls.zones, cls.regions = _build_world()
+        cls.nodes, cls.cells, cls.zones = _build_world()
+        # Override zone centroids to get three DISTINCT zone-pair distances
+        # (1.0, 3.0, 4.0), so all three tiers can populate from one call.
+        cls.custom_centroids = gpd.GeoSeries(
+            [Point(1.0, 0.0), Point(1.0, 1.0), Point(1.0, 4.0)],
+            index=cls.zones.index, crs=cls.zones.crs,
+        )
 
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_returns_three_dicts_same_shape(self):
+        # r_cells=1.5 catches d(Z0,Z1)=1.0; r_medium=3.5 catches d(Z1,Z2)=3.0;
+        # r_zones=4.5 catches d(Z0,Z2)=4.0. All three tiers populated.
         pairs = get_pairs(self.cells, r_cells=1.5, node_column='node_id',
-                          zones=self.zones, r_zones=2.5,
-                          regions=self.regions, r_regions=10.0)
+                          zones=self.zones, r_zones=4.5, r_medium=3.5,
+                          zones_centroids=self.custom_centroids)
         vals = dest_values('population', pairs, self.cells, 'node_id',
-                           zones=self.zones, regions=self.regions)
+                           zones=self.zones)
         for ot_pairs, ot_vals in [(pairs.cells_to_cells, vals.cells_to_cells),
-                                  (pairs.zones_to_zones, vals.zones_to_zones),
-                                  (pairs.zones_to_regions, vals.zones_to_regions)]:
+                                  (pairs.cells_to_zones, vals.cells_to_zones),
+                                  (pairs.zones_to_zones, vals.zones_to_zones)]:
             if ot_pairs is None:
                 self.assertIsNone(ot_vals)
                 continue
@@ -332,31 +279,30 @@ class DestValuesTestCase(unittest.TestCase):
             self.assertSetEqual(set(ot_pairs.keys()), set(ot_vals.keys()))
             for k in ot_pairs:
                 self.assertEqual(len(ot_pairs[k]), len(ot_vals[k]))
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_raises_without_required_frame(self):
         pairs = get_pairs(self.cells, r_cells=1.5, node_column='node_id',
                           zones=self.zones, r_zones=2.5)
         with self.assertRaisesRegex(ValueError, 'zones'):
             dest_values('population', pairs, self.cells, 'node_id')
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_raises_on_missing_column(self):
         pairs = get_pairs(self.cells, r_cells=1.5, node_column='node_id')
         with self.assertRaisesRegex(ValueError, 'unknown_col'):
             dest_values('unknown_col', pairs, self.cells, 'node_id')
 
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
-    def test_region_tier_looks_up_regions_column(self):
-        # Set up a case where ZN0 reaches RN1 at region tier; vals should be pop(R1).
+    def test_cells_to_zones_looks_up_zones_column(self):
+        # r_cells=0, r_medium=r_zones=3.0 → all non-same-zone pairs (d ∈ {1,1,2})
+        # in middle tier.
         pairs = get_pairs(self.cells, r_cells=0.0, node_column='node_id',
-                          zones=self.zones, r_zones=1.0,
-                          regions=self.regions, r_regions=2.0)
+                          zones=self.zones, r_zones=3.0, r_medium=3.0)
         vals = dest_values('population', pairs, self.cells, 'node_id',
-                           zones=self.zones, regions=self.regions)
-        assert vals.zones_to_regions is not None
-        # R1 has only Z2 → pop(R1) = pop(Z2) = 700+800+900 = 2400.
-        self.assertEqual(vals.zones_to_regions['ZN0'].tolist(), [2400])
+                           zones=self.zones)
+        assert vals.cells_to_zones is not None
+        # N0 (in Z0) → ZN1 and ZN2 at middle tier. Z1 pop = 500+600=1100,
+        # Z2 pop = 700+800+900=2400.
+        d_to_v = dict(zip(pairs.cells_to_zones['N0'].tolist(),
+                          vals.cells_to_zones['N0'].tolist()))
+        self.assertEqual(d_to_v['ZN1'], 1100)
+        self.assertEqual(d_to_v['ZN2'], 2400)
 
 
 class ConservationTestCase(unittest.TestCase):
@@ -364,59 +310,41 @@ class ConservationTestCase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.nodes, cls.cells, cls.zones, cls.regions = _build_world()
+        cls.nodes, cls.cells, cls.zones = _build_world()
 
     def _check_conservation(self, pairs):
         vals = dest_values('population', pairs, self.cells, 'node_id',
-                           zones=self.zones, regions=self.regions)
+                           zones=self.zones)
         total = sum(_CELL_POPULATIONS)
         cell_to_zone = self.cells.set_index('node_id')['zone_id']
         zone_to_node = self.zones['node_id']
-        zone_to_region = self.zones['region_id']
-        region_to_node = self.regions['node_id']
         for origin in self.cells['node_id']:
             tier_sum = vals.cells_to_cells.get(origin, np.array([])).sum()
             zone_origin = zone_to_node[cell_to_zone[origin]]
-            region_origin = region_to_node[zone_to_region[cell_to_zone[origin]]]
+            if vals.cells_to_zones is not None:
+                tier_sum += vals.cells_to_zones.get(origin, np.array([])).sum()
             if vals.zones_to_zones is not None:
                 tier_sum += vals.zones_to_zones.get(zone_origin, np.array([])).sum()
-            if vals.zones_to_regions is not None:
-                # zones_to_regions is keyed by zone node, not region node.
-                tier_sum += vals.zones_to_regions.get(zone_origin, np.array([])).sum()
             self.assertEqual(tier_sum, total, f'origin {origin}: {tier_sum} != {total}')
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_conservation_three_tier_full_coverage(self):
-        pairs = get_pairs(self.cells, r_cells=0.5, node_column='node_id',
-                          zones=self.zones, r_zones=1.5,
-                          regions=self.regions, r_regions=100.0)
+        # r_cells=1.0 cell-tier covers (Z0,Z1) (d=0.5); r_medium=1.2 middle
+        # tier covers (Z1,Z2) (d=1.0); r_zones=100 far tier covers (Z0,Z2)
+        # (d=1.5). All zone pairs slot into exactly one tier.
+        pairs = get_pairs(self.cells, r_cells=1.0, node_column='node_id',
+                          zones=self.zones, r_zones=100.0, r_medium=1.2)
         self._check_conservation(pairs)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
-    def test_conservation_under_promotion(self):
-        # Cross-region cell-tier exists (r_cells=1.5 catches Z1-Z2 d=1.0); r_zones
-        # too small for (R0, R1). Promotion ensures conservation.
-        pairs = get_pairs(self.cells, r_cells=1.5, node_column='node_id',
-                          zones=self.zones, r_zones=0.5,
-                          regions=self.regions, r_regions=10.0)
+    def test_conservation_two_tier_no_far(self):
+        # r_medium=r_zones → middle tier captures everything, far tier empty.
+        pairs = get_pairs(self.cells, r_cells=1.0, node_column='node_id',
+                          zones=self.zones, r_zones=10.0, r_medium=10.0)
+        self.assertIsNone(pairs.zones_to_zones)
         self._check_conservation(pairs)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
-    def test_conservation_no_regions(self):
-        # Two-tier (cells + zones), r_zones large enough to cover everything.
+    def test_conservation_no_middle_tier(self):
+        # r_medium=r_cells → middle tier empty; far tier captures everything.
         pairs = get_pairs(self.cells, r_cells=0.5, node_column='node_id',
-                          zones=self.zones, r_zones=10.0)
-        # Conservation: cells_to_cells + zones_to_zones (no regions tier).
-        vals = dest_values('population', pairs, self.cells, 'node_id', zones=self.zones)
-        total = sum(_CELL_POPULATIONS)
-        cell_to_zone = self.cells.set_index('node_id')['zone_id']
-        zone_to_node = self.zones['node_id']
-        for origin in self.cells['node_id']:
-            tier_sum = vals.cells_to_cells.get(origin, np.array([])).sum()
-            zone_origin = zone_to_node[cell_to_zone[origin]]
-            if vals.zones_to_zones is not None:
-                tier_sum += vals.zones_to_zones.get(zone_origin, np.array([])).sum()
-            self.assertEqual(tier_sum, total, f'origin {origin}: {tier_sum} != {total}')
+                          zones=self.zones, r_zones=10.0, r_medium=0.5)
+        self.assertIsNone(pairs.cells_to_zones)
+        self._check_conservation(pairs)
 
 
 class GetEuclidianDistsTestCase(unittest.TestCase):
@@ -424,9 +352,7 @@ class GetEuclidianDistsTestCase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.nodes, cls.cells, cls.zones, cls.regions = _build_world()
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
+        cls.nodes, cls.cells, cls.zones = _build_world()
     def test_dists_pair_position_wise_with_pairs(self):
         pairs = get_pairs(self.cells, r_cells=1.5, node_column='node_id',
                           zones=self.zones, r_zones=2.5)
@@ -439,23 +365,26 @@ class GetEuclidianDistsTestCase(unittest.TestCase):
                     self.nodes.loc[origin].geometry.y - self.nodes.loc[d].geometry.y,
                 )
                 self.assertAlmostEqual(dists.cells_to_cells[origin][i], expected, places=6)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_dists_dtype_param(self):
         pairs = get_pairs(self.cells, r_cells=1.5, node_column='node_id')
         dists = get_euclidian_dists(self.nodes, pairs, dtype=np.float32)
         first = next(iter(dists.cells_to_cells.values()))
         self.assertEqual(first.dtype, np.float32)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
-    def test_dists_third_tier_zone_to_region(self):
-        pairs = get_pairs(self.cells, r_cells=0.0, node_column='node_id',
-                          zones=self.zones, r_zones=1.0,
-                          regions=self.regions, r_regions=2.0)
+    def test_dists_three_tiers(self):
+        # Override centroids for 3 distinct zone-pair distances: 1, 3, 4.
+        custom = gpd.GeoSeries(
+            [Point(1.0, 0.0), Point(1.0, 1.0), Point(1.0, 4.0)],
+            index=self.zones.index, crs=self.zones.crs,
+        )
+        pairs = get_pairs(self.cells, r_cells=1.5, node_column='node_id',
+                          zones=self.zones, r_zones=4.5, r_medium=3.5,
+                          zones_centroids=custom)
         dists = get_euclidian_dists(self.nodes, pairs)
-        assert dists.zones_to_regions is not None
-        # ZN0 at (1.0, 0.5), RN1 at (1.0, 2.0) → d = 1.5.
-        self.assertAlmostEqual(dists.zones_to_regions['ZN0'][0], 1.5, places=6)
+        assert dists.cells_to_zones is not None
+        assert dists.zones_to_zones is not None
+        # ZN0 at (1, 0.5), ZN2 at (1, 2.0) → d = 1.5 (uses *network node*
+        # coords, not zone polygon centroids).
+        self.assertAlmostEqual(dists.zones_to_zones['ZN0'][0], 1.5, places=6)
 
 
 class ValidationTestCase(unittest.TestCase):
@@ -463,26 +392,14 @@ class ValidationTestCase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.nodes, cls.cells, cls.zones, cls.regions = _build_world()
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
+        cls.nodes, cls.cells, cls.zones = _build_world()
     def test_missing_node_column_raises(self):
         bad = self.cells.drop(columns='node_id')
         with self.assertRaisesRegex(ValueError, "missing required column 'node_id'"):
             get_pairs(bad, r_cells=1.0, node_column='node_id')
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_zones_without_r_zones_raises(self):
         with self.assertRaisesRegex(ValueError, 'r_zones'):
             get_pairs(self.cells, r_cells=1.0, node_column='node_id', zones=self.zones)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
-    def test_regions_without_zones_raises(self):
-        with self.assertRaisesRegex(ValueError, 'requires.*zones'):
-            get_pairs(self.cells, r_cells=1.0, node_column='node_id',
-                      regions=self.regions, r_regions=1.0)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_cells_without_zone_id_raises(self):
         bad = self.cells.drop(columns='zone_id')
         with self.assertRaisesRegex(ValueError, "'zone_id'"):
@@ -495,7 +412,7 @@ class DescribeTestCase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.nodes, cls.cells, cls.zones, cls.regions = _build_world()
+        cls.nodes, cls.cells, cls.zones = _build_world()
 
     def test_describe_id_pairs_cells_only(self):
         pairs = get_pairs(self.cells, r_cells=1.5, node_column='node_id')
@@ -508,7 +425,9 @@ class DescribeTestCase(unittest.TestCase):
                           zones=self.zones, r_zones=2.5)
         out = pairs.describe()
         self.assertIn('cells_to_cells', out)
-        self.assertIn('zones_to_zones', out)
+        # cells_to_zones is populated here (auto r_medium = min(15, 2.5) = 2.5
+        # → middle tier captures non-same-zone within [1.5, 2.5)).
+        self.assertIn('cells_to_zones', out)
 
     def test_describe_distance_values_shows_stats(self):
         pairs = get_pairs(self.cells, r_cells=1.5, node_column='node_id',
@@ -521,19 +440,17 @@ class DescribeTestCase(unittest.TestCase):
 
 
 class GetPairsMaskFiltersTestCase(unittest.TestCase):
-    """`orig_cells` / `dest_cells` / `dest_zones` / `dest_regions` masks
-    restrict origins and destinations to subsets of the full universe.
+    """`orig_cells` / `dest_cells` / `dest_zones` masks restrict origins and
+    destinations to subsets of the full universe.
     """
 
     @classmethod
     def setUpClass(cls):
-        cls.nodes, cls.cells, cls.zones, cls.regions = _build_world()
+        cls.nodes, cls.cells, cls.zones = _build_world()
 
     # ----- baseline: no mask = current behaviour -----
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_no_masks_matches_baseline(self):
-        """All four mask kwargs unspecified = identical to the no-filter call."""
+        """All mask kwargs unspecified = identical to the no-filter call."""
         pairs_a = get_pairs(self.cells, r_cells=1.5, node_column='node_id',
                             zones=self.zones, r_zones=2.5)
         pairs_b = get_pairs(self.cells, r_cells=1.5, node_column='node_id',
@@ -548,8 +465,6 @@ class GetPairsMaskFiltersTestCase(unittest.TestCase):
                                   pairs_b.cells_to_cells[k].tolist())
 
     # ----- orig_cells: filter origins -----
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_orig_cells_filters_origins(self):
         """orig_cells=mask drops cells where False from being origins entirely."""
         # Mark only C0 and C4 as origins (rest are excluded).
@@ -559,26 +474,19 @@ class GetPairsMaskFiltersTestCase(unittest.TestCase):
                           orig_cells=orig)
         # Only N0 and N4 (cells C0 and C4) should appear as cells_to_cells origins.
         self.assertSetEqual(set(pairs.cells_to_cells.keys()), {'N0', 'N4'})
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_orig_cells_excludes_zone_tier_origin_when_no_origins_in_zone(self):
         """A zone with no origin cells in it should not appear as zone-tier origin."""
         # No cells in Z2 (cells C6-C8) are origins.
         orig = ~self.cells['zone_id'].isin(['Z2']).to_numpy()
+        # r_cells=r_medium=1.5 → middle tier empty; all non-same-zone → far.
         pairs = get_pairs(self.cells, r_cells=1.5, node_column='node_id',
-                          zones=self.zones, r_zones=2.5,
-                          regions=self.regions, r_regions=10.0,
+                          zones=self.zones, r_zones=10.0, r_medium=1.5,
                           orig_cells=orig)
         assert pairs.zones_to_zones is not None
         # ZN2 is Z2's zone node — it should NOT appear as a zones_to_zones origin.
         self.assertNotIn('ZN2', pairs.zones_to_zones.keys())
-        assert pairs.zones_to_regions is not None
-        # Same for zones_to_regions origins.
-        self.assertNotIn('ZN2', pairs.zones_to_regions.keys())
 
     # ----- dest_cells: filter cell-tier destinations -----
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_dest_cells_filters_destinations(self):
         """dest_cells=mask drops cells where False from being cell-tier destinations."""
         # Only C0, C1, C2 are valid destinations.
@@ -592,60 +500,55 @@ class GetPairsMaskFiltersTestCase(unittest.TestCase):
             self.assertTrue(
                 set(dests.tolist()).issubset(allowed),
                 f"Origin {orig!r} has dests {dests.tolist()} outside allowed set.")
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
-    def test_dest_cells_does_not_affect_zone_tier(self):
-        """dest_cells filters cell-tier dests only; zone-tier dests are independent."""
+    def test_dest_cells_does_not_affect_zone_dest_tiers(self):
+        """dest_cells filters cell-tier dests only; zone-dest tiers are independent."""
         dest = self.cells.index.isin(['C0', 'C1'])
         pairs_filt = get_pairs(self.cells, r_cells=1.5, node_column='node_id',
                                zones=self.zones, r_zones=2.5, dest_cells=dest)
         pairs_full = get_pairs(self.cells, r_cells=1.5, node_column='node_id',
                                zones=self.zones, r_zones=2.5)
-        assert pairs_filt.zones_to_zones is not None
-        assert pairs_full.zones_to_zones is not None
-        # zones_to_zones structure should be identical for the two calls.
-        self.assertSetEqual(set(pairs_filt.zones_to_zones.keys()),
-                            set(pairs_full.zones_to_zones.keys()))
-        for k in pairs_filt.zones_to_zones:
-            self.assertCountEqual(pairs_filt.zones_to_zones[k].tolist(),
-                                  pairs_full.zones_to_zones[k].tolist())
+        # The zone-dest tiers (cells_to_zones, zones_to_zones) should match.
+        for tier_name in ('cells_to_zones', 'zones_to_zones'):
+            full_tier = getattr(pairs_full, tier_name)
+            filt_tier = getattr(pairs_filt, tier_name)
+            if full_tier is None:
+                self.assertIsNone(filt_tier)
+                continue
+            assert filt_tier is not None
+            self.assertSetEqual(set(filt_tier.keys()), set(full_tier.keys()))
+            for k in filt_tier:
+                self.assertCountEqual(filt_tier[k].tolist(), full_tier[k].tolist())
 
     # ----- dest_zones: filter zone-tier destinations -----
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
-    def test_dest_zones_filters_zone_destinations(self):
-        """dest_zones=mask drops zones where False from being zone-tier destinations."""
-        # Only Z1 is a valid zone-tier destination.
-        dest_z = self.zones.index.isin(['Z1'])
+    def test_dest_zones_filters_far_tier(self):
+        """dest_zones drops filtered zones from far-tier destinations."""
+        # r_cells=r_medium=1.5 → middle empty; r_zones=3.0 catches d=2.0
+        # (Z0↔Z2). dest_z=[Z2] means only ZN2 can be a far-tier dest.
+        dest_z = self.zones.index.isin(['Z2'])
         pairs = get_pairs(self.cells, r_cells=1.5, node_column='node_id',
-                          zones=self.zones, r_zones=2.5,
+                          zones=self.zones, r_zones=3.0, r_medium=1.5,
                           dest_zones=dest_z)
-        # Every zones_to_zones destination should be ZN1.
         assert pairs.zones_to_zones is not None
         for orig, dests in pairs.zones_to_zones.items():
+            self.assertTrue(
+                all(d == 'ZN2' for d in dests.tolist()),
+                f"Origin {orig!r} has unexpected dests {dests.tolist()}.")
+
+    def test_dest_zones_filters_middle_tier(self):
+        """dest_zones drops filtered zones from middle-tier destinations."""
+        # r_cells=0, r_medium=r_zones=3.0 → all non-same-zone in middle tier.
+        # dest_z=[Z1] → cells_to_zones dests must be ZN1 only.
+        dest_z = self.zones.index.isin(['Z1'])
+        pairs = get_pairs(self.cells, r_cells=0.0, node_column='node_id',
+                          zones=self.zones, r_zones=3.0, r_medium=3.0,
+                          dest_zones=dest_z)
+        assert pairs.cells_to_zones is not None
+        for orig, dests in pairs.cells_to_zones.items():
             self.assertTrue(
                 all(d == 'ZN1' for d in dests.tolist()),
                 f"Origin {orig!r} has unexpected dests {dests.tolist()}.")
 
-    # ----- dest_regions: filter region-tier destinations -----
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
-    def test_dest_regions_filters_region_destinations(self):
-        """dest_regions=mask drops regions where False from being region-tier dests."""
-        dest_r = self.regions.index.isin(['R0'])
-        pairs = get_pairs(self.cells, r_cells=1.5, node_column='node_id',
-                          zones=self.zones, r_zones=2.5,
-                          regions=self.regions, r_regions=10.0,
-                          dest_regions=dest_r)
-        assert pairs.zones_to_regions is not None
-        # Every region-tier dest should be RN0 (R0's node).
-        for orig, dests in pairs.zones_to_regions.items():
-            for d in dests.tolist():
-                self.assertEqual(d, 'RN0', f"Unexpected dest {d!r}")
-
     # ----- combined filters -----
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_combined_orig_and_dest_filters(self):
         """orig + dest filters compose: only filtered origins route to filtered dests."""
         orig = self.cells.index.isin(['C0', 'C4'])
@@ -661,8 +564,6 @@ class GetPairsMaskFiltersTestCase(unittest.TestCase):
             self.assertTrue(set(dests.tolist()).issubset(allowed))
 
     # ----- cells-only (no zones) variant -----
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_masks_work_in_cells_only_mode(self):
         """orig_cells and dest_cells filters work when zones aren't provided."""
         orig = self.cells.index.isin(['C0', 'C1'])
@@ -676,22 +577,16 @@ class GetPairsMaskFiltersTestCase(unittest.TestCase):
             self.assertTrue(set(dests.tolist()).issubset(allowed))
 
     # ----- validation -----
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_wrong_length_mask_raises(self):
         wrong = np.array([True] * (len(self.cells) + 1))
         with self.assertRaisesRegex(ValueError, "length"):
             get_pairs(self.cells, r_cells=1.5, node_column='node_id',
                       zones=self.zones, r_zones=2.5, orig_cells=wrong)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_non_boolean_mask_raises(self):
         not_bool = np.arange(len(self.cells))
         with self.assertRaisesRegex(ValueError, "boolean"):
             get_pairs(self.cells, r_cells=1.5, node_column='node_id',
                       zones=self.zones, r_zones=2.5, dest_cells=not_bool)
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_series_mask_accepted(self):
         """pd.Series boolean masks work the same as numpy arrays."""
         orig = self.cells['zone_id'] == 'Z0'   # pd.Series of booleans
@@ -700,8 +595,6 @@ class GetPairsMaskFiltersTestCase(unittest.TestCase):
                           orig_cells=orig)
         # Origins limited to N0-N3 (Z0's cells).
         self.assertSetEqual(set(pairs.cells_to_cells.keys()), {'N0', 'N1', 'N2', 'N3'})
-
-    @unittest.skip("Phase A refactor: pending Phase B/D for cells_to_zones replacement")
     def test_node_column_with_string_extension_dtype(self):
         """Regression: pandas `StringDtype` `node_column` shouldn't break
         the orig_cells filter. `s.unique()` returns a `pd.StringArray`

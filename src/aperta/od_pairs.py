@@ -551,9 +551,14 @@ def get_pairs(
         cell_mask = d < r_cells
         cell_mask[i] = True
         cell_tier_dests.append(np.where(cell_mask)[0])
+        # Same-zone carve-out: i is always cell-tier, so exclude it from the
+        # other tiers even when r_cells == 0 (otherwise d=0 would qualify for
+        # c2z when r_medium > 0, double-counting the self-zone).
         c2z_mask = (d >= r_cells) & (d < r_medium)
+        c2z_mask[i] = False
         c2z_tier_dests.append(np.where(c2z_mask)[0])
         z2z_mask = (d >= r_medium) & (d < r_zones)
+        z2z_mask[i] = False
         z2z_tier_dests.append(np.where(z2z_mask)[0])
 
     # --- Identify zones that contain at least one origin cell ---
