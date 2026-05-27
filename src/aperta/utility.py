@@ -42,7 +42,7 @@ function will add it to every cell's destination utilities — units match
 For **logsum** (cross-modal) accessibility, combine per-mode utility ODMs with
 `od_pairs.aggregate_across_modes(utilities_by_mode, aggregator='logsum')`,
 then run gravity (with β = 1) or other downstream metrics on the combined
-ODM. See the minimal example notebook for a worked demonstration.
+ODM. See the walkthrough notebook for a worked demonstration.
 
 ## Known limitations
 

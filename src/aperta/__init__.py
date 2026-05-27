@@ -37,8 +37,9 @@ All algorithm modules (`od_pairs`, `routing`, `overhead`, `accessibility`,
 `calibration`, `topography`) operate on plain numpy / pandas / networkx
 inputs — no filesystem assumptions, no opinionated project structure.
 See `tests/test_workflow.py` for the ~150-line end-to-end toy-world
-example, `examples/minimal/accessibility.ipynb` for the quickstart with
-real OSM data, and `examples/extended/` for a multi-notebook showcase
+example, `examples/minimal/accessibility.ipynb` for a ~40-line OSM
+quickstart, `examples/walkthrough/accessibility.ipynb` for the full
+guided tour, and `examples/extended/` for a multi-notebook showcase
 with published-paper calibration (Bern + 25 km).
 
 For an opinionated project scaffolding layer on top of aperta —

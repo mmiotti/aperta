@@ -63,8 +63,8 @@ The extended example splits its prep across five notebooks and its analysis acro
 
 Runnable examples, in increasing depth:
 
-- [examples/quickstart/quickstart.ipynb](examples/quickstart/quickstart.ipynb) — what aperta does in ~40 lines using only OpenStreetMap. Cambridge MA, ~10 s.
-- [examples/minimal/accessibility.ipynb](examples/minimal/accessibility.ipynb) — guided tour of every primitive; multi-modal walk + car, cross-modal logsum, path-first per-edge feature aggregation. Central Paris, ~15 min end-to-end.
+- [examples/minimal/accessibility.ipynb](examples/minimal/accessibility.ipynb) — what aperta does in ~40 lines using only OpenStreetMap. Cambridge MA, ~10 s.
+- [examples/walkthrough/accessibility.ipynb](examples/walkthrough/accessibility.ipynb) — guided tour of every primitive; multi-modal walk + car, cross-modal logsum, path-first per-edge feature aggregation. Central Paris, ~15 min end-to-end.
 - [examples/extended/](examples/extended/) — production-scale Bern + 25 km: prep pipeline, calibration against observed travel times, traffic-flow estimation, accessibility analysis. ~30 min.
 
 The toy-world end-to-end test in [tests/test_workflow.py](tests/test_workflow.py) doubles as the smallest possible walk-through (~150 lines, runs in a second).
@@ -99,7 +99,7 @@ acc = accessibility.count_in_bins(times, {'supermarkets': sm_weights}, {},
                                    [accessibility.Bin('15min', 0, 15 * 60)])
 ```
 
-Runnable end-to-end version: [examples/quickstart/quickstart.ipynb](examples/quickstart/quickstart.ipynb).
+Runnable end-to-end version: [examples/minimal/accessibility.ipynb](examples/minimal/accessibility.ipynb).
 
 ## Modules
 
