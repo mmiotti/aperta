@@ -317,16 +317,18 @@ def aggregate_dest_overhead_per_group_routed(
         per group. Groups with no constituent cells (or with all cells
         unreachable from `g_node`) get `NaN`.
     """
-    # Local import to avoid module-load cycle: network_processing pulls in
-    # osmnx + heavy deps which we don't want at aperta-load time.
-    from aperta.network_processing import ig_from_networkx_with_idx_maps
-    h, idx_maps = ig_from_networkx_with_idx_maps(graph)
-    nx_to_ig = idx_maps['node_nx_to_ig']
+    # Local import to keep scipy.sparse out of the module load path.
+    import scipy.sparse.csgraph as csg
+    from aperta.routing import _graph_to_csr
+    csr, nx_to_seq, _ = _graph_to_csr(graph, weight)
 
     def _distances_from(g_node, cell_nodes):
-        ig_g = nx_to_ig[g_node]
-        ig_cells = [nx_to_ig[n] for n in cell_nodes]
-        return np.asarray(h.distances([ig_g], ig_cells, weights=weight)[0])
+        g_seq = nx_to_seq[g_node]
+        dist_row = csg.dijkstra(csr, indices=[g_seq],
+                                return_predecessors=False)[0]
+        cell_seqs = np.fromiter((nx_to_seq[n] for n in cell_nodes),
+                                dtype=np.int64, count=len(cell_nodes))
+        return dist_row[cell_seqs]
 
     cells_valid = cells.dropna(subset=[node_column, group_id_column])
     cells_by_group = cells_valid.groupby(group_id_column)

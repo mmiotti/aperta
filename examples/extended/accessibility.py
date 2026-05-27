@@ -427,7 +427,7 @@ CELL_TO_ZONE = cells['zone_id'].to_dict()
 # normalised by 10_000).
 cells['pop_plus_emp'] = cells['population'] + cells['employment_total']
 cells_centroids_gdf = cells.set_geometry(cells.geometry.centroid)
-raw_per_m2 = geo_processing.aggregate_within_radius(
+raw_per_m2 = geo_processing.cross_sum_within_radius(
     targets=cells_centroids_gdf, sources=cells_centroids_gdf,
     radius=1000.0, weight_column='pop_plus_emp', return_density=True,
 )

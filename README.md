@@ -2,7 +2,7 @@
 
 [![tests](https://github.com/mmiotti/aperta/actions/workflows/test.yml/badge.svg)](https://github.com/mmiotti/aperta/actions/workflows/test.yml)
 
-A Python toolkit for **accessibility analysis on multimodal transport networks** — routing, distance/time computation, and gravity-/utility-/logsum-based accessibility metrics on `networkx` / `igraph` graphs.
+A Python toolkit for **accessibility analysis on multimodal transport networks** — routing, distance/time computation, and gravity-/utility-/logsum-based accessibility metrics on `networkx` graphs (routed via `scipy.sparse.csgraph`).
 
 The name is Latin/Italian for *open*.
 
@@ -42,7 +42,7 @@ python -m unittest discover -s tests -t .
 aperta is organised around a six-phase workflow. Every module slots into one of these phases.
 
 1. **Load and prepare data** — networks (per mode), land-use rasters and points.
-2. **Map data to units + compute shared features** — build the `cells → zones → regions` aggregation hierarchy via `geo_mapping`; snap geo units to network nodes via `network_processing.snap_to_network_nodes` / `assign_to_eligible_centroid`; sample topography rasters (`topography.fetch_copernicus_dem` + `geo_processing.sample_raster_at_points`); compute per-node density via `geo_processing.aggregate_within_radius`.
+2. **Map data to units + compute shared features** — build the `cells → zones → regions` aggregation hierarchy via `geo_mapping`; snap geo units to network nodes via `network_processing.snap_to_network_nodes` / `assign_to_eligible_centroid`; sample topography rasters (`topography.fetch_copernicus_dem` + `geo_processing.sample_raster_at_points`); compute per-node density via `geo_processing.cross_sum_within_radius`.
 3. **Build sparse OD pairs** — `od_pairs.get_pairs` returns a `TieredODNodePairs` (cell / zone / region tiers, node-keyed). Lift to `TieredODGeoPairs` (cell/zone/region-keyed) via `od_pairs.reindex_by_geo_unit` for cross-modal alignment.
 4. **Estimate traffic flows** — `traffic_flows.nested_node_sample` + betweenness via `network_processing.get_*_betweenness*`. Optional calibration against observed counters via `calibration.snap_counters_to_edges` + `calibration.evaluate_against_counters`.
 5. **Estimate travel costs** — `routing.tiered_path_costs` / `routing.tiered_path_aggregate` (Dijkstra on any networkx graph) + `overhead.add_node_overheads` / `add_geo_overheads` / `add_origin_cell_overhead`. Optional calibration of per-edge weights against observed travel times via `calibration.calibrate_edge_weights`. Plus `utility.route_utility` / `add_endpoint_utility` for utility-based costs.
@@ -106,14 +106,14 @@ Runnable end-to-end version: [examples/quickstart/quickstart.ipynb](examples/qui
 | Module | Purpose |
 |---|---|
 | `od_pairs` | Tiered OD pair structures (`TieredODNodePairs`, `TieredODGeoPairs`) + builders (`get_pairs`, `dest_values`, `reindex_by_geo_unit`, `make_mask`, `aggregate_across_modes` for cross-modal alignment). |
-| `routing` | Shortest paths on `networkx` / `igraph` graphs. Edge-weighting helpers, single-source / one-to-one primitives, tiered OD routing (`tiered_path_costs`, `tiered_path_aggregate` with per-edge `PathAggregation` and per-node `NodeAggregation` feature aggregation along realised paths), pure path-walker primitive `aggregate_along_paths` (for prebuilt path lists), intrazonal-cost flooring. |
+| `routing` | Shortest paths on `networkx` graphs via `scipy.sparse.csgraph.dijkstra`. Edge-weighting helpers, single-source / one-to-one primitives, tiered OD routing (`tiered_path_costs`, `tiered_path_aggregate` with per-edge `PathAggregation` and per-node `NodeAggregation` feature aggregation along realised paths), pure path-walker primitive `aggregate_along_paths` (for prebuilt path lists), intrazonal-cost flooring. |
 | `accessibility` | `count_in_bins` (cumulative), `gravity` (decay-based), `nearest_k` (cost to nearest k). Outputs per-node or per-cell depending on input ODM class. |
 | `utility` | Linear utility specs (`Utility`, `RouteFeature`) and pipeline (`route_utility`, `add_endpoint_utility`) for utility-based costs; consumed by `accessibility.gravity` with an exp decay for logsum accessibility. |
 | `overhead` | First/last-mile overheads on cost ODMs. `add_node_overheads` (node-keyed); `add_geo_overheads` / `add_origin_cell_overhead` (geo-keyed); `aggregate_dest_overhead_per_*` helpers for zone/region-tier last-mile. |
 | `traffic_flows` | Traffic-volume estimation via cost-weighted nested-node sampling (`nested_node_sample`). |
 | `calibration` | OLS calibration of per-edge weights (`calibrate_edge_weights`) against observed point-to-point travel times; bearing-aware traffic-counter snapping (`snap_counters_to_edges`) + counter-fit evaluation (`evaluate_against_counters`) for traffic-flow calibration. |
 | `network_processing` | Network helpers — `networkx ↔ igraph` bridging, `consolidate_intersections` (OSMnx-output cleanup with obstacle re-attachment), betweenness, `snap_to_network_nodes`, `assign_to_eligible_centroid`, `aggregate_edges_to_nodes`, `lanes_per_direction`. |
-| `geo_processing` | Geometry helpers — hectare and H3 grids, bearings, `aggregate_within_radius` (cross-set buffer aggregation via scipy KDTree), `custom_spatial_lag`. |
+| `geo_processing` | Geometry helpers — hectare and H3 grids, bearings, `sum_within_radius` (same-set neighbourhood sum) and `cross_sum_within_radius` (cross-set buffer aggregation), both via scipy KDTree. |
 | `geo_mapping` | Spatial-join wrappers — `map_points_to_polygons`, `map_polygons_to_points`, `map_points_to_points`, `map_points_to_filtered_lines`. |
 | `geo_units` | Registry of the 5 canonical aperta units (`cells`, `zones`, `regions`, `nodes`, `edges`) and their `id_col` conventions. |
 | `osm_helpers` | OSM data fetching + per-edge categorisation via `osmnx` (`fetch_network`, `fetch_pois`, `categorize_edges`). Requires `aperta[osm]`. |

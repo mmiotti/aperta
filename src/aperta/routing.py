@@ -1,7 +1,9 @@
 """
-Pure-Python routing built on networkx and igraph. Replaces OSRM-based routing.
+Routing primitives backed by `scipy.sparse.csgraph.dijkstra`. Input graphs
+are `networkx.Graph` (or its multi/directed variants); aperta converts to a
+scipy CSR matrix internally per call. No backend choice — scipy throughout.
 
-The library exposes three concerns separately:
+The library exposes two concerns separately:
 
 1. **Edge weighting** — `apply_edge_weights` runs a user-supplied callable on each
    edge of a graph and writes the result to a named edge attribute. Mode-specific
@@ -12,23 +14,28 @@ The library exposes three concerns separately:
    `combine_edge_weights` sums multiple per-edge components into a single routing
    weight (e.g. edge travel time + intersection penalty -> total cost).
 
-2. **Routing primitives** — three functions covering the common query shapes:
-   - `shortest_distances_from`: single source -> all reachable nodes (with optional
+2. **Routing primitives** — covering the common query shapes:
+   - `shortest_distances_from`: single source → all reachable nodes (with optional
      cutoff). Used for accessibility / isochrone calculations.
    - `shortest_distances_pairwise`: full distance matrix between two node lists.
-   - `shortest_path_metrics_one_to_one`: paired (origin, destination) routing that
-     also aggregates edge features along each path. Used for travel-time model
-     calibration and similar trip-by-trip work.
+   - `shortest_path_metrics_one_to_one`: paired (origin, destination) routing
+     that also aggregates edge features along each path. Used for travel-time
+     model calibration and similar trip-by-trip work.
+   - `tiered_path_costs` / `tiered_path_aggregate`: bulk many-to-many routing
+     across the three-tier OD structure.
 
-3. **Backend switching** — every routing primitive accepts either an `nx.Graph` or
-   an `ig.Graph`. NetworkX is simpler and supports cutoffs efficiently in the
-   single-source case; igraph is much faster for matrix queries and bulk one-to-one.
-   Convert with `aperta.network_processing.ig_from_networkx_with_idx_maps` when you
-   need igraph performance.
+Why scipy-only: aperta's routing workflow is one-shot Dijkstra-from-many-origins
+on a *live* graph whose edge weights are routinely mutated (calibration loop,
+scenario comparison, time-of-day variants). Contraction hierarchies (Pandana,
+OSRM) preprocess once and reuse, which fights this workflow. The historical
+networkx / igraph backends were dropped in favour of scipy CSR + scipy
+`csgraph.dijkstra`, which is competitive in raw speed (faster than igraph
+with a `cutoff` set; comparable without), zero-preprocessing, and has a
+single code path.
 
-   **Backend asymmetry to watch:** igraph node keys are integer vertex indices;
-   networkx node keys are whatever the graph uses (often the original OSM node IDs).
-   Outputs follow the input convention.
+The only routing operation still on igraph is edge betweenness centrality
+(`network_processing.get_edge_betweenness_using_igraph`); scipy doesn't have
+a competitive betweenness implementation.
 
 A future `RoutingProfile` class will bundle the duration callable + parameters +
 graph into one object; for now, callers compose the pieces themselves.
@@ -39,7 +46,6 @@ import logging
 import numpy as np
 import pandas as pd
 import networkx as nx
-import igraph as ig
 
 from typing import Callable, NamedTuple
 
@@ -102,8 +108,15 @@ def combine_edge_weights(g: nx.Graph, source_names: list[str], target_name: str)
 def _graph_to_csr(graph: nx.Graph, weight: str):
     """Build a scipy CSR matrix from `graph` using `weight` as edge cost.
 
-    For MultiDiGraph parallels, keeps the minimum-weight edge per (u, v)
-    — matches the choice igraph's distances() makes internally.
+    For MultiGraph / MultiDiGraph parallels, keeps the minimum-weight edge
+    per (u, v) — matches igraph's `distances()` choice.
+
+    Undirected graphs (`nx.Graph` / `nx.MultiGraph`) are emitted as symmetric
+    CSR so callers can use scipy's default `directed=True` dijkstra. For
+    parallel-edge multigraphs the per-direction min is taken independently,
+    so an undirected MultiGraph with one parallel weighted 3 in (u, v) and
+    another weighted 5 still gets `csr[u, v] = csr[v, u] = 3` (the user's
+    intent for "undirected" is symmetric).
 
     Returns `(csr, nx_to_seq, seq_to_nx)`:
       - `csr`: scipy.sparse.csr_matrix of shape (n, n), float weights
@@ -115,19 +128,27 @@ def _graph_to_csr(graph: nx.Graph, weight: str):
     nx_to_seq = {n: i for i, n in enumerate(node_ids)}
     seq_to_nx = np.array(node_ids, dtype=object)
     is_multi = isinstance(graph, (nx.MultiGraph, nx.MultiDiGraph))
+    is_directed = graph.is_directed()
+
+    def _update(key_uv: tuple[int, int], w: float) -> None:
+        if key_uv not in min_weight or min_weight[key_uv] > w:
+            min_weight[key_uv] = w
+
     min_weight: dict[tuple[int, int], float] = {}
     if is_multi:
         for u, v, _k, data in graph.edges(keys=True, data=True):
             w = float(data[weight])
-            key = (nx_to_seq[u], nx_to_seq[v])
-            if key not in min_weight or min_weight[key] > w:
-                min_weight[key] = w
+            ui, vi = nx_to_seq[u], nx_to_seq[v]
+            _update((ui, vi), w)
+            if not is_directed:
+                _update((vi, ui), w)
     else:
         for u, v, data in graph.edges(data=True):
             w = float(data[weight])
-            key = (nx_to_seq[u], nx_to_seq[v])
-            if key not in min_weight or min_weight[key] > w:
-                min_weight[key] = w
+            ui, vi = nx_to_seq[u], nx_to_seq[v]
+            _update((ui, vi), w)
+            if not is_directed:
+                _update((vi, ui), w)
     n = len(node_ids)
     if min_weight:
         rows = np.fromiter((u for u, _v in min_weight.keys()),
@@ -165,67 +186,56 @@ def _walk_predecessors_to_path(predecessors_row: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
-# Routing primitives
+# Routing primitives — all backed by `scipy.sparse.csgraph.dijkstra`. The
+# input is always an `nx.Graph` (or a multi/directed variant); aperta
+# converts to a scipy CSR matrix internally via `_graph_to_csr`.
 # ---------------------------------------------------------------------------
 
-def _is_igraph(graph) -> bool:
-    return isinstance(graph, ig.Graph)
-
-
 def shortest_distances_from(
-    graph: nx.Graph | ig.Graph,
+    graph: nx.Graph,
     origin,
     weight: str,
     cutoff: float | None = None,
 ) -> dict:
     """Single-source shortest distances from `origin` to all reachable nodes.
 
-    Returns a dict mapping node -> total weight. With `cutoff`, only nodes within
-    that weight threshold are returned. Unreachable nodes are omitted.
-
-    NetworkX backend uses `nx.single_source_dijkstra_path_length` (efficient with
-    cutoff). igraph backend uses `graph.distances(...)` and filters in Python.
+    Returns a dict mapping node -> total weight. With `cutoff`, only nodes
+    within that weight threshold are returned. Unreachable nodes are omitted.
     """
-    if _is_igraph(graph):
-        distances = graph.distances(origin, weights=weight)[0]
-        if cutoff is None:
-            return {dest: d for dest, d in enumerate(distances) if not np.isinf(d)}
-        return {dest: d for dest, d in enumerate(distances)
-                if not np.isinf(d) and d <= cutoff}
-    return dict(nx.single_source_dijkstra_path_length(graph, origin,
-                                                      cutoff=cutoff, weight=weight))
+    import scipy.sparse.csgraph as csg
+    csr, nx_to_seq, seq_to_nx = _graph_to_csr(graph, weight)
+    limit = cutoff if cutoff is not None else np.inf
+    dist_row = csg.dijkstra(csr, indices=[nx_to_seq[origin]],
+                            limit=limit, return_predecessors=False)[0]
+    return {seq_to_nx[i]: float(d) for i, d in enumerate(dist_row)
+            if np.isfinite(d)}
 
 
 def shortest_distances_pairwise(
-    graph: nx.Graph | ig.Graph,
+    graph: nx.Graph,
     origins: list,
     destinations: list,
     weight: str,
+    cutoff: float | None = None,
 ) -> np.ndarray:
     """Distance matrix for `origins` x `destinations`.
 
     Returns ndarray of shape (len(origins), len(destinations)). Unreachable
     destinations are `np.inf`.
-
-    igraph backend uses vectorized `graph.distances()` (fast). NetworkX backend
-    runs single-source Dijkstra per origin (slow for many origins).
     """
-    if _is_igraph(graph):
-        return np.array(graph.distances(origins, destinations, weights=weight),
-                        dtype=float)
-    out = np.full((len(origins), len(destinations)), np.inf, dtype=float)
-    dest_to_col = {d: j for j, d in enumerate(destinations)}
-    for i, o in enumerate(origins):
-        lengths = nx.single_source_dijkstra_path_length(graph, o, weight=weight)
-        for d, length in lengths.items():
-            j = dest_to_col.get(d)
-            if j is not None:
-                out[i, j] = length
-    return out
+    import scipy.sparse.csgraph as csg
+    csr, nx_to_seq, _ = _graph_to_csr(graph, weight)
+    limit = cutoff if cutoff is not None else np.inf
+    origin_seqs = [nx_to_seq[o] for o in origins]
+    dest_seqs = np.fromiter((nx_to_seq[d] for d in destinations),
+                            dtype=np.int64, count=len(destinations))
+    dist = csg.dijkstra(csr, indices=origin_seqs, limit=limit,
+                        return_predecessors=False)
+    return dist[:, dest_seqs]
 
 
 def shortest_path_metrics_one_to_one(
-    graph: nx.Graph | ig.Graph,
+    graph: nx.Graph,
     trip_ids: list | pd.Series | np.ndarray,
     origins: list | pd.Series | np.ndarray,
     destinations: list | pd.Series | np.ndarray,
@@ -255,29 +265,32 @@ def shortest_path_metrics_one_to_one(
     reserved = {'distance', 'cost'} & set(edge_features)
     if reserved:
         raise DataError(f"edge_features may not include reserved column names: {sorted(reserved)}")
+
+    import scipy.sparse.csgraph as csg
+    csr, nx_to_seq, seq_to_nx = _graph_to_csr(graph, weight)
+    is_multi = isinstance(graph, (nx.MultiGraph, nx.MultiDiGraph))
+
+    # Group trips by origin so we only call dijkstra once per unique origin
+    # — far cheaper than per-trip when many trips share an origin (typical
+    # of calibration data: per-person trip diaries).
+    by_origin: dict = {}
+    for trip_id, o, d in zip(trip_ids, origins, destinations):
+        by_origin.setdefault(o, []).append((trip_id, d))
+
     rows = {}
-    if _is_igraph(graph):
-        for trip_id, o, d in zip(trip_ids, origins, destinations):
-            epath = graph.get_shortest_path(o, d, weight, output='epath')
-            if not epath:
+    for origin, trips in by_origin.items():
+        origin_seq = nx_to_seq[origin]
+        dist, pred = csg.dijkstra(csr, indices=[origin_seq],
+                                  return_predecessors=True)
+        for trip_id, dest in trips:
+            target_seq = nx_to_seq[dest]
+            if not np.isfinite(dist[0, target_seq]):
                 continue
-            lengths = np.array([graph.es[e][length_attr] for e in epath])
-            costs = np.array([graph.es[e][weight] for e in epath])
-            row = {'distance': float(lengths.sum()), 'cost': float(costs.sum())}
-            for feature, agg in edge_features.items():
-                try:
-                    values = np.array([graph.es[e][feature] for e in epath])
-                except KeyError:
-                    raise KeyError(f"Attribute {feature} does not exist")
-                row[feature] = _aggregate(values, lengths, agg, feature)
-            rows[trip_id] = row
-    else:
-        for trip_id, o, d in zip(trip_ids, origins, destinations):
-            try:
-                npath = nx.dijkstra_path(graph, o, d, weight=weight)
-            except (nx.NetworkXNoPath, nx.NodeNotFound):
+            npath = _walk_predecessors_to_path(pred[0], origin_seq, target_seq,
+                                               seq_to_nx)
+            if not npath:
                 continue
-            edge_data = [_pick_min_weight_edge(graph, u, v, weight)
+            edge_data = [_pick_min_weight_edge(graph, u, v, weight, is_multi)
                          for u, v in zip(npath[:-1], npath[1:])]
             lengths = np.array([ed.get(length_attr, 0.0) for ed in edge_data])
             costs = np.array([ed[weight] for ed in edge_data])
@@ -289,12 +302,13 @@ def shortest_path_metrics_one_to_one(
     return pd.DataFrame.from_dict(rows, orient='index')
 
 
-def _pick_min_weight_edge(graph: nx.Graph, u, v, weight: str) -> dict:
+def _pick_min_weight_edge(graph: nx.Graph, u, v, weight: str,
+                          is_multi: bool) -> dict:
     """For a (multi)graph, return the edge data dict for the cheapest parallel edge."""
     data = graph.get_edge_data(u, v)
     if data is None:
         raise DataError(f"No edge between {u} and {v}.")
-    if isinstance(graph, (nx.MultiGraph, nx.MultiDiGraph)):
+    if is_multi:
         return min(data.values(), key=lambda d: d[weight])
     return data
 
@@ -352,15 +366,14 @@ def tiered_path_costs(
             "masked-out" from "unreachable" if you care. Missing origins or
             missing tiers in the mask are treated as "no filter".
         cutoff: optional network-distance cutoff in weight units (e.g. seconds
-            for time-weighted edges, metres for length-weighted). When set,
-            switches the routing backend from igraph (full reachable graph
-            explored per origin) to `scipy.sparse.csgraph.dijkstra` with
-            `limit=cutoff`, which truncates each Dijkstra at the cutoff. Big
-            speed-up when the cutoff is small relative to graph diameter (e.g.
-            walk accessibility on a country-scale graph). Destinations beyond
-            cutoff are stored as `np.inf` — same convention as unreachable, so
-            downstream metrics (`count_in_bins` etc.) handle them naturally.
-            Default `None` = igraph backend (no cutoff).
+            for time-weighted edges, metres for length-weighted). Passed through
+            to `scipy.sparse.csgraph.dijkstra` as `limit=cutoff`, truncating
+            each per-origin Dijkstra at the cutoff. Big speed-up when the
+            cutoff is small relative to graph diameter (e.g. walk accessibility
+            on a country-scale graph). Destinations beyond cutoff are stored
+            as `np.inf` — same convention as unreachable, so downstream metrics
+            (`count_in_bins` etc.) handle them naturally. Default `None` = no
+            cutoff (`limit=np.inf`).
         dtype: dtype of returned cost arrays (default `np.float32` — halves
             memory + on-disk size vs `float64`, with seconds-resolution
             precision more than sufficient for travel costs). Pass
@@ -372,33 +385,18 @@ def tiered_path_costs(
         unreachable, masked-out, or beyond-cutoff destination is stored as
         `np.inf`.
     """
-    use_scipy = cutoff is not None
-    if use_scipy:
-        import scipy.sparse.csgraph as csg
-        csr, nx_to_seq, _seq_to_nx = _graph_to_csr(graph, weight)
-        zero_edge = (csr.nnz == 0)
+    import scipy.sparse.csgraph as csg
+    csr, nx_to_seq, _seq_to_nx = _graph_to_csr(graph, weight)
+    zero_edge = (csr.nnz == 0)
+    limit = cutoff if cutoff is not None else np.inf
 
-        def _route_subset(orig, sub_dests):
-            origin_seq = nx_to_seq[orig]
-            dist_row = csg.dijkstra(csr, indices=[origin_seq], limit=cutoff,
-                                     return_predecessors=False)[0]
-            seq_dests = np.fromiter((nx_to_seq[d] for d in sub_dests),
-                                     dtype=np.int64, count=len(sub_dests))
-            return dist_row[seq_dests]
-    else:
-        # Local import — `aperta.network_processing` doesn't depend on routing,
-        # but importing at module load would couple osmnx imports together.
-        from aperta.network_processing import ig_from_networkx_with_idx_maps
-        h, idx_maps = ig_from_networkx_with_idx_maps(graph)
-        nx_to_ig = idx_maps['node_nx_to_ig']
-        # Zero-edge graph short-circuit applies once — igraph raises if no edge
-        # weight attribute exists, which is the case for an edgeless graph.
-        zero_edge = (h.ecount() == 0)
-
-        def _route_subset(orig, sub_dests):
-            ig_orig = nx_to_ig[orig]
-            ig_dests = [nx_to_ig[d] for d in sub_dests]
-            return np.asarray(h.distances([ig_orig], ig_dests, weights=weight)[0])
+    def _route_subset(orig, sub_dests):
+        origin_seq = nx_to_seq[orig]
+        dist_row = csg.dijkstra(csr, indices=[origin_seq], limit=limit,
+                                 return_predecessors=False)[0]
+        seq_dests = np.fromiter((nx_to_seq[d] for d in sub_dests),
+                                 dtype=np.int64, count=len(sub_dests))
+        return dist_row[seq_dests]
 
     def _per_origin(orig, dests, dest_mask):
         n = len(dests)
@@ -417,7 +415,7 @@ def tiered_path_costs(
 
     logging.info(
         f"tiered_path_costs: routing single-process "
-        f"({'scipy, cutoff=' + str(cutoff) if use_scipy else 'igraph'})...")
+        f"(scipy, cutoff={'none' if cutoff is None else cutoff})...")
 
     def _process(tier_name: str, tier: dict | None,
                  mask_tier: dict | None) -> dict | None:
@@ -445,152 +443,6 @@ def tiered_path_costs(
         cells_to_zones=_process('cells_to_zones', pairs.cells_to_zones, c2z_mask),
         zones_to_zones=_process('zones_to_zones', pairs.zones_to_zones, zones_mask),
     )
-
-
-# ---------------------------------------------------------------------------
-# tiered_path_costs_mp — experimental multi-process variant.
-#
-# Kept structurally separate from the single-process hot path because the
-# module-level worker functions multiprocessing requires would otherwise
-# add per-origin dict-lookup overhead to every single-process call.
-# ---------------------------------------------------------------------------
-
-# Worker-process state for `tiered_path_costs_mp`. Initialised by
-# `_init_cost_worker` (passed as `Pool(initializer=...)`); read by
-# `_cost_route_origin` per task. Module-level so both functions are
-# picklable (forkserver/spawn need to re-import them by qualified name).
-_COST_WORKER: dict = {}
-
-
-def _init_cost_worker(h, nx_to_ig: dict, weight: str, dtype) -> None:
-    _COST_WORKER['h'] = h
-    _COST_WORKER['nx_to_ig'] = nx_to_ig
-    _COST_WORKER['weight'] = weight
-    _COST_WORKER['dtype'] = dtype
-    _COST_WORKER['zero_edge'] = (h.ecount() == 0)
-
-
-def _cost_route_origin(task):
-    """One Dijkstra call per origin. Returns `(origin, cost_array)`."""
-    orig, dests, dest_mask = task
-    h = _COST_WORKER['h']
-    nx_to_ig = _COST_WORKER['nx_to_ig']
-    weight = _COST_WORKER['weight']
-    dtype = _COST_WORKER['dtype']
-    n = len(dests)
-    if n == 0:
-        return orig, np.empty(0, dtype=dtype)
-    if _COST_WORKER['zero_edge']:
-        return orig, np.array([0.0 if d == orig else np.inf for d in dests],
-                              dtype=dtype)
-    if dest_mask is None:
-        ig_orig = nx_to_ig[orig]
-        ig_dests = [nx_to_ig[d] for d in dests]
-        result = np.asarray(h.distances([ig_orig], ig_dests, weights=weight)[0])
-        return orig, result.astype(dtype, copy=False)
-    true_idx = np.where(dest_mask)[0]
-    out = np.full(n, np.inf, dtype=dtype)
-    if len(true_idx) > 0:
-        ig_orig = nx_to_ig[orig]
-        ig_dests = [nx_to_ig[d] for d in dests[true_idx]]
-        out[true_idx] = np.asarray(h.distances([ig_orig], ig_dests, weights=weight)[0])
-    return orig, out
-
-
-@timeit
-def tiered_path_costs_mp(
-    pairs: TieredODPairs,
-    graph: nx.Graph,
-    weight: str,
-    *,
-    mask: TieredODPairs | None = None,
-    n_workers: int = 4,
-    dtype: np.dtype | type = np.float32,
-) -> TieredODPairs:
-    """Experimental: multi-process variant of `tiered_path_costs`.
-
-    Spins up a `multiprocessing.Pool` (forkserver context — pays the
-    aperta + igraph + numpy import cost once when the forkserver starts,
-    then each worker is cheap-forked) where each worker holds its own
-    copy of the igraph; per-origin Dijkstra calls are dispatched via
-    `imap_unordered`.
-
-    Effective speedup is modest on the Swiss-scale benchmark (~1.3× at
-    `n_workers=4`) — per-call pool setup and per-task IPC dilute the
-    gain. For small graphs (e.g. car-only at this scale) it can be net
-    slower than single-process. Use only when single-process routing
-    is genuinely the wall-time bottleneck.
-
-    Memory cost: roughly one graph copy per worker.
-
-    **Calling script MUST guard its entry point with
-    `if __name__ == '__main__':`** — forkserver re-imports the caller's
-    module to find the worker functions; without the guard, top-level
-    routing calls re-run in the forkserver's import and the script
-    hangs. Notebooks are exempt (kernel acts as `__main__`).
-
-    Args:
-        pairs, graph, weight, mask, dtype: as in `tiered_path_costs`.
-        n_workers: process count for the Pool (default 4). Use 1 to
-            fall back to the single-process hot path in
-            `tiered_path_costs` (without the worker-pool overhead).
-
-    Returns:
-        `TieredODPairs` — same shape as `tiered_path_costs`.
-    """
-    if n_workers < 1:
-        raise ValueError(f"`n_workers` must be >= 1, got {n_workers!r}.")
-    if n_workers == 1:
-        # No reason to pay the pool setup cost; defer to the hot path.
-        return tiered_path_costs(pairs, graph, weight, mask=mask, dtype=dtype)
-
-    import multiprocessing as mp
-    from aperta.network_processing import ig_from_networkx_with_idx_maps
-
-    h, idx_maps = ig_from_networkx_with_idx_maps(graph)
-    nx_to_ig = idx_maps['node_nx_to_ig']
-
-    cells_mask = mask.cells_to_cells if mask is not None else None
-    c2z_mask = mask.cells_to_zones if mask is not None else None
-    zones_mask = mask.zones_to_zones if mask is not None else None
-
-    def _build_tasks(tier: dict, mask_tier: dict | None) -> list:
-        return [(orig,
-                 np.asarray(dests),
-                 mask_tier.get(orig) if mask_tier is not None else None)
-                for orig, dests in tier.items()]
-
-    ctx = mp.get_context('forkserver')
-    pool = ctx.Pool(n_workers, initializer=_init_cost_worker,
-                    initargs=(h, nx_to_ig, weight, dtype))
-    logging.info(f"tiered_path_costs_mp: routing with {n_workers} workers...")
-
-    def _process(tier_name: str, tier: dict | None,
-                 mask_tier: dict | None) -> dict | None:
-        if tier is None:
-            return None
-        n = len(tier)
-        log_every = max(1, n // 10)
-        tasks = _build_tasks(tier, mask_tier)
-        chunksize = max(1, n // (n_workers * 4))
-        out: dict = {}
-        for i, (orig, cost_arr) in enumerate(
-                pool.imap_unordered(_cost_route_origin, tasks, chunksize=chunksize),
-                start=1):
-            out[orig] = cost_arr
-            if i % log_every == 0 or i == n:
-                logging.info(f"  {tier_name}: {i:,} of {n:,} origins routed")
-        return out
-
-    try:
-        return TieredODNodePairs(
-            cells_to_cells=_process('cells_to_cells', pairs.cells_to_cells, cells_mask),
-            cells_to_zones=_process('cells_to_zones', pairs.cells_to_zones, c2z_mask),
-            zones_to_zones=_process('zones_to_zones', pairs.zones_to_zones, zones_mask),
-        )
-    finally:
-        pool.close()
-        pool.join()
 
 
 class PathAggregation(NamedTuple):
@@ -837,9 +689,9 @@ def tiered_path_aggregate(
 
     Args:
         pairs, graph, weight, mask, cutoff, dtype: as in `tiered_path_costs`.
-            With `cutoff` set, the scipy backend retrieves paths via
-            `dijkstra(return_predecessors=True)` and walks the predecessor
-            chain per target; otherwise igraph's `get_shortest_paths` is used.
+            Paths are retrieved via `scipy.sparse.csgraph.dijkstra(
+            return_predecessors=True)` and reconstructed by walking the
+            predecessor chain back from each target to the origin.
         edge_aggregations: list of `PathAggregation` specs (per-edge).
         node_aggregations: list of `NodeAggregation` specs (per-node).
             At least one of the two must be non-empty. Names must be unique
@@ -877,49 +729,29 @@ def tiered_path_aggregate(
         raise ValueError(
             f"Aggregation names must be unique across edge + node specs; got {names}.")
 
-    use_scipy = cutoff is not None
-    if use_scipy:
-        # Per-origin path retrieval via scipy dijkstra with cutoff. Path
-        # reconstruction walks the predecessor chain from each target back
-        # to the origin.
-        import scipy.sparse.csgraph as csg
-        csr, nx_to_seq, seq_to_nx = _graph_to_csr(graph, weight)
-        zero_edge = (csr.nnz == 0)
+    # Per-origin path retrieval via scipy dijkstra. Path reconstruction
+    # walks the predecessor chain from each target back to the origin.
+    import scipy.sparse.csgraph as csg
+    csr, nx_to_seq, seq_to_nx = _graph_to_csr(graph, weight)
+    zero_edge = (csr.nnz == 0)
+    limit = cutoff if cutoff is not None else np.inf
 
-        def _paths(orig, sub_dests):
-            if zero_edge:
-                return [[orig] if d == orig else [] for d in sub_dests]
-            origin_seq = nx_to_seq[orig]
-            dist, pred = csg.dijkstra(csr, indices=[origin_seq],
-                                       limit=cutoff,
-                                       return_predecessors=True)
-            paths = []
-            for d in sub_dests:
-                target_seq = nx_to_seq[d]
-                if not np.isfinite(dist[0, target_seq]):
-                    paths.append([])  # unreachable or beyond cutoff
-                else:
-                    paths.append(_walk_predecessors_to_path(
-                        pred[0], origin_seq, target_seq, seq_to_nx))
-            return paths
-    else:
-        # Per-origin path retrieval via igraph (vectorised C engine). Returns
-        # a list of node-id lists, one per dest, [] when unreachable.
-        from aperta.network_processing import ig_from_networkx_with_idx_maps
-        h, idx_maps = ig_from_networkx_with_idx_maps(graph)
-        nx_to_ig = idx_maps['node_nx_to_ig']
-        ig_to_nx = idx_maps['node_ig_to_nx']
-
-        def _paths(orig, sub_dests):
-            # Zero-edge graph short-circuit: igraph raises on missing weight
-            # attribute when the graph has no edges. Self-pair → [orig];
-            # others → [].
-            if h.ecount() == 0:
-                return [[orig] if d == orig else [] for d in sub_dests]
-            ig_orig = nx_to_ig[orig]
-            ig_dests = [nx_to_ig[d] for d in sub_dests]
-            paths_ig = h.get_shortest_paths(ig_orig, to=ig_dests, weights=weight)
-            return [[ig_to_nx[v] for v in p] for p in paths_ig]
+    def _paths(orig, sub_dests):
+        if zero_edge:
+            return [[orig] if d == orig else [] for d in sub_dests]
+        origin_seq = nx_to_seq[orig]
+        dist, pred = csg.dijkstra(csr, indices=[origin_seq],
+                                   limit=limit,
+                                   return_predecessors=True)
+        paths = []
+        for d in sub_dests:
+            target_seq = nx_to_seq[d]
+            if not np.isfinite(dist[0, target_seq]):
+                paths.append([])  # unreachable or beyond cutoff
+            else:
+                paths.append(_walk_predecessors_to_path(
+                    pred[0], origin_seq, target_seq, seq_to_nx))
+        return paths
 
     def _per_origin(orig, dests, dest_mask):
         n = len(dests)
@@ -950,7 +782,7 @@ def tiered_path_aggregate(
 
     logging.info(
         f"tiered_path_aggregate: routing "
-        f"({'scipy, cutoff=' + str(cutoff) if use_scipy else 'igraph'})...")
+        f"(scipy, cutoff={'none' if cutoff is None else cutoff})...")
 
     def _process(tier_name: str, tier: dict | None,
                  mask_tier: dict | None) -> tuple[dict, dict[str, dict]] | None:
