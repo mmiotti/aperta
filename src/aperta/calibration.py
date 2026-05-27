@@ -32,8 +32,8 @@ since updated coefficients change edge weights and therefore the chosen path
 
 This module does NOT compute betweenness / traffic flows itself. Treat the
 traffic estimate as just another per-edge attribute the caller supplies (e.g.
-via `network_processing.get_nested_edge_betweenness_using_igraph`). Then
-include it in `multiplier_features` (if it scales duration like density) or
+via `network_processing.get_nested_edge_betweenness`). Then include it in
+`multiplier_features` (if it scales duration like density) or
 `additive_route_features` (if seconds-per-unit).
 """
 import logging

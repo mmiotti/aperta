@@ -3,7 +3,6 @@ from collections import defaultdict
 from typing import Callable, Literal, cast
 
 import geopandas as gpd
-import igraph as ig
 import networkx as nx
 import numpy as np
 import pandas as pd
@@ -88,78 +87,82 @@ def set_nx_edge_attributes_filled(g: nx.MultiGraph,
 
 
 @utils.timeit
-def ig_from_networkx_with_idx_maps(g: nx.Graph):
-    """Convert networkx graph to iGraph graph with node/edge nx↔ig index maps.
-
-    Accepts any nx graph type (`Graph`, `DiGraph`, `MultiGraph`, `MultiDiGraph`).
-    For multigraphs each edge is identified by its `(u, v, key)` triple; for
-    plain graphs by `(u, v)`. The mapping is stored on the nx graph as a
-    `nx_edge_id` edge attribute so igraph picks it up automatically.
-    """
-    if g.is_multigraph():
-        edge_id_attr = {(u, v, k): (u, v, k) for u, v, k in g.edges(keys=True)}
-    else:
-        edge_id_attr = {(u, v): (u, v) for u, v in g.edges()}
-    nx.set_edge_attributes(g, edge_id_attr, name='nx_edge_id')
-    h = ig.Graph.from_networkx(g)
-    # Edge attribute access via `h.es()[name]` raises KeyError when the graph
-    # has zero edges (the attribute slot was never created). Edge-tier maps
-    # are simply empty in that case.
-    if h.ecount() > 0:
-        edge_ids = h.es()['nx_edge_id']
-        edge_list = h.get_edgelist()
-        edge_nx_to_ig = dict(zip(edge_ids, edge_list))
-        edge_ig_to_nx = {b: a for a, b in zip(edge_ids, edge_list)}
-    else:
-        edge_nx_to_ig = {}
-        edge_ig_to_nx = {}
-    idx_maps = {
-        'node_nx_to_ig': {a: b for a, b in zip(h.vs()['_nx_name'], h.vs.indices)},
-        'node_ig_to_nx': {b: a for a, b in zip(h.vs()['_nx_name'], h.vs.indices)},
-        'edge_nx_to_ig': edge_nx_to_ig,
-        'edge_ig_to_nx': edge_ig_to_nx,
-    }
-    return h, idx_maps
-
-
-@utils.timeit
-def get_edge_betweenness_using_igraph(
-    g: nx.MultiGraph,
-    directed: bool = True,
-    cutoff: int | float | None = None,
-    weights: str | None = None,
-    sources: list | None = None,
-    targets: list | None = None,
-) -> pd.Series:
-    """Get edge betweenness centralities from networkx network using iGraph (faster than networkx)."""
-
-    h, idx_maps = ig_from_networkx_with_idx_maps(g)
-    if sources:
-        sources = [idx_maps['node_nx_to_ig'][node] for node in sources]
-    if targets:
-        targets = [idx_maps['node_nx_to_ig'][node] for node in targets]
-    bc_result = h.edge_betweenness(directed, cutoff, weights, sources, targets)
-    bc_data = {idx_maps['edge_ig_to_nx'][idx]: bc for idx, bc in zip(h.get_edgelist(), bc_result)}
-    return pd.Series(bc_data)
-
-
-@utils.timeit
-def get_nested_edge_betweenness_using_igraph(
-    g: nx.MultiGraph,
+def get_nested_edge_betweenness(
+    g: nx.Graph,
     nested_node_sample: dict,
-    directed: bool = True,
     weights: str | None = None,
+    *,
+    cutoff: float | None = None,
 ) -> pd.Series:
-    """Get edge betweenness centralities from nested (asymmetric) node pairs."""
-    out = defaultdict(int)
-    h, idx_maps = ig_from_networkx_with_idx_maps(g)
-    for orig, dests in nested_node_sample.items():
-        orig = idx_maps['node_nx_to_ig'][orig]
-        dests = [idx_maps['node_nx_to_ig'][node] for node in dests]
-        bc_result = h.edge_betweenness(directed, None, weights, [orig], dests)
-        for idx, bc in zip(h.get_edgelist(), bc_result):
-            out[idx] += bc
-    out = {idx_maps['edge_ig_to_nx'][k]: v for k, v in out.items()}
+    """Edge usage counts from a nested (origin → sampled-destinations) sample.
+
+    For each origin in `nested_node_sample`, runs a single-source Dijkstra
+    on `g` (via `scipy.sparse.csgraph.dijkstra` with `return_predecessors`),
+    walks the predecessor chain from each sampled destination back to the
+    origin, and adds 1 to every edge on the path. The result is the
+    weighted sum over all sampled OD pairs — a "traffic-stress"-style edge
+    usage count, not classical Brandes' betweenness.
+
+    Repeated destinations in the per-origin sample naturally count multiple
+    times (each occurrence adds 1 to its path's edges), so weight comes
+    from the upstream sampling step's destination distribution.
+
+    Args:
+        g: networkx graph (any variant). MultiGraph parallel edges with the
+            same `(u, v)` collapse to the min-`weight` edge for routing,
+            and the chosen key is the one credited in the output.
+        nested_node_sample: `{origin_node -> array_of_dest_nodes}`, typically
+            from `traffic_flows.nested_node_sample`. Origins are unique;
+            duplicate destinations within an origin's array are fine.
+        weights: edge attribute name to use as the per-edge cost (e.g.
+            `'duration_s'`). Required — there's no "all edges weight 1"
+            default since traffic-flow sampling always needs real costs.
+        cutoff: optional network-distance cutoff in weight units. Passed to
+            `csg.dijkstra(limit=cutoff)` to truncate each per-origin search
+            once destinations beyond the cutoff are unreachable anyway. Set
+            this to the upstream sampling radius (typically `r_zones` from
+            `od_pairs.get_pairs`) — destinations sampled within that radius
+            are guaranteed reachable within `cutoff`, and the truncation
+            gives a large speed-up on country-scale graphs. Default `None`
+            = no cutoff.
+
+    Returns:
+        `pd.Series` indexed by edge ID — `(u, v)` for plain graphs, `(u, v, k)`
+        for multigraphs — with the accumulated edge usage count.
+    """
+    # Local import to keep scipy.sparse out of the module load path.
+    import scipy.sparse.csgraph as csg
+    from aperta.routing import _graph_to_csr
+
+    is_multi = g.is_multigraph()
+    csr, nx_to_seq, seq_to_nx, parallel_keys = _graph_to_csr(
+        g, weights, return_parallel_keys=True)
+    limit = cutoff if cutoff is not None else np.inf
+
+    out: dict = defaultdict(float)
+    for orig_nx, dest_nodes in nested_node_sample.items():
+        if orig_nx not in nx_to_seq:
+            continue
+        orig_seq = nx_to_seq[orig_nx]
+        _, pred = csg.dijkstra(csr, indices=[orig_seq], limit=limit,
+                               return_predecessors=True)
+        pred_row = pred[0]
+        for dest_nx in dest_nodes:
+            v_seq = nx_to_seq.get(dest_nx)
+            if v_seq is None or v_seq == orig_seq:
+                continue
+            # Walk predecessors back to the origin; accumulate 1 per edge.
+            while v_seq != orig_seq:
+                u_seq = pred_row[v_seq]
+                if u_seq < 0:
+                    break  # unreachable / beyond cutoff
+                if is_multi:
+                    k = parallel_keys.get((int(u_seq), int(v_seq)))
+                    edge_key = (seq_to_nx[int(u_seq)], seq_to_nx[int(v_seq)], k)
+                else:
+                    edge_key = (seq_to_nx[int(u_seq)], seq_to_nx[int(v_seq)])
+                out[edge_key] += 1
+                v_seq = u_seq
     return pd.Series(out)
 
 

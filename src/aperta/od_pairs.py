@@ -1246,3 +1246,41 @@ def get_euclidian_dists(
     )
 
 
+def max_cost(costs: TieredODPairs) -> float:
+    """Largest finite value across all tiers of `costs`.
+
+    Designed as a one-liner upper bound to pass as `cutoff=` to downstream
+    routing helpers (`routing.tiered_path_costs`, `traffic_flows.get`,
+    `network_processing.get_nested_edge_betweenness`, etc.) when the
+    routing targets are guaranteed to live inside this `costs` ODM — e.g.
+    the canonical traffic-flows workflow:
+
+        costs  = routing.tiered_path_costs(pairs, g, weight)
+        sample = traffic_flows.nested_node_sample(pairs, weights, costs, ...)
+        flows  = traffic_flows.get(g, weight, expected_km, sample,
+                                   cutoff=od_pairs.max_cost(costs))
+
+    Correctness-preserving: every (origin, dest) pair in `costs` is
+    reachable within this distance by definition, so a downstream
+    `csg.dijkstra(limit=cutoff)` won't clip any pair the caller cares
+    about. Loose vs the per-origin or per-sampled-pair max — but still
+    captures the bulk of the cutoff speedup at zero plumbing cost.
+
+    Non-finite entries (`np.inf` for unreachable, `np.nan`) are ignored.
+    Returns `0.0` if every tier is empty / all-unreachable — safe to pass
+    as a cutoff (means "route nothing").
+    """
+    finite_max = -np.inf
+    for tier in (costs.cells_to_cells, costs.cells_to_zones, costs.zones_to_zones):
+        if tier is None:
+            continue
+        for arr in tier.values():
+            if len(arr) == 0:
+                continue
+            arr = np.asarray(arr)
+            finite = arr[np.isfinite(arr)]
+            if finite.size:
+                finite_max = max(finite_max, float(finite.max()))
+    return finite_max if finite_max > -np.inf else 0.0
+
+

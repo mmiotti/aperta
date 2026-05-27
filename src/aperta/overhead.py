@@ -272,6 +272,7 @@ def aggregate_dest_overhead_per_group_routed(
     node_column: str = 'node_id',
     cell_overhead_column: str | None = None,
     weight_column: str | None = None,
+    cutoff: float | None = None,
 ) -> pd.Series:
     """Per-group destination overhead via routing — for zone- or region-tier
     destinations.
@@ -311,6 +312,12 @@ def aggregate_dest_overhead_per_group_routed(
             ignored).
         weight_column: optional column on `cells` to weight the mean (e.g.
             `'population'`). `None` = uniform.
+        cutoff: optional `csg.dijkstra(limit=cutoff)` in `weight` units.
+            Cells beyond it from `g_node` are treated as unreachable
+            (contribute NaN, filtered from the mean). Set this comfortably
+            above the longest expected last-mile in `weight` units (typical
+            zone diameter ÷ slowest mode speed) to speed up routing on
+            large graphs.
 
     Returns:
         `pd.Series` indexed by `target_groups.index`, with one mean overhead
@@ -321,10 +328,11 @@ def aggregate_dest_overhead_per_group_routed(
     import scipy.sparse.csgraph as csg
     from aperta.routing import _graph_to_csr
     csr, nx_to_seq, _ = _graph_to_csr(graph, weight)
+    limit = cutoff if cutoff is not None else np.inf
 
     def _distances_from(g_node, cell_nodes):
         g_seq = nx_to_seq[g_node]
-        dist_row = csg.dijkstra(csr, indices=[g_seq],
+        dist_row = csg.dijkstra(csr, indices=[g_seq], limit=limit,
                                 return_predecessors=False)[0]
         cell_seqs = np.fromiter((nx_to_seq[n] for n in cell_nodes),
                                 dtype=np.int64, count=len(cell_nodes))

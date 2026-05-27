@@ -29,13 +29,8 @@ on a *live* graph whose edge weights are routinely mutated (calibration loop,
 scenario comparison, time-of-day variants). Contraction hierarchies (Pandana,
 OSRM) preprocess once and reuse, which fights this workflow. The historical
 networkx / igraph backends were dropped in favour of scipy CSR + scipy
-`csgraph.dijkstra`, which is competitive in raw speed (faster than igraph
-with a `cutoff` set; comparable without), zero-preprocessing, and has a
-single code path.
-
-The only routing operation still on igraph is edge betweenness centrality
-(`network_processing.get_edge_betweenness_using_igraph`); scipy doesn't have
-a competitive betweenness implementation.
+`csgraph.dijkstra`, which is competitive in raw speed, zero-preprocessing,
+and has a single code path.
 
 A future `RoutingProfile` class will bundle the duration callable + parameters +
 graph into one object; for now, callers compose the pieces themselves.
@@ -105,7 +100,8 @@ def combine_edge_weights(g: nx.Graph, source_names: list[str], target_name: str)
 # ---------------------------------------------------------------------------
 
 
-def _graph_to_csr(graph: nx.Graph, weight: str):
+def _graph_to_csr(graph: nx.Graph, weight: str,
+                  return_parallel_keys: bool = False):
     """Build a scipy CSR matrix from `graph` using `weight` as edge cost.
 
     For MultiGraph / MultiDiGraph parallels, keeps the minimum-weight edge
@@ -118,10 +114,21 @@ def _graph_to_csr(graph: nx.Graph, weight: str):
     another weighted 5 still gets `csr[u, v] = csr[v, u] = 3` (the user's
     intent for "undirected" is symmetric).
 
-    Returns `(csr, nx_to_seq, seq_to_nx)`:
-      - `csr`: scipy.sparse.csr_matrix of shape (n, n), float weights
-      - `nx_to_seq`: dict mapping nx node ID → row index 0..n-1
-      - `seq_to_nx`: ndarray of shape (n,) mapping row index → nx node ID
+    Args:
+        graph: networkx graph (any variant).
+        weight: edge attribute name used as the per-edge routing cost.
+        return_parallel_keys: when `True`, also return a `parallel_keys`
+            dict mapping `(u_seq, v_seq) -> nx_edge_key` for MultiGraph
+            inputs (the key of the parallel edge whose weight was kept).
+            For non-Multi graphs the dict is empty. Use this when the
+            caller needs to attribute path edges back to specific
+            MultiGraph edge IDs (e.g. edge betweenness on a MultiDiGraph
+            where output keys are `(u, v, k)` triples).
+
+    Returns:
+        `(csr, nx_to_seq, seq_to_nx)` by default, or
+        `(csr, nx_to_seq, seq_to_nx, parallel_keys)` when
+        `return_parallel_keys=True`.
     """
     import scipy.sparse
     node_ids = list(graph.nodes())
@@ -129,19 +136,24 @@ def _graph_to_csr(graph: nx.Graph, weight: str):
     seq_to_nx = np.array(node_ids, dtype=object)
     is_multi = isinstance(graph, (nx.MultiGraph, nx.MultiDiGraph))
     is_directed = graph.is_directed()
-
-    def _update(key_uv: tuple[int, int], w: float) -> None:
-        if key_uv not in min_weight or min_weight[key_uv] > w:
-            min_weight[key_uv] = w
+    track_keys = return_parallel_keys and is_multi
 
     min_weight: dict[tuple[int, int], float] = {}
+    parallel_keys: dict[tuple[int, int], object] = {} if track_keys else {}
+
+    def _update(key_uv: tuple[int, int], w: float, k=None) -> None:
+        if key_uv not in min_weight or min_weight[key_uv] > w:
+            min_weight[key_uv] = w
+            if track_keys:
+                parallel_keys[key_uv] = k
+
     if is_multi:
-        for u, v, _k, data in graph.edges(keys=True, data=True):
+        for u, v, k, data in graph.edges(keys=True, data=True):
             w = float(data[weight])
             ui, vi = nx_to_seq[u], nx_to_seq[v]
-            _update((ui, vi), w)
+            _update((ui, vi), w, k)
             if not is_directed:
-                _update((vi, ui), w)
+                _update((vi, ui), w, k)
     else:
         for u, v, data in graph.edges(data=True):
             w = float(data[weight])
@@ -162,6 +174,8 @@ def _graph_to_csr(graph: nx.Graph, weight: str):
         data = np.empty(0, dtype=float)
     csr = scipy.sparse.csr_matrix((data, (rows, cols)), shape=(n, n),
                                    dtype=float)
+    if return_parallel_keys:
+        return csr, nx_to_seq, seq_to_nx, parallel_keys
     return csr, nx_to_seq, seq_to_nx
 
 
@@ -242,6 +256,8 @@ def shortest_path_metrics_one_to_one(
     weight: str,
     length_attr: str = 'length',
     edge_features: dict[str, str] | None = None,
+    *,
+    cutoff: float | None = None,
 ) -> pd.DataFrame:
     """Paired (origin, destination) shortest-path routing with edge-feature aggregation.
 
@@ -256,6 +272,13 @@ def shortest_path_metrics_one_to_one(
 
     Trips with no path are omitted from the output (so output length <= input length).
 
+    `cutoff` (optional): per-origin Dijkstra `limit=` in `weight` units. Set
+    this to a value comfortably above the longest expected trip cost — trips
+    that would route beyond it are silently dropped (treated as unreachable),
+    same as actually-unreachable trips. Big speed-up on large graphs when
+    trip costs are small relative to graph diameter (e.g. urban trips on a
+    country-scale road graph). Default `None` = no cutoff.
+
     Raises DataError if 'distance' or 'cost' appear in `edge_features` (would
     collide with the built-in path-total columns).
     """
@@ -269,6 +292,7 @@ def shortest_path_metrics_one_to_one(
     import scipy.sparse.csgraph as csg
     csr, nx_to_seq, seq_to_nx = _graph_to_csr(graph, weight)
     is_multi = isinstance(graph, (nx.MultiGraph, nx.MultiDiGraph))
+    limit = cutoff if cutoff is not None else np.inf
 
     # Group trips by origin so we only call dijkstra once per unique origin
     # — far cheaper than per-trip when many trips share an origin (typical
@@ -280,7 +304,7 @@ def shortest_path_metrics_one_to_one(
     rows = {}
     for origin, trips in by_origin.items():
         origin_seq = nx_to_seq[origin]
-        dist, pred = csg.dijkstra(csr, indices=[origin_seq],
+        dist, pred = csg.dijkstra(csr, indices=[origin_seq], limit=limit,
                                   return_predecessors=True)
         for trip_id, dest in trips:
             target_seq = nx_to_seq[dest]
@@ -353,9 +377,8 @@ def tiered_path_costs(
 
     Args:
         pairs: TieredODPairs of destination IDs (typically from `od_pairs.get_pairs`).
-        graph: networkx routable graph containing every node referenced in `pairs`.
-            Converted internally to igraph (default) or scipy CSR (if
-            `cutoff` is set).
+        graph: networkx routable graph containing every node referenced in
+            `pairs`. Converted internally to a scipy CSR matrix.
         weight: edge attribute name used as the per-edge routing cost (e.g.
             `'duration_naive'`, `'duration_traffic_iterative'`).
         mask: optional boolean `TieredODPairs` (build via `od_pairs.make_mask`).
