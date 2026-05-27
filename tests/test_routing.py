@@ -54,11 +54,11 @@ class SetMinIntrazonalCostTestCase(unittest.TestCase):
         np.testing.assert_array_equal(out.cells_to_cells['b'], np.array([1., 300.]))
 
     def test_other_tiers_unchanged(self):
-        """zones_to_zones and zones_to_regions pass through untouched."""
+        """cells_to_zones and zones_to_zones pass through untouched."""
         costs = self._costs()
         out = set_min_intrazonal_cost(costs, min_cost=10.0)
         self.assertIs(out.zones_to_zones, costs.zones_to_zones)
-        self.assertIsNone(out.zones_to_regions)
+        self.assertIsNone(out.cells_to_zones)
 
     def test_dict_per_origin(self):
         """Per-origin floors apply independently."""
@@ -438,11 +438,12 @@ class AggregateAlongPathsTestCase(unittest.TestCase):
             aggregate_along_paths([['a', 'b']], self._graph(), weight='w')
 
 
-class ScipyBackendTestCase(unittest.TestCase):
-    """`cutoff=T` switches `tiered_path_costs` / `tiered_path_aggregate` to the
-    scipy.sparse.csgraph.dijkstra backend with `limit=T`. Validates that
-    (a) with a generous cutoff, results agree with igraph; (b) destinations
-    beyond cutoff are correctly returned as inf / NaN.
+class CutoffCorrectnessTestCase(unittest.TestCase):
+    """`cutoff=T` on `tiered_path_costs` / `tiered_path_aggregate` passes
+    through to `scipy.sparse.csgraph.dijkstra(limit=T)`. Validates that
+    (a) with a generous cutoff, results match the no-cutoff variant
+    bit-for-bit; (b) destinations beyond the cutoff are correctly returned
+    as inf / NaN.
     """
 
     def _graph(self) -> nx.Graph:
@@ -461,13 +462,13 @@ class ScipyBackendTestCase(unittest.TestCase):
             cells_to_cells={'a': np.array(['a', 'b', 'c'])},
         )
 
-    def test_costs_agree_with_igraph_when_cutoff_loose(self):
-        """Generous cutoff → scipy must agree with igraph bit-for-bit."""
+    def test_costs_with_loose_cutoff_match_no_cutoff(self):
+        """Generous cutoff must agree with the no-cutoff call bit-for-bit."""
         pairs, graph = self._pairs(), self._graph()
-        c_igraph = tiered_path_costs(pairs, graph, weight='w')
-        c_scipy = tiered_path_costs(pairs, graph, weight='w', cutoff=1_000)
+        c_unbounded = tiered_path_costs(pairs, graph, weight='w')
+        c_capped = tiered_path_costs(pairs, graph, weight='w', cutoff=1_000)
         np.testing.assert_array_equal(
-            c_igraph.cells_to_cells['a'], c_scipy.cells_to_cells['a'])
+            c_unbounded.cells_to_cells['a'], c_capped.cells_to_cells['a'])
 
     def test_costs_beyond_cutoff_are_inf(self):
         """Tight cutoff → destinations beyond it are inf."""
@@ -478,19 +479,19 @@ class ScipyBackendTestCase(unittest.TestCase):
         self.assertEqual(c.cells_to_cells['a'][1], 1.0)   # a→b
         self.assertTrue(np.isinf(c.cells_to_cells['a'][2]))  # a→c beyond cutoff
 
-    def test_aggregate_agrees_with_igraph_when_cutoff_loose(self):
-        """Generous cutoff → scipy aggregate results match igraph."""
+    def test_aggregate_with_loose_cutoff_match_no_cutoff(self):
+        """Generous cutoff aggregate results match the no-cutoff call."""
         pairs, graph = self._pairs(), self._graph()
         agg = [PathAggregation('attr_total', 'attr', 'sum')]
-        c_ig, a_ig = tiered_path_aggregate(
+        c_unbounded, a_unbounded = tiered_path_aggregate(
             pairs, graph, weight='w', edge_aggregations=agg)
-        c_sp, a_sp = tiered_path_aggregate(
+        c_capped, a_capped = tiered_path_aggregate(
             pairs, graph, weight='w', edge_aggregations=agg, cutoff=1_000)
         np.testing.assert_array_equal(
-            c_ig.cells_to_cells['a'], c_sp.cells_to_cells['a'])
+            c_unbounded.cells_to_cells['a'], c_capped.cells_to_cells['a'])
         np.testing.assert_array_equal(
-            a_ig['attr_total'].cells_to_cells['a'],
-            a_sp['attr_total'].cells_to_cells['a'])
+            a_unbounded['attr_total'].cells_to_cells['a'],
+            a_capped['attr_total'].cells_to_cells['a'])
 
     def test_aggregate_beyond_cutoff_yields_inf_and_nan(self):
         """Cutoff makes a→c unreachable; cost=inf, aggregation=NaN."""
@@ -503,8 +504,8 @@ class ScipyBackendTestCase(unittest.TestCase):
         self.assertTrue(np.isinf(c.cells_to_cells['a'][2]))
         self.assertTrue(np.isnan(a['attr_total'].cells_to_cells['a'][2]))
 
-    def test_aggregate_node_features_via_scipy(self):
-        """Node aggregations work the same way under scipy backend."""
+    def test_aggregate_node_features_with_cutoff(self):
+        """Node aggregations work the same way alongside a cutoff."""
         g = nx.Graph()
         g.add_node('a', x=0.0, y=0.0, signal=0)
         g.add_node('b', x=1.0, y=0.0, signal=1)
@@ -520,7 +521,7 @@ class ScipyBackendTestCase(unittest.TestCase):
         self.assertEqual(a['signals'].cells_to_cells['a'][2], 1.0)  # [a,b,c]: 1
 
     def test_costs_multidigraph_picks_min_weight_parallel(self):
-        """MultiDiGraph: min-weight parallel collapse matches igraph behavior."""
+        """MultiDiGraph parallel edges collapse to the min-`weight` edge."""
         g = nx.MultiDiGraph()
         g.add_node('a', x=0.0, y=0.0)
         g.add_node('b', x=1.0, y=0.0)

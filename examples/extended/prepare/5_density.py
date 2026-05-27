@@ -86,7 +86,7 @@ print(f"Cells: {len(cells):,} (Σ pop+emp = {cells['pop_plus_emp'].sum():,.0f})"
 # ```
 #
 # where the numerator aggregates pop+emp from cell centroids within
-# 1 km of the node. `aggregate_within_radius` with `return_density=True`
+# 1 km of the node. `cross_sum_within_radius` with `return_density=True`
 # returns the density per m²; multiplying by 100 (× 1e6 to convert to
 # per-km², then ÷ 10_000) gives the quantity under the sqrt.
 
@@ -105,7 +105,7 @@ def add_density_and_propagate(graph: nx.MultiDiGraph, label: str) -> None:
     ).set_index('node_id')
 
     # Per-node density.
-    raw_per_m2 = geo_processing.aggregate_within_radius(
+    raw_per_m2 = geo_processing.cross_sum_within_radius(
         targets=nodes_gdf, sources=cells, radius=1000.0,
         weight_column='pop_plus_emp', return_density=True,
     )

@@ -6,11 +6,14 @@ Inputs are always:
     2. One or more pre-aggregated property weights, position-aligned with the
        cost ODM at each tier — a `dict[name -> TieredODPairs]`.
     3. A `cell_to_zone` mapping that gives each cell-tier origin its parent
-       zone-tier key (for stitching cell + zone + region tiers).
+       zone-tier key (for stitching the `zones_to_zones` far tier — the
+       `cells_to_cells` and `cells_to_zones` tiers are already cell-keyed
+       and don't need the indirection).
 
-The per-origin stitching of `cells / zones / zones_to_regions` tiers is done once,
-then reused across every (parameter × property) combination — so adding more bins,
-decays, or k values is essentially free relative to a single-parameter call.
+The per-origin stitching of `cells_to_cells / cells_to_zones / zones_to_zones`
+tiers is done once, then reused across every (parameter × property) combination
+— so adding more bins, decays, or k values is essentially free relative to a
+single-parameter call.
 
 ## Key space — node-keyed vs geo-keyed
 
@@ -109,26 +112,31 @@ def _stitched_for(origin: int | str,
     The slices let callers stitch *other* per-tier arrays (e.g. each property's
     weights) into the same position-aligned 1-D layout without re-deriving the
     boundaries.
+
+    Three tiers in order: cells_to_cells (cell-keyed, direct), cells_to_zones
+    (cell-keyed, direct), zones_to_zones (zone-keyed, needs origin's parent
+    zone). The returned slices have the same order.
     """
     cell_arr = costs.cells_to_cells[origin]
+    c2z_arr = (costs.cells_to_zones.get(origin)
+               if costs.cells_to_zones is not None else None)
     zone_node = cell_to_zone_node.get(origin)
-    zone_arr = (costs.zones_to_zones.get(zone_node) if costs.zones_to_zones is not None else None)
-    region_arr = (costs.zones_to_regions.get(zone_node)
-                  if costs.zones_to_regions is not None else None)
+    zone_arr = (costs.zones_to_zones.get(zone_node)
+                if costs.zones_to_zones is not None else None)
     parts = [cell_arr]
+    if c2z_arr is not None:
+        parts.append(c2z_arr)
     if zone_arr is not None:
         parts.append(zone_arr)
-    if region_arr is not None:
-        parts.append(region_arr)
     stitched = np.concatenate(parts) if len(parts) > 1 else cell_arr
     n_cell = len(cell_arr)
+    n_c2z = len(c2z_arr) if c2z_arr is not None else 0
     n_zone = len(zone_arr) if zone_arr is not None else 0
-    n_region = len(region_arr) if region_arr is not None else 0
     return (
         stitched,
         slice(0, n_cell),
-        slice(n_cell, n_cell + n_zone),
-        slice(n_cell + n_zone, n_cell + n_zone + n_region),
+        slice(n_cell, n_cell + n_c2z),
+        slice(n_cell + n_c2z, n_cell + n_c2z + n_zone),
     )
 
 
@@ -136,33 +144,50 @@ def _stitched_weights(origin: int | str,
                       zone_node: int | str | None,
                       weights: TieredODPairs,
                       n_cell: int,
+                      n_c2z: int,
                       n_zone: int,
-                      n_region: int) -> np.ndarray:
+                      dtype: np.dtype | type = np.float32) -> np.ndarray:
     """Stitch a single property's three-tier value arrays for one origin.
 
     Tiers that are `None` (or where the origin / zone has no entry) contribute
     zeros so the result is positionally aligned with the cost stitching from
     `_stitched_for`.
     """
-    total = n_cell + n_zone + n_region
-    out = np.zeros(total, dtype=np.float64)
+    total = n_cell + n_c2z + n_zone
+    out = np.zeros(total, dtype=dtype)
     cell_w = weights.cells_to_cells.get(origin)
     if cell_w is not None and n_cell:
         out[:n_cell] = cell_w
+    if n_c2z and weights.cells_to_zones is not None:
+        c2z_w = weights.cells_to_zones.get(origin)
+        if c2z_w is not None:
+            out[n_cell:n_cell + n_c2z] = c2z_w
     if n_zone and weights.zones_to_zones is not None:
         zw = weights.zones_to_zones.get(zone_node)
         if zw is not None:
-            out[n_cell:n_cell + n_zone] = zw
-    if n_region and weights.zones_to_regions is not None:
-        rw = weights.zones_to_regions.get(zone_node)
-        if rw is not None:
-            out[n_cell + n_zone:] = rw
+            out[n_cell + n_c2z:] = zw
     return out
 
 
 def _origin_index_name(costs: TieredODPairs) -> str:
     """Output-DataFrame index name based on the input ODM's key space."""
     return 'cell' if isinstance(costs, TieredODGeoPairs) else 'node'
+
+
+def _sniff_dtype(costs: TieredODPairs) -> np.dtype:
+    """Return the dtype of the first non-empty per-tier cost array.
+
+    Used to make accessibility output dtype follow the input costs dtype
+    (FP32 by default, FP64 if the caller opted in upstream) without an
+    explicit kwarg on every accessibility function.
+    """
+    for tier in (costs.cells_to_cells, costs.cells_to_zones,
+                 costs.zones_to_zones):
+        if tier is None:
+            continue
+        for arr in tier.values():
+            return np.asarray(arr).dtype
+    return np.dtype(np.float32)
 
 
 @timeit
@@ -193,8 +218,9 @@ def count_in_bins(
 
     Returns:
         DataFrame indexed by origin key with `(bin_name, property_name)`
-        MultiIndex on columns. Order: bins outer, properties inner. Dtype:
-        float64.
+        MultiIndex on columns. Order: bins outer, properties inner. Dtype
+        follows the input `costs` ODM (FP32 by default, FP64 if the caller
+        opted in upstream).
 
     Per-cell overhead: for `TieredODGeoPairs` inputs, bake per-cell origin
     overhead into the cost ODM upfront via `overhead.add_origin_cell_overhead`.
@@ -203,20 +229,21 @@ def count_in_bins(
     origins = list(costs.cells_to_cells.keys())
     columns = pd.MultiIndex.from_product([[b.name for b in bins], prop_names],
                                          names=['bin', 'property'])
-    out = np.zeros((len(origins), len(bins) * len(prop_names)), dtype=np.float64)
+    dtype = _sniff_dtype(costs)
+    out = np.zeros((len(origins), len(bins) * len(prop_names)), dtype=dtype)
 
     for i, origin in enumerate(origins):
-        stitched_cost, cell_sl, zone_sl, region_sl = _stitched_for(
+        stitched_cost, cell_sl, c2z_sl, zone_sl = _stitched_for(
             origin, costs, cell_to_zone)
         n_cell = cell_sl.stop - cell_sl.start
+        n_c2z = c2z_sl.stop - c2z_sl.start
         n_zone = zone_sl.stop - zone_sl.start
-        n_region = region_sl.stop - region_sl.start
         zone_key = cell_to_zone.get(origin)
 
-        prop_weights = np.empty((len(prop_names), len(stitched_cost)), dtype=np.float64)
+        prop_weights = np.empty((len(prop_names), len(stitched_cost)), dtype=dtype)
         for p, name in enumerate(prop_names):
             prop_weights[p] = _stitched_weights(origin, zone_key, weights[name],
-                                                n_cell, n_zone, n_region)
+                                                n_cell, n_c2z, n_zone, dtype=dtype)
 
         for b, bin_ in enumerate(bins):
             mask = (stitched_cost >= bin_.lo) & (stitched_cost < bin_.hi)
@@ -262,7 +289,8 @@ def gravity(
 
     Returns:
         DataFrame indexed by origin key with MultiIndex columns
-        `(decay, property)`. Dtype: float64.
+        `(decay, property)`. Dtype follows the input `costs` ODM
+        (FP32 by default, FP64 if the caller opted in upstream).
     """
     if isinstance(decays, Decay):
         decays = [decays]
@@ -275,20 +303,21 @@ def gravity(
     columns = pd.MultiIndex.from_product([decay_names, prop_names],
                                          names=['decay', 'property'])
     n_props = len(prop_names)
-    out = np.zeros((len(origins), len(decays) * n_props), dtype=np.float64)
+    dtype = _sniff_dtype(costs)
+    out = np.zeros((len(origins), len(decays) * n_props), dtype=dtype)
 
     for i, origin in enumerate(origins):
-        stitched_cost, cell_sl, zone_sl, region_sl = _stitched_for(
+        stitched_cost, cell_sl, c2z_sl, zone_sl = _stitched_for(
             origin, costs, cell_to_zone)
         n_cell = cell_sl.stop - cell_sl.start
+        n_c2z = c2z_sl.stop - c2z_sl.start
         n_zone = zone_sl.stop - zone_sl.start
-        n_region = region_sl.stop - region_sl.start
         zone_key = cell_to_zone.get(origin)
 
-        prop_weights = np.empty((n_props, len(stitched_cost)), dtype=np.float64)
+        prop_weights = np.empty((n_props, len(stitched_cost)), dtype=dtype)
         for p, name in enumerate(prop_names):
             prop_weights[p] = _stitched_weights(origin, zone_key, weights[name],
-                                                n_cell, n_zone, n_region)
+                                                n_cell, n_c2z, n_zone, dtype=dtype)
 
         finite_mask = np.isfinite(stitched_cost)
         if not finite_mask.any():
@@ -358,7 +387,9 @@ def nearest_k(
 
     Returns:
         DataFrame indexed by origin key with MultiIndex columns `(k, property)`.
-        Dtype: float64. NaN where the `k`-th opportunity is unreachable.
+        Dtype follows the input `costs` ODM (FP32 by default, FP64 if the
+        caller opted in upstream). NaN where the `k`-th opportunity is
+        unreachable.
     """
     if aggregator not in ('cost_mean', 'cost_at_k'):
         raise ValueError(
@@ -374,21 +405,22 @@ def nearest_k(
     origins = list(costs.cells_to_cells.keys())
     columns = pd.MultiIndex.from_product([ks, prop_names], names=['k', 'property'])
     n_props = len(prop_names)
-    out = np.full((len(origins), len(ks) * n_props), np.nan, dtype=np.float64)
-    ks_arr = np.asarray(ks, dtype=np.float64)
+    dtype = _sniff_dtype(costs)
+    out = np.full((len(origins), len(ks) * n_props), np.nan, dtype=dtype)
+    ks_arr = np.asarray(ks, dtype=dtype)
 
     for i, origin in enumerate(origins):
-        stitched_cost, cell_sl, zone_sl, region_sl = _stitched_for(
+        stitched_cost, cell_sl, c2z_sl, zone_sl = _stitched_for(
             origin, costs, cell_to_zone)
         n_cell = cell_sl.stop - cell_sl.start
+        n_c2z = c2z_sl.stop - c2z_sl.start
         n_zone = zone_sl.stop - zone_sl.start
-        n_region = region_sl.stop - region_sl.start
         zone_key = cell_to_zone.get(origin)
 
-        prop_weights = np.empty((n_props, len(stitched_cost)), dtype=np.float64)
+        prop_weights = np.empty((n_props, len(stitched_cost)), dtype=dtype)
         for p, name in enumerate(prop_names):
             prop_weights[p] = _stitched_weights(origin, zone_key, weights[name],
-                                                n_cell, n_zone, n_region)
+                                                n_cell, n_c2z, n_zone, dtype=dtype)
 
         finite_mask = np.isfinite(stitched_cost)
         if not finite_mask.any():

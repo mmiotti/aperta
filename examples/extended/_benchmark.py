@@ -1,23 +1,30 @@
 """
 Quick aperta vs pandana benchmark on the Bern + 25 km consolidated graphs.
 
-Cumulative-opportunity to total employment, per mode, three routing variants:
+Cumulative-opportunity to total employment, per mode. The story this version
+tells: how does aperta's runtime scale with the **origin set size**? The
+destination structure (3-tier `cells_to_cells + cells_to_zones +
+zones_to_zones`) and the routing cutoff (`r_zones_m`) are held constant
+across the three aperta variants — only the origin set differs:
 
-  1. Pandana — native, routes from every graph node. Reported in three
-     phases: Network construction, precompute (the bulk routing), and
-     set+aggregate (destination weights + metric).
-  2. Aperta tiered (cells as origins) — standard aperta usage; cells_to_cells
-     plus zones_to_zones for the far tier. `od_pairs.get_pairs(r_cells=...,
-     r_zones=...)` does the Euclidean mask before routing — each origin
-     only sees destinations within that radius, which is what makes the
-     "sparse origins" case fast.
-  3. Aperta all-nodes — every graph node is its own "cell"; no zones,
-     same Euclidean radius mask. Apples-to-apples vs pandana on raw
-     per-origin throughput.
+  A. **All graph nodes** as origins (pandana-comparable; tiered structure
+     can't help when every node is already an origin, so this collapses to
+     a single-tier Euclidean-cutoff routing).
+  B. **Cell-snap origins** — every unique snap-node referenced by at least
+     one cell. Standard tiered aperta usage; 3-tier destination structure.
+  C. **AOI cell-snap origins** — variant B further restricted to cells
+     whose centroid lies inside the AOI polygon (the typical production
+     case: a buffer zone around the AOI provides destinations and through-
+     routing but is *not* an origin). Same 3-tier dest structure.
+
+Pandana (always all-nodes) is reported as a reference baseline for variant A.
+
+All aperta variants route via scipy `csgraph.dijkstra` (aperta's only
+routing backend) with `cutoff=metric_t_s` applied uniformly.
 
 Toggle `TEST_MODE = True` for a fast end-to-end smoke test on a small
 bbox subset (~30 s); set `TEST_MODE = False` for the full Bern + 25 km
-run (probably 30 min+).
+run (~5–10 min).
 
 Run from `aperta/examples/extended/`. Prep outputs assumed available
 under `data/prepared/`.
@@ -40,13 +47,19 @@ TEST_MODE = False              # True → small bbox subset; False → full Bern
 TEST_BBOX_HALF_KM = 3.0        # half-size of the test bbox around AOI centroid
 
 # Per-mode settings (Euclidean cutoff for OD construction; metric threshold).
+# Tier semantics:
+#   - r_cells_m:  cells_to_cells outer radius (close, cell-cell)
+#   - r_medium_m: cells_to_zones outer radius (medium, cell-zone) — `None`
+#                 auto-infers as min(r_cells * 10, r_zones)
+#   - r_zones_m:  zones_to_zones outer radius (far, zone-zone). This is the
+#                 effective routing cutoff for variants A/B/C and pandana.
 MODES = {
     'walk': dict(
         graph_file='walk_graph.graphml',
         speed_kph=5.0,            # length / (5 km/h) → seconds; matches prep
-        r_cells_m=1_000,          # aperta tiered cell tier
-        r_zones_m=2_000,          # aperta tiered zone tier (outer radius)
-        radius_m=2_000,           # aperta-all-nodes + pandana cutoff (outer)
+        r_cells_m=1_000,
+        r_medium_m=None,          # auto: min(1000*10, 2000) = 2000
+        r_zones_m=2_000,
         metric_t_s=15 * 60,       # cumulative within 15 minutes
     ),
     'car': dict(
@@ -54,9 +67,8 @@ MODES = {
         # car uses per-edge OSM speed_kph; speed_kph below is the fallback
         speed_kph=None,           # use per-edge speed_kph instead
         r_cells_m=1_000,
-        r_zones_m=10_000,
-        r_regions_m=50_000,
-        radius_m=50_000,
+        r_medium_m=10_000,        # preserve cell-origin precision to 10 km
+        r_zones_m=50_000,
         metric_t_s=30 * 60,
     ),
 }
@@ -122,7 +134,7 @@ def per_node_weight(cells, node_col, weight_col, all_node_index):
 # ----------------------------------------------------------------------------
 
 def run_pandana(graph, time_attr, cells, node_col, weight_col, t_metric):
-    """All nodes routed; precompute + aggregate. Returns (acc, construct_s,
+    """All graph nodes routed via pandana CH. Returns (acc, construct_s,
     precompute_s, set_aggregate_s)."""
     node_x, node_y, edges_df = graph_to_pandana_dfs(graph, time_attr)
     t0 = time.time()
@@ -137,8 +149,6 @@ def run_pandana(graph, time_attr, cells, node_col, weight_col, t_metric):
     net.precompute(t_metric)
     t_precompute = time.time() - t0
     t0 = time.time()
-    # Snap-node IDs from `cells` are strings (graphml-loaded). Convert to
-    # int64 to match `node_x.index` so the per-node weight reindex hits.
     snap_ids = cells[node_col].astype('int64')
     per_node = cells.assign(_snap=snap_ids).groupby('_snap')[weight_col].sum()
     per_node = per_node.reindex(node_x.index, fill_value=0.0)
@@ -148,46 +158,13 @@ def run_pandana(graph, time_attr, cells, node_col, weight_col, t_metric):
     return acc, t_construct, t_precompute, t_set_aggregate
 
 
-def run_aperta_tiered(graph, time_attr, cells, zones, regions, node_col,
-                      weight_col, r_cells_m, r_zones_m, r_regions_m, t_metric,
-                      cutoff_s=None):
-    """Cells (+ optional zones + optional regions) as tiered origins / dests.
+def run_variant_a_all_nodes(graph, time_attr, cells, node_col, weight_col,
+                            r_outer_m, t_metric, *, cutoff_s=None):
+    """Variant A: every graph node is its own 'cell', single-tier — the
+    tiered destination structure can't help when every node is already an
+    origin.
 
-    Pass `regions=None, r_regions_m=None` for the 2-tier walk case; pass all
-    three for the 3-tier car case. With `cutoff_s` set, routing uses scipy
-    (cutoff in weight units = seconds for time-weighted edges); otherwise
-    igraph (no cutoff). Returns `(acc, total_s, n_origins)`.
-    """
-    t0 = time.time()
-    pairs = od_pairs.get_pairs(
-        cells, r_cells=r_cells_m, node_column=node_col,
-        zones=zones, r_zones=r_zones_m,
-        regions=regions, r_regions=r_regions_m,
-    )
-    times = routing.tiered_path_costs(pairs, graph, weight=time_attr,
-                                       cutoff=cutoff_s)
-    pairs_geo, times_geo = od_pairs.reindex_by_geo_unit(
-        pairs, times, cells,
-        cell_node_column=node_col,
-        zones=zones, zone_node_column=node_col,
-        regions=regions, region_node_column=node_col,
-    )
-    w_geo = od_pairs.dest_values_geo(
-        weight_col, pairs_geo, cells, zones=zones, regions=regions)
-    cell_to_zone = cells['zone_id'].to_dict()
-    acc = accessibility.count_in_bins(
-        times_geo, {'w': w_geo}, cell_to_zone,
-        [accessibility.Bin('in_T', 0, t_metric)],
-    )
-    n_origins = len(pairs.cells_to_cells)
-    return acc, time.time() - t0, n_origins
-
-
-def run_aperta_all_nodes(graph, time_attr, cells, node_col, weight_col,
-                         r_cells_m, t_metric):
-    """Every graph node = origin = its own 'cell'; single tier.
-
-    Returns `(acc, total_s, n_origins)` where n_origins = graph node count.
+    Returns `(acc, total_s, n_origins)`.
     """
     t0 = time.time()
     node_ids = list(graph.nodes())
@@ -200,9 +177,10 @@ def run_aperta_all_nodes(graph, time_attr, cells, node_col, weight_col,
         crs=cells.crs,
     )
     pairs = od_pairs.get_pairs(
-        nodes_gdf, r_cells=r_cells_m, node_column='node_id_synth',
+        nodes_gdf, r_cells=r_outer_m, node_column='node_id_synth',
     )
-    times = routing.tiered_path_costs(pairs, graph, weight=time_attr)
+    times = routing.tiered_path_costs(pairs, graph, weight=time_attr,
+                                      cutoff=cutoff_s)
     w_vals = od_pairs.dest_values(
         weight_col, pairs, nodes_gdf, node_column='node_id_synth',
     )
@@ -213,110 +191,140 @@ def run_aperta_all_nodes(graph, time_attr, cells, node_col, weight_col,
     return acc, time.time() - t0, len(node_ids)
 
 
+def run_variant_tiered(graph, time_attr, cells, zones, node_col,
+                       weight_col, r_cells_m, r_medium_m, r_zones_m,
+                       t_metric, *, orig_cells=None, cutoff_s=None):
+    """Variants B and C: 3-tier destination structure (cells_to_cells +
+    cells_to_zones + zones_to_zones), with optional `orig_cells` mask.
+
+    - `orig_cells=None` → variant B (every cell is an origin).
+    - `orig_cells=<bool array aligned to cells.index>` → variant C (e.g.
+      AOI-restricted origins).
+
+    Returns `(acc, total_s, n_origins)`.
+    """
+    t0 = time.time()
+    pairs = od_pairs.get_pairs(
+        cells, r_cells=r_cells_m, node_column=node_col,
+        zones=zones, r_zones=r_zones_m, r_medium=r_medium_m,
+        orig_cells=orig_cells,
+    )
+    times = routing.tiered_path_costs(pairs, graph, weight=time_attr,
+                                      cutoff=cutoff_s)
+    pairs_geo, times_geo = od_pairs.reindex_by_geo_unit(
+        pairs, times, cells,
+        cell_node_column=node_col,
+        zones=zones, zone_node_column=node_col,
+    )
+    w_geo = od_pairs.dest_values_geo(
+        weight_col, pairs_geo, cells, zones=zones)
+    cell_to_zone = cells['zone_id'].to_dict()
+    acc = accessibility.count_in_bins(
+        times_geo, {'w': w_geo}, cell_to_zone,
+        [accessibility.Bin('in_T', 0, t_metric)],
+    )
+    n_origins = len(pairs.cells_to_cells)
+    return acc, time.time() - t0, n_origins
+
+
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 
-def clip_to_test_bbox(cells, zones, regions, graph, half_km):
-    """Clip cells, zones, regions, and graph to a square box around the
-    cells' centroid. Returns (cells_sub, zones_sub, regions_sub, graph_sub).
-    `regions` may be None (returns None back)."""
+def clip_to_test_bbox(cells, zones, graph, aoi_polygon, half_km):
+    """Clip cells, zones, graph, and AOI to a square box around the cells'
+    centroid. Returns (cells_sub, zones_sub, graph_sub, aoi_sub)."""
     centre = cells.union_all().centroid
     half_m = half_km * 1000
     minx, miny = centre.x - half_m, centre.y - half_m
     maxx, maxy = centre.x + half_m, centre.y + half_m
     cells_sub = cells.cx[minx:maxx, miny:maxy].copy()
     zones_sub = zones.cx[minx:maxx, miny:maxy].copy()
-    regions_sub = (regions.cx[minx:maxx, miny:maxy].copy()
-                   if regions is not None else None)
-    # Drop cells/zones referencing a parent not in the subset (keeps tier
-    # stitching consistent).
     cells_sub = cells_sub[cells_sub['zone_id'].isin(zones_sub.index)]
-    if regions_sub is not None and 'region_id' in zones_sub.columns:
-        zones_sub = zones_sub[zones_sub['region_id'].isin(regions_sub.index)]
-        cells_sub = cells_sub[cells_sub['zone_id'].isin(zones_sub.index)]
-    # Subset graph to nodes inside the bbox.
     keep_nodes = [n for n, d in graph.nodes(data=True)
                   if minx <= d['x'] <= maxx and miny <= d['y'] <= maxy]
     graph_sub = graph.subgraph(keep_nodes).copy()
-    return cells_sub, zones_sub, regions_sub, graph_sub
+    # Intersect AOI with the bbox so the "in-AOI" fraction is meaningful.
+    from shapely.geometry import box
+    aoi_sub = aoi_polygon.intersection(box(minx, miny, maxx, maxy))
+    return cells_sub, zones_sub, graph_sub, aoi_sub
 
 
 def main():
     cells = gpd.read_file(PREPARED_DIR / 'cells.gpkg').set_index('cell_id')
     zones = gpd.read_file(PREPARED_DIR / 'zones.gpkg').set_index('zone_id')
-    regions = gpd.read_file(PREPARED_DIR / 'regions.gpkg').set_index('region_id')
-    # Derive zone→region from cells (H3 hierarchy is deterministic).
-    if 'region_id' not in zones.columns:
-        zones['region_id'] = cells.groupby('zone_id')['region_id'].first()
-    print(f"Cells (full): {len(cells):,}   Zones (full): {len(zones):,}   "
-          f"Regions (full): {len(regions):,}")
+    aoi_polygon = gpd.read_file(PREPARED_DIR / 'aoi_polygon.gpkg').geometry.iloc[0]
+    print(f"Cells (full): {len(cells):,}   Zones (full): {len(zones):,}")
     if TEST_MODE:
         print(f"TEST_MODE — subsetting to ±{TEST_BBOX_HALF_KM} km around AOI centroid.")
 
     for mode, cfg in MODES.items():
-        r_regions_m = cfg.get('r_regions_m')
-        n_tiers = 3 if r_regions_m else 2
+        r_medium_m = cfg.get('r_medium_m')
+        medium_label = (f"{r_medium_m/1000:.0f} km" if r_medium_m
+                        else f"auto≈{min(cfg['r_cells_m']*10, cfg['r_zones_m'])/1000:.0f} km")
         print(f"\n{'='*70}\n{mode.upper()}  "
               f"(cumulative employment within {cfg['metric_t_s']//60} min; "
-              f"{n_tiers}-tier: r_cells={cfg['r_cells_m']/1000:.0f} km"
-              + (f", r_zones={cfg['r_zones_m']/1000:.0f} km" if cfg.get('r_zones_m') else "")
-              + (f", r_regions={r_regions_m/1000:.0f} km" if r_regions_m else "")
-              + f"; all-nodes/pandana r={cfg['radius_m']/1000:.0f} km)\n{'='*70}")
+              f"r_cells={cfg['r_cells_m']/1000:.0f} km, "
+              f"r_medium={medium_label}, "
+              f"r_zones={cfg['r_zones_m']/1000:.0f} km)\n{'='*70}")
         graph = network_processing.load_consolidated_graphml(
             PREPARED_DIR / cfg['graph_file'])
         bake_edge_times(graph, mode, cfg['speed_kph'])
         attr = time_attr_for(mode)
         node_col = f'node_id_{mode}'
 
-        mode_regions = regions if r_regions_m else None
         if TEST_MODE:
-            mode_cells, mode_zones, mode_regions, graph = clip_to_test_bbox(
-                cells, zones, mode_regions, graph, TEST_BBOX_HALF_KM)
-            r_extra = f", {len(mode_regions):,} regions" if mode_regions is not None else ""
-            print(f"  Subset: {len(mode_cells):,} cells, {len(mode_zones):,} zones"
-                  f"{r_extra}, {graph.number_of_nodes():,} graph nodes, "
+            mode_cells, mode_zones, graph, mode_aoi = clip_to_test_bbox(
+                cells, zones, graph, aoi_polygon, TEST_BBOX_HALF_KM)
+            print(f"  Subset: {len(mode_cells):,} cells, {len(mode_zones):,} zones, "
+                  f"{graph.number_of_nodes():,} graph nodes, "
                   f"{graph.number_of_edges():,} edges")
         else:
-            mode_cells, mode_zones = cells, zones
+            mode_cells, mode_zones, mode_aoi = cells, zones, aoi_polygon
             print(f"  Graph: {graph.number_of_nodes():,} nodes, "
                   f"{graph.number_of_edges():,} edges")
         snap_cells(mode_cells, graph, node_col)
         snap_cells(mode_zones, graph, node_col)
-        if mode_regions is not None:
-            snap_cells(mode_regions, graph, node_col)
 
-        n_all = graph.number_of_nodes()
+        # AOI mask: cell centroids inside the AOI polygon.
+        in_aoi = mode_cells.geometry.centroid.within(mode_aoi).to_numpy()
+        n_aoi = int(in_aoi.sum())
+        print(f"  Origin universe — graph nodes: {graph.number_of_nodes():,} · "
+              f"cells: {len(mode_cells):,} ({mode_cells[node_col].nunique():,} unique snap-nodes) · "
+              f"AOI cells: {n_aoi:,} ({100*in_aoi.mean():.1f}%)")
 
-        print(f"  Pandana ({n_all:,} nodes routed) ...    ", end='', flush=True)
+        # --- Pandana (reference, all graph nodes) -------------------------
+        print(f"\n  Pandana (all {graph.number_of_nodes():,} graph nodes) ...    ",
+              end='', flush=True)
         _, t_c, t_p, t_a = run_pandana(graph, attr, mode_cells, node_col,
                                        'employment_total', cfg['metric_t_s'])
         print(f"construct {t_c:5.1f}s  precompute {t_p:6.1f}s  "
               f"set+aggregate {t_a:5.1f}s  → total {t_c+t_p+t_a:6.1f}s")
 
-        print(f"  Aperta tiered (igraph) ...", end=' ', flush=True)
-        _, t, n_origins = run_aperta_tiered(
-            graph, attr, mode_cells, mode_zones, mode_regions, node_col,
-            'employment_total',
-            cfg['r_cells_m'], cfg['r_zones_m'], r_regions_m,
-            cfg['metric_t_s'])
-        print(f"({n_origins:,} unique snap-node origins from {len(mode_cells):,} cells)  "
-              f"→ {t:6.1f} s")
-
-        print(f"  Aperta tiered (scipy, cutoff={cfg['metric_t_s']}s) ...",
-              end=' ', flush=True)
-        _, t, _ = run_aperta_tiered(
-            graph, attr, mode_cells, mode_zones, mode_regions, node_col,
-            'employment_total',
-            cfg['r_cells_m'], cfg['r_zones_m'], r_regions_m,
-            cfg['metric_t_s'], cutoff_s=cfg['metric_t_s'])
-        print(f"→ {t:6.1f} s")
-
-        print(f"  Aperta all-nodes ...", end=' ', flush=True)
-        _, t, n_origins = run_aperta_all_nodes(
+        # --- Variant A: all graph nodes (single tier) ---------------------
+        print(f"  [A] Aperta all-nodes ...", end=' ', flush=True)
+        _, t, n_origins = run_variant_a_all_nodes(
             graph, attr, mode_cells, node_col, 'employment_total',
-            cfg['radius_m'], cfg['metric_t_s'])
+            cfg['r_zones_m'], cfg['metric_t_s'], cutoff_s=cfg['metric_t_s'])
         print(f"({n_origins:,} origins)  → {t:6.1f} s")
+
+        # --- Variant B: all cell-snap origins (3-tier) --------------------
+        print(f"  [B] Aperta cell-snap ...", end=' ', flush=True)
+        _, t, n_origins = run_variant_tiered(
+            graph, attr, mode_cells, mode_zones, node_col,
+            'employment_total',
+            cfg['r_cells_m'], r_medium_m, cfg['r_zones_m'],
+            cfg['metric_t_s'], cutoff_s=cfg['metric_t_s'])
+        print(f"({n_origins:,} origins from {len(mode_cells):,} cells)  → {t:6.1f} s")
+
+        # --- Variant C: AOI cell-snap origins (3-tier) --------------------
+        print(f"  [C] Aperta AOI cell-snap ...", end=' ', flush=True)
+        _, t, n_origins = run_variant_tiered(
+            graph, attr, mode_cells, mode_zones, node_col,
+            'employment_total',
+            cfg['r_cells_m'], r_medium_m, cfg['r_zones_m'],
+            cfg['metric_t_s'], orig_cells=in_aoi, cutoff_s=cfg['metric_t_s'])
+        print(f"({n_origins:,} origins from {n_aoi:,} AOI cells)  → {t:6.1f} s")
 
 
 if __name__ == '__main__':

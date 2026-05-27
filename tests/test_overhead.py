@@ -302,21 +302,20 @@ class AddNodeOverheadsTestCase(unittest.TestCase):
         pairs = TieredODNodePairs(
             cells_to_cells={'a': np.array(['a', 'b', 'c']),
                             'b': np.array(['a', 'b'])},
+            cells_to_zones={'a': np.array(['ZB']),
+                            'b': np.array(['ZA'])},
             zones_to_zones={'ZA': np.array(['ZB']),
                             'ZB': np.array(['ZA'])},
-            zones_to_regions={'ZA': np.array(['RC']),
-                              'ZB': np.array(['RC'])},
         )
         costs = TieredODNodePairs(
             cells_to_cells={'a': np.array([0.0, 10.0, 20.0]),
                             'b': np.array([10.0, 0.0])},
+            cells_to_zones={'a': np.array([300.0]),
+                            'b': np.array([300.0])},
             zones_to_zones={'ZA': np.array([100.0]),
                             'ZB': np.array([100.0])},
-            zones_to_regions={'ZA': np.array([500.0]),
-                              'ZB': np.array([500.0])},
         )
         return pairs, costs
-
     def test_origin_only(self):
         """Origin overhead is added to every OD pair from that origin, all tiers."""
         pairs, costs = self._setup()
@@ -325,12 +324,12 @@ class AddNodeOverheadsTestCase(unittest.TestCase):
         # cells_to_cells: a gets +3 added to every entry; b gets +5.
         np.testing.assert_array_equal(out.cells_to_cells['a'], np.array([3.0, 13.0, 23.0]))
         np.testing.assert_array_equal(out.cells_to_cells['b'], np.array([15.0, 5.0]))
-        # zones_to_zones: ZA gets +100, ZB gets +200.
+        # cells_to_zones: cell-node origins → a +3, b +5.
+        np.testing.assert_array_equal(out.cells_to_zones['a'], np.array([303.0]))
+        np.testing.assert_array_equal(out.cells_to_zones['b'], np.array([305.0]))
+        # zones_to_zones: zone-node origins → ZA +100, ZB +200.
         np.testing.assert_array_equal(out.zones_to_zones['ZA'], np.array([200.0]))
         np.testing.assert_array_equal(out.zones_to_zones['ZB'], np.array([300.0]))
-        # zones_to_regions: same origin lookup.
-        np.testing.assert_array_equal(out.zones_to_regions['ZA'], np.array([600.0]))
-
     def test_dest_cell_only(self):
         """Destination cell-tier overhead is added per cell-tier destination."""
         pairs, costs = self._setup()
@@ -340,26 +339,26 @@ class AddNodeOverheadsTestCase(unittest.TestCase):
         np.testing.assert_array_equal(out.cells_to_cells['a'], np.array([1.0, 12.0, 23.0]))
         # b's dests: [a, b] → adds [1, 2]. Costs: [10, 0] → [11, 2].
         np.testing.assert_array_equal(out.cells_to_cells['b'], np.array([11.0, 2.0]))
-        # Other tiers unchanged (no dest_zone / dest_region given).
+        # Other tiers unchanged (no dest_zone given).
+        np.testing.assert_array_equal(out.cells_to_zones['a'], np.array([300.0]))
         np.testing.assert_array_equal(out.zones_to_zones['ZA'], np.array([100.0]))
-        np.testing.assert_array_equal(out.zones_to_regions['ZA'], np.array([500.0]))
-
     def test_per_tier_dest_overheads(self):
-        """dest_cell, dest_zone, dest_region apply independently per tier."""
+        """dest_cell and dest_zone apply independently per tier; dest_zone
+        applies to BOTH cells_to_zones and zones_to_zones (both have zone dests)."""
         pairs, costs = self._setup()
         out = add_node_overheads(
             costs, pairs,
             dest_cell={'a': 1.0, 'b': 2.0, 'c': 3.0},
             dest_zone={'ZA': 50.0, 'ZB': 60.0},
-            dest_region={'RC': 200.0},
         )
         # cells: a [0,10,20] + dest [1,2,3] = [1, 12, 23].
         np.testing.assert_array_equal(out.cells_to_cells['a'], np.array([1.0, 12.0, 23.0]))
-        # zones: ZA's dest is ZB → +60. cost 100 → 160.
+        # c2z: a's dest is ZB → +60. cost 300 → 360.
+        np.testing.assert_array_equal(out.cells_to_zones['a'], np.array([360.0]))
+        # c2z: b's dest is ZA → +50. cost 300 → 350.
+        np.testing.assert_array_equal(out.cells_to_zones['b'], np.array([350.0]))
+        # z2z: ZA's dest is ZB → +60. cost 100 → 160.
         np.testing.assert_array_equal(out.zones_to_zones['ZA'], np.array([160.0]))
-        # zones_to_regions: ZA's dest is RC → +200. cost 500 → 700.
-        np.testing.assert_array_equal(out.zones_to_regions['ZA'], np.array([700.0]))
-
     def test_origin_and_destination_combine(self):
         """Origin and destination overheads add independently."""
         pairs, costs = self._setup()
@@ -370,7 +369,6 @@ class AddNodeOverheadsTestCase(unittest.TestCase):
         )
         # a: cost [0,10,20] + origin 3 + dest [1,2,3] = [4, 15, 26].
         np.testing.assert_array_equal(out.cells_to_cells['a'], np.array([4.0, 15.0, 26.0]))
-
     def test_missing_keys_get_zero(self):
         """Nodes absent from a lookup contribute 0 overhead."""
         pairs, costs = self._setup()
@@ -383,7 +381,6 @@ class AddNodeOverheadsTestCase(unittest.TestCase):
         np.testing.assert_array_equal(out.cells_to_cells['a'], np.array([3.0, 15.0, 23.0]))
         # b: cost [10,0] + origin 0 + dest [0, 2] = [10, 2].
         np.testing.assert_array_equal(out.cells_to_cells['b'], np.array([10.0, 2.0]))
-
     def test_all_none_is_no_op(self):
         """No overheads provided → costs returned unchanged (but as a new TieredODPairs)."""
         pairs, costs = self._setup()
@@ -394,7 +391,6 @@ class AddNodeOverheadsTestCase(unittest.TestCase):
             out.zones_to_zones['ZA'], costs.zones_to_zones['ZA'])
         # Must be a copy, not the same object.
         self.assertIsNot(out.cells_to_cells['a'], costs.cells_to_cells['a'])
-
     def test_dict_or_series_accepted(self):
         """Both dict and Series work for any kwarg."""
         pairs, costs = self._setup()
@@ -402,7 +398,6 @@ class AddNodeOverheadsTestCase(unittest.TestCase):
         b = add_node_overheads(costs, pairs,
                                 dest_cell=pd.Series({'a': 1.0, 'b': 2.0, 'c': 3.0}))
         np.testing.assert_array_equal(a.cells_to_cells['a'], b.cells_to_cells['a'])
-
     def test_input_costs_not_mutated(self):
         """Input cost TieredODPairs is not modified by add_node_overheads."""
         pairs, costs = self._setup()

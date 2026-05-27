@@ -89,35 +89,19 @@ def _inverse_distance(x: np.ndarray) -> np.ndarray:
 
 class GetTrafficFlowsTestCase(unittest.TestCase):
 
-    def test_returns_series(self):
+    def test_returns_series_keyed_by_multidigraph_edge(self):
         g = _toy_graph()
-        flows = get(g, routing_edge_weight='cost', expected_km_driven=100.0)
+        sample = {'A': ['D']}
+        flows = get(g, routing_edge_weight='cost', expected_km_driven=10.0,
+                    nested_node_sample=sample)
         self.assertIsInstance(flows, pd.Series)
         # Each edge is keyed by (u, v, k) (MultiDiGraph).
         for key in flows.index:
             self.assertEqual(len(key), 3)
 
-    def test_normalisation_matches_expected_km(self):
-        """`sum(flow × length) == expected_km_driven` by construction."""
-        g = _toy_graph()
-        flows = get(g, routing_edge_weight='cost', expected_km_driven=100.0)
-        lengths = nx.get_edge_attributes(g, 'length')
-        total_vkt = sum(v * lengths[k] for k, v in flows.items())
-        self.assertAlmostEqual(total_vkt, 100.0)
-
-    def test_normalisation_with_cutoff(self):
-        """Same normalisation holds when a cutoff truncates the betweenness."""
-        g = _toy_graph()
-        flows = get(g, routing_edge_weight='cost',
-                    expected_km_driven=50.0, cutoff=1)
-        lengths = nx.get_edge_attributes(g, 'length')
-        total_vkt = sum(v * lengths[k] for k, v in flows.items())
-        self.assertAlmostEqual(total_vkt, 50.0)
-        self.assertGreater(flows.sum(), 0)
-
     def test_nested_node_sample_path(self):
-        """With `nested_node_sample` given, only edges on the sampled paths
-        get positive flow. A→D goes via A-C-D (the shortcut)."""
+        """Only edges on the sampled paths get positive flow; the
+        `expected_km_driven` normaliser is exact."""
         g = _toy_graph()
         sample = {'A': ['D']}
         flows = get(g, routing_edge_weight='cost',
@@ -277,6 +261,96 @@ class NestedNodeSampleTestCase(unittest.TestCase):
         self.assertNotIn('Z2', set(out['c1'].tolist()))
         # c3 (in Z2) still has Z1 as zone-tier dest — should still appear.
         self.assertIn('Z1', set(out['c3'].tolist()))
+
+
+class NestedNodeSampleMiddleTierTestCase(unittest.TestCase):
+    """Verifies the middle-tier (`cells_to_zones`) integration: per-cell
+    cell-origin → zone-node dest pairs participate in the flattened sampling
+    pool alongside cell- and far-tier dests.
+    """
+
+    def setUp(self):
+        # Extend the 2-tier fixture with a middle tier: c1 reaches a single
+        # middle-tier dest 'M1' at cost 200 with high weight; c2 reaches 'M2'
+        # similarly. (Per Phase B semantics, cells in the same zone could
+        # share the same dest zones; here we use distinct destinations so we
+        # can distinguish c1's vs c2's middle-tier output deterministically.)
+        (cells_pairs, cells_weights, cells_costs,
+         c2z_map, orig_w) = _toy_tiered_inputs()
+        self.pairs = TieredODNodePairs(
+            cells_to_cells=cells_pairs.cells_to_cells,
+            cells_to_zones={
+                'c1': np.array(['M1']),
+                'c2': np.array(['M2']),
+                # c3, c4: no middle-tier dests — sampling falls back to other tiers.
+            },
+            zones_to_zones=cells_pairs.zones_to_zones,
+        )
+        self.weights = TieredODNodePairs(
+            cells_to_cells=cells_weights.cells_to_cells,
+            cells_to_zones={'c1': np.array([10_000.0]),
+                            'c2': np.array([10_000.0])},
+            zones_to_zones=cells_weights.zones_to_zones,
+        )
+        self.costs = TieredODNodePairs(
+            cells_to_cells=cells_costs.cells_to_cells,
+            cells_to_zones={'c1': np.array([200.0]),
+                            'c2': np.array([200.0])},
+            zones_to_zones=cells_costs.zones_to_zones,
+        )
+        self.c2z = c2z_map
+        self.orig_weights = orig_w
+
+    def test_middle_tier_dests_appear_when_weighted_up(self):
+        """With middle-tier weights boosted, the middle-tier dest shows up
+        in the per-cell sample — and the per-cell dest set differs between
+        cells in the same zone (cells_to_zones is cell-keyed)."""
+        rs = np.random.RandomState(42)
+        c1_only = np.array([1.0, 0.0, 0.0, 0.0])
+        out = nested_node_sample(
+            self.pairs, self.weights, self.costs, self.c2z,
+            c1_only, _inverse_distance,
+            n_orig=1, n_dest=1000, random_state=rs,
+        )
+        self.assertIn('M1', set(out['c1'].tolist()))
+        # c1 only routes to M1 (its own middle-tier dest), never M2 (c2's).
+        self.assertNotIn('M2', set(out['c1'].tolist()))
+
+    def test_middle_tier_mask_filters_dests(self):
+        """A cells_to_zones mask removes specific middle-tier dests."""
+        mask = TieredODNodePairs(
+            cells_to_cells={k: np.ones(len(v), dtype=bool)
+                            for k, v in self.pairs.cells_to_cells.items()},
+            cells_to_zones={'c1': np.array([False]),  # drop c1's M1
+                            'c2': np.array([True])},
+            zones_to_zones={k: np.ones(len(v), dtype=bool)
+                            for k, v in self.pairs.zones_to_zones.items()},
+        )
+        rs = np.random.RandomState(42)
+        c1_only = np.array([1.0, 0.0, 0.0, 0.0])
+        out = nested_node_sample(
+            self.pairs, self.weights, self.costs, self.c2z,
+            c1_only, _inverse_distance,
+            n_orig=1, n_dest=500, random_state=rs,
+            mask=mask,
+        )
+        self.assertNotIn('M1', set(out['c1'].tolist()))
+
+    def test_cells_without_middle_tier_entry_still_work(self):
+        """Cells absent from `cells_to_zones` use the empty fallback — no
+        crash, sampling just draws from cell + far tiers."""
+        rs = np.random.RandomState(42)
+        c3_only = np.array([0.0, 0.0, 1.0, 0.0])  # c3 has no cells_to_zones entry
+        out = nested_node_sample(
+            self.pairs, self.weights, self.costs, self.c2z,
+            c3_only, _inverse_distance,
+            n_orig=1, n_dest=100, random_state=rs,
+        )
+        # All sampled dests should be from c3's cell-tier or zone-tier pool.
+        dests = set(out['c3'].tolist())
+        allowed = {'c3', 'c4', 'Z1'}  # cell-tier dests + zone-tier dest from Z2
+        self.assertTrue(dests.issubset(allowed),
+                        f"Unexpected dests: {dests - allowed}")
 
 
 if __name__ == '__main__':

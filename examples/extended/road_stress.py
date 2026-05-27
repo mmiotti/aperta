@@ -16,8 +16,9 @@
 # %% [markdown]
 # # `road_stress` — calibration + production estimate
 #
-# Estimates per-edge AADT for the car network via nested betweenness,
-# with three knobs calibrated against observed traffic counters:
+# Estimates per-edge AADT for the car network via cost-decay-weighted
+# nested-betweenness sampling, calibrated against observed traffic
+# counters. Three knobs:
 #
 # 1. `lognorm_shape` (σ) — width of the trip-time distribution used as
 #    the cost-decay weight in `nested_node_sample`.
@@ -30,24 +31,49 @@
 # reasonable prior, but not the same thing as "what weighting produces
 # flows that match traffic counters".
 #
-# **Flow** of the notebook:
+# ## Two design choices worth flagging upfront
 #
-# 1. Load inputs (graph, zones, regions, counters).
+# **Zones, not cells, as the granular unit.** Unlike `accessibility.ipynb`
+# (which uses H3-res-10 cells, ~95k in the Bern dest polygon), road_stress
+# uses H3-res-8 **zones** (~5500). Two reasons:
+#
+# - Flow estimation is bulk-attributing — thousands of OD pairs accumulate
+#   on each road segment, so per-cell origin precision is washed out at
+#   the edge level anyway. Zone granularity (~17 cells per zone) gives
+#   enough origin resolution to differentiate density patterns without
+#   the per-cell overhead.
+# - The calibration loop reruns `simulate_flows` many times. Per-call
+#   cost scales with the number of unique sampled origins; zone-level
+#   sampling keeps each call snappy (~25 s on full Bern + 25 km).
+#
+# A single-tier OD structure (`cells_to_cells` only, with zones playing
+# the role of "cells") suffices — no middle or far tier needed since the
+# zone universe is small enough that the all-zones-within-200-km OD
+# matrix fits comfortably in memory.
+#
+# **Origins are NOT restricted to the AOI.** Unlike accessibility (where
+# AOI-restriction is fine because we only care about accessibility at
+# origins inside the AOI), flow estimation has boundary effects: trips
+# originating *outside* the AOI but passing through it contribute to
+# observed counter readings. Restricting origins to AOI would
+# systematically under-predict flows near the AOI boundary.
+#
+# ## Flow of the notebook
+#
+# 1. Load inputs (graph, zones, counters).
 # 2. Snap counters to edges (bearing-aware, per-tier eligibility).
 # 3. Build the fixed routing inputs (OD pairs, costs, lognormal prior).
 # 4. `simulate_flows` helper — one parameter set → per-edge AADT.
 # 5. Baseline evaluation at the prior values.
 # 6. 1D scan over lognormal shape, pick best.
-# 7. 1D scan over lognormal scale (using best shape), pick best.
-# 8. Derive `TRIPS_PER_PERSON_PER_DAY` from the slope.
-# 9. **Production run** — re-simulate with calibrated params + save
+# 7. Derive `TRIPS_PER_PERSON_PER_DAY` from the slope.
+# 8. **Production run** — re-simulate with calibrated params + save
 #    `data/prepared/road_stress.csv`.
-# 10. Visualise (raw flows + capacity-normalised maps).
-# 11. Investigate the (V/C)² long tail.
+# 9. Visualise the per-edge stress map.
 #
-# Sections 5-8 use the library helpers `snap_counters_to_edges` and
+# Sections 5-7 use the library helpers `snap_counters_to_edges` and
 # `evaluate_against_counters` from `aperta.calibration`; the scan
-# loops + parameter selection are project-specific and live here.
+# loop + parameter selection are project-specific and live here.
 #
 # `data/prepared/road_stress.csv` is consumed by
 # `calibrate_edge_weights.ipynb` as the `road_stress` feature for the
@@ -58,17 +84,13 @@ import warnings
 from pathlib import Path
 
 import geopandas as gpd
-import h3
 import matplotlib.pyplot as plt
 import numpy as np
-import osmnx as ox
 import pandas as pd
 import scipy.stats
-from shapely.geometry import Point
 
 from aperta import (
     calibration,
-    geo_processing,
     network_processing,
     od_pairs,
     routing,
@@ -90,10 +112,10 @@ LOCATION_LABEL = 'Bern'
 # %% [markdown]
 # ## 1. Load inputs
 #
-# Same graph + zones + regions setup as `road_stress.ipynb`. Plus the
-# counters file: directional point counters with `traffic_cars`,
-# `bearing_deg`, and per-tier flags (`is_highway`, `is_main`,
-# `is_local`).
+# Graph + zones (the granular unit for flow estimation — see header
+# rationale) + counters. The counters file holds directional point
+# counters with `traffic_cars`, `bearing_deg`, and per-tier flags
+# (`is_highway`, `is_main`, `is_local`).
 
 # %%
 car_graph = network_processing.load_consolidated_graphml(
@@ -101,12 +123,10 @@ car_graph = network_processing.load_consolidated_graphml(
 print(f"Car graph: {car_graph.number_of_nodes():,} nodes / "
       f"{car_graph.number_of_edges():,} edges")
 
-cells = gpd.read_file(PREPARED_DIR / 'cells.gpkg').set_index('cell_id')
-cells['pop_plus_emp'] = cells['population'] + cells['employment_total']
 zones = gpd.read_file(PREPARED_DIR / 'zones.gpkg').set_index('zone_id')
-regions = gpd.read_file(PREPARED_DIR / 'regions.gpkg').set_index('region_id')
-zones['region_id'] = zones.index.map(lambda zid: h3.cell_to_parent(zid, 6))
+zones['pop_plus_emp'] = zones['population'] + zones['employment_total']
 total_pop = float(zones['population'].sum())
+print(f"Zones: {len(zones):,} (Σ pop {total_pop:,.0f})")
 
 counters_all = gpd.read_file(GROUND_TRUTH_DIR / 'traffic_counters.gpkg')
 print(f"Counters: {len(counters_all):,} "
@@ -215,39 +235,39 @@ for u, v, k, d in car_graph.edges(keys=True, data=True):
     add_term = sum(c * float(d[f]) for f, c in INITIAL_ADD.items())
     d['duration_initial'] = max(base + mult_term + add_term, base * 0.2)
 
-# OD pairs (zones as cells, regions as zones — see road_stress.ipynb).
-R_ZONE_PAIR = 20_000.0
-R_REGION_PAIR = 200_000.0
-for layer in (zones, regions):
-    centroids = layer.copy()
-    centroids['geometry'] = centroids.geometry.centroid
-    nid, _ = network_processing.snap_to_network_nodes(centroids, car_graph)
-    layer['node_id'] = nid
+# Snap zone centroids to the car graph (zones play the role of "cells"
+# in the OD structure below — see header rationale).
+zone_centroids = zones.copy()
+zone_centroids['geometry'] = zones.geometry.centroid
+nid, _ = network_processing.snap_to_network_nodes(zone_centroids, car_graph)
+zones['node_id'] = nid
 
-zones_as_cells = zones.copy()
-zones_as_cells.index.name = 'cell_id'
-zones_as_cells['zone_id'] = zones_as_cells['region_id']
+# Single-tier OD pairs: `get_pairs` with no `zones=` kwarg returns a
+# TieredODNodePairs with only the `cells_to_cells` slot populated. With
+# r_cells=200 km the all-zones-within-200-km matrix is ~5500² entries,
+# which fits comfortably at FP32 (~120 MB).
+R_ZONE_PAIR_M = 200_000.0
+CAR_TIME_CUTOFF_S = 2 * 3600  # 2-hour ceiling on any single trip
 
 pairs = od_pairs.get_pairs(
-    zones_as_cells, r_cells=R_ZONE_PAIR, node_column='node_id',
-    zones=regions, r_zones=R_REGION_PAIR,
+    zones, r_cells=R_ZONE_PAIR_M, node_column='node_id',
 )
-costs = routing.tiered_path_costs(pairs, car_graph, weight='duration_initial')
+costs = routing.tiered_path_costs(
+    pairs, car_graph, weight='duration_initial', cutoff=CAR_TIME_CUTOFF_S,
+)
 
-zones_as_cells['_orig_weight'] = (zones_as_cells['population']
-                                  + zones_as_cells['employment_total'])
-zones_as_cells['_dest_weight'] = zones_as_cells['employment_total']
-regions['_dest_weight'] = (
-    zones.groupby('region_id')['employment_total'].sum()
-    .reindex(regions.index, fill_value=0.0))
-
+zones['_dest_weight'] = zones['employment_total']
 orig_weights = od_pairs.node_values(
-    '_orig_weight', list(pairs.cells_to_cells.keys()),
-    zones_as_cells, 'node_id')
+    'pop_plus_emp', list(pairs.cells_to_cells.keys()),
+    zones, 'node_id')
 dest_weights = od_pairs.dest_values(
-    '_dest_weight', pairs, zones_as_cells, 'node_id', regions)
-cell_to_zone_node = od_pairs.build_cell_to_zone_node_map(
-    zones_as_cells, regions, 'node_id')
+    '_dest_weight', pairs, zones, 'node_id')
+
+# `nested_node_sample` calls `cell_to_zone_node.get(origin)` to look up
+# the parent zone for the (absent) zone-tier and middle-tier. With a
+# single-tier OD structure the lookup just returns None and the function
+# skips the zone-tier code path entirely.
+cell_to_zone_node = {}
 
 # Initial lognormal prior fit from ground-truth times.
 _pos_times = legs.loc[legs['time_measured'] > 0, 'time_measured']
@@ -281,8 +301,10 @@ def simulate_flows(shape: float, scale: float,
         cost_to_weight=_cost_to_weight, n_orig=n_orig, n_dest=n_dest,
         random_state=rng,
     )
-    edge_bc = network_processing.get_nested_edge_betweenness_using_igraph(
-        car_graph, nested_sample, directed=True, weights='duration_initial')
+    edge_bc = network_processing.get_nested_edge_betweenness(
+        car_graph, nested_sample, weights='duration_initial',
+        cutoff=od_pairs.max_cost(costs),  # correctness-preserving Dijkstra cap
+    )
     aadt_scale = (total_pop * trips_per_person_per_day) / (n_orig * n_dest)
     return edge_bc * aadt_scale
 

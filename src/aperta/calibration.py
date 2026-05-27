@@ -32,8 +32,8 @@ since updated coefficients change edge weights and therefore the chosen path
 
 This module does NOT compute betweenness / traffic flows itself. Treat the
 traffic estimate as just another per-edge attribute the caller supplies (e.g.
-via `network_processing.get_nested_edge_betweenness_using_igraph`). Then
-include it in `multiplier_features` (if it scales duration like density) or
+via `network_processing.get_nested_edge_betweenness`). Then include it in
+`multiplier_features` (if it scales duration like density) or
 `additive_route_features` (if seconds-per-unit).
 """
 import logging
@@ -126,10 +126,9 @@ def _apply_edge_durations(graph: nx.MultiDiGraph,
     Per-edge duration is clipped to `min_edge_duration` seconds. Without
     this, a single transient negative coefficient (mid-iteration OLS noise,
     common when starting from zero on a noisy feature) can produce a
-    negative edge weight and trigger igraph's negative-cycle detector —
-    making the next routing pass crash rather than just produce a slightly
-    odd path. The clip is wide of any physically meaningful duration so
-    well-conditioned fits are unaffected.
+    negative edge weight, which scipy's Dijkstra refuses to handle. The
+    clip is wide of any physically meaningful duration so well-conditioned
+    fits are unaffected.
     """
     for u, v, k, data in graph.edges(keys=True, data=True):
         base = baseline_duration[(u, v, k)]
@@ -377,15 +376,6 @@ def calibrate_edge_weights(
     #    into every iteration's edge-duration formula.
     baseline_duration = _baseline_edge_duration(graph, baseline_speed_attr)
 
-    # 3. Build igraph once for fast per-trip routing across iterations.
-    h, idx_maps = network_processing.ig_from_networkx_with_idx_maps(graph)
-    nx_to_ig = idx_maps['node_nx_to_ig']
-    legs['ig_node_orig'] = legs['nx_node_orig'].map(nx_to_ig)
-    legs['ig_node_dest'] = legs['nx_node_dest'].map(nx_to_ig)
-    legs = legs.dropna(subset=['ig_node_orig', 'ig_node_dest'])
-    legs['ig_node_orig'] = legs['ig_node_orig'].astype(int)
-    legs['ig_node_dest'] = legs['ig_node_dest'].astype(int)
-
     # 4. Iterate: apply current coefs → route → fit → update coefs.
     #    α (baseline scale) starts at 1.0; multiplier/additive/endpoint
     #    coefs start at user-supplied initial values. After each OLS fit,
@@ -412,15 +402,15 @@ def calibrate_edge_weights(
     kinds: list[str] = []
 
     for iteration in range(1, n_iterations + 1):
-        # 4a. Write per-edge duration into the graph + sync to igraph.
+        # 4a. Write per-edge duration into the graph (scipy CSR is rebuilt
+        # per call inside shortest_path_metrics_one_to_one — cheap relative
+        # to the actual Dijkstras).
         _apply_edge_durations(graph, baseline_duration, alpha, cur_mult,
                               cur_add, edge_duration_attr)
-        for eid, (u, v, k) in zip(range(h.ecount()), h.es['nx_edge_id']):
-            h.es[eid][edge_duration_attr] = graph[u][v][k][edge_duration_attr]
 
         # 4b. Route every trip + aggregate features along the path.
         routed = routing.shortest_path_metrics_one_to_one(
-            h, list(legs.index), legs['ig_node_orig'], legs['ig_node_dest'],
+            graph, list(legs.index), legs['nx_node_orig'], legs['nx_node_dest'],
             weight=edge_duration_attr, length_attr='length',
             edge_features=edge_feature_aggs,
         )

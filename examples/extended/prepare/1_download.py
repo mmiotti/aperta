@@ -153,7 +153,7 @@ gpd.GeoDataFrame(
 ).to_file(PREPARED_DIR / 'dest_polygon.gpkg', driver='GPKG')
 
 # %% [markdown]
-# Quick visualisation of the three nested regions.
+# Quick visualisation of the three nested buffer polygons.
 
 # %%
 fig, ax = plt.subplots(figsize=(8, 8))
@@ -177,8 +177,9 @@ cx.add_basemap(
 )
 ax.set_title(
     f'{LOCATION_LABEL} accessibility scope\n'
-    f'red = seed ({LOCATION_LABEL}) · gold = AOI (seed + 5 km) · '
-    f'blue = destination area (AOI + 25 km)'
+    f'red = seed ({LOCATION_LABEL}) · '
+    f'gold = AOI (seed + {AOI_BUFFER_M // 1000:.0f} km) · '
+    f'blue = destination area (AOI + {DEST_BUFFER_M // 1000:.0f} km)'
 )
 ax.set_axis_off()
 plt.tight_layout()

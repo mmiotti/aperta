@@ -32,7 +32,7 @@ Aperta supports four overhead categories, organised by **which side** and
 
 - **(3) Destination overhead at node** — per-destination-node overhead,
   independent of geo unit (e.g., parking-find time on arrival). Added via
-  `add_node_overheads(dest_cell=..., dest_zone=..., dest_region=...)` per
+  `add_node_overheads(dest_cell=..., dest_zone=...)` per
   tier.
 
 - **(4) Destination overhead, node → cell (aggregated)** — for cell-tier
@@ -169,8 +169,8 @@ def aggregate_dest_overhead_per_group_euclidean(
     """Per-group destination overhead — Euclidean-distance-based, for zone-
     or region-tier destinations.
 
-    Use as `dest_zone=...` or `dest_region=...` in `add_node_overheads`
-    (overhead #4 at zone / region tier). One function handles both tiers
+    Use as `dest_zone=...` in `add_node_overheads`
+    (overhead #4 at zone tier). The same function shape handles any
     via the `group_id_column` kwarg.
 
     For each target group `g` (with polygon centroid `g_centroid`):
@@ -272,12 +272,13 @@ def aggregate_dest_overhead_per_group_routed(
     node_column: str = 'node_id',
     cell_overhead_column: str | None = None,
     weight_column: str | None = None,
+    cutoff: float | None = None,
 ) -> pd.Series:
     """Per-group destination overhead via routing — for zone- or region-tier
     destinations.
 
-    Use as `dest_zone=...` or `dest_region=...` in `add_node_overheads`
-    (overhead #4 at zone / region tier). One function handles both tiers
+    Use as `dest_zone=...` in `add_node_overheads`
+    (overhead #4 at zone tier). The same function shape handles any
     via the `group_id_column` kwarg.
 
     For each target group `g` (with representative network node `g_node`):
@@ -311,22 +312,31 @@ def aggregate_dest_overhead_per_group_routed(
             ignored).
         weight_column: optional column on `cells` to weight the mean (e.g.
             `'population'`). `None` = uniform.
+        cutoff: optional `csg.dijkstra(limit=cutoff)` in `weight` units.
+            Cells beyond it from `g_node` are treated as unreachable
+            (contribute NaN, filtered from the mean). Set this comfortably
+            above the longest expected last-mile in `weight` units (typical
+            zone diameter ÷ slowest mode speed) to speed up routing on
+            large graphs.
 
     Returns:
         `pd.Series` indexed by `target_groups.index`, with one mean overhead
         per group. Groups with no constituent cells (or with all cells
         unreachable from `g_node`) get `NaN`.
     """
-    # Local import to avoid module-load cycle: network_processing pulls in
-    # osmnx + heavy deps which we don't want at aperta-load time.
-    from aperta.network_processing import ig_from_networkx_with_idx_maps
-    h, idx_maps = ig_from_networkx_with_idx_maps(graph)
-    nx_to_ig = idx_maps['node_nx_to_ig']
+    # Local import to keep scipy.sparse out of the module load path.
+    import scipy.sparse.csgraph as csg
+    from aperta.routing import _graph_to_csr
+    csr, nx_to_seq, _ = _graph_to_csr(graph, weight)
+    limit = cutoff if cutoff is not None else np.inf
 
     def _distances_from(g_node, cell_nodes):
-        ig_g = nx_to_ig[g_node]
-        ig_cells = [nx_to_ig[n] for n in cell_nodes]
-        return np.asarray(h.distances([ig_g], ig_cells, weights=weight)[0])
+        g_seq = nx_to_seq[g_node]
+        dist_row = csg.dijkstra(csr, indices=[g_seq], limit=limit,
+                                return_predecessors=False)[0]
+        cell_seqs = np.fromiter((nx_to_seq[n] for n in cell_nodes),
+                                dtype=np.int64, count=len(cell_nodes))
+        return dist_row[cell_seqs]
 
     cells_valid = cells.dropna(subset=[node_column, group_id_column])
     cells_by_group = cells_valid.groupby(group_id_column)
@@ -373,7 +383,6 @@ def add_node_overheads(
     origin: pd.Series | dict | None = None,
     dest_cell: pd.Series | dict | None = None,
     dest_zone: pd.Series | dict | None = None,
-    dest_region: pd.Series | dict | None = None,
 ) -> TieredODPairs:
     """Add per-node origin and destination overheads to a cost `TieredODPairs`.
 
@@ -383,32 +392,31 @@ def add_node_overheads(
 
     - `origin`: added to every OD cost whose origin matches a key. Looked up
       by the origin node of each TieredODPairs entry. Applies to all tiers
-      (cells_to_cells uses cell-tier origin nodes; zones_to_zones and
-      zones_to_regions use zone-tier origin nodes).
+      (cells_to_cells and cells_to_zones use cell-tier origin nodes;
+      zones_to_zones uses zone-tier origin nodes).
     - `dest_cell`: added to cells_to_cells OD costs, looked up by destination
       cell-tier node. Use for overhead #3 (cell-tier dest, at-node) and / or
       #4 (cell-tier dest, aggregated — from
       `aggregate_dest_overhead_per_node`).
-    - `dest_zone`: added to zones_to_zones OD costs, looked up by destination
-      zone-tier node. Use for overhead #3 / #4 at zone tier.
-    - `dest_region`: added to zones_to_regions OD costs, looked up by
-      destination region-tier node. Use for overhead #3 / #4 at region tier.
+    - `dest_zone`: added to BOTH `cells_to_zones` and `zones_to_zones` OD
+      costs, looked up by destination zone-tier node. Use for overhead #3 / #4
+      at zone tier (both middle and far tier have zone destinations).
 
     Any kwarg can be `None` (no overhead applied at that side / tier). The
     returned `TieredODPairs` is a new object — the input is not mutated.
 
     Note on origin overhead: the same Series is looked up at all tiers, but
-    the *origin nodes themselves differ by tier* (cell-tier origins are
-    cell-nodes; zone-tier origins are zone-nodes). To apply a single per-
-    cell-node origin overhead to all tiers, you would need to combine it
-    with `cell_overhead_column` at accessibility time instead — see this
-    module's docstring on the per-cell-vs-per-node granularity choice.
+    the *origin nodes themselves differ by tier* (cell-tier and middle-tier
+    origins are cell-nodes; far-tier origins are zone-nodes). To apply a
+    single per-cell-node origin overhead to all tiers, you would need to
+    combine it with `cell_overhead_column` at accessibility time instead —
+    see this module's docstring on the per-cell-vs-per-node granularity choice.
 
     Args:
         costs: `TieredODPairs` of routed costs.
         pairs: `TieredODPairs` of destination IDs (typically from
             `od_pairs.get_pairs`), position-aligned with `costs`.
-        origin, dest_cell, dest_zone, dest_region: per-node overhead lookups.
+        origin, dest_cell, dest_zone: per-node overhead lookups.
 
     Returns:
         New `TieredODPairs` of cost arrays with the requested overheads added.
@@ -417,7 +425,6 @@ def add_node_overheads(
     origin_lu = _as_lookup(origin)
     dest_cell_lu = _as_lookup(dest_cell)
     dest_zone_lu = _as_lookup(dest_zone)
-    dest_region_lu = _as_lookup(dest_region)
 
     def _augment(cost_tier: dict | None,
                  pair_tier: dict | None,
@@ -426,15 +433,18 @@ def add_node_overheads(
             return None
         out: dict = {}
         for orig, cost_arr in cost_tier.items():
-            new_arr = np.asarray(cost_arr, dtype=np.float64).copy()
+            # Preserve input dtype (typically FP32 for cost ODMs) — silent
+            # FP64 upcast here would double memory for the whole result.
+            new_arr = np.asarray(cost_arr).copy()
+            dt = new_arr.dtype
             if origin_lu is not None:
-                new_arr = new_arr + float(origin_lu.get(orig, 0.0))
+                new_arr = new_arr + dt.type(origin_lu.get(orig, 0.0))
             if dest_lookup is not None and pair_tier is not None:
                 dest_ids = pair_tier.get(orig)
                 if dest_ids is not None:
                     dest_arr = np.fromiter(
-                        (float(dest_lookup.get(d, 0.0)) for d in dest_ids),
-                        dtype=np.float64, count=len(dest_ids))
+                        (dest_lookup.get(d, 0.0) for d in dest_ids),
+                        dtype=dt, count=len(dest_ids))
                     new_arr = new_arr + dest_arr
             out[orig] = new_arr
         return out
@@ -442,10 +452,10 @@ def add_node_overheads(
     return type(costs)(
         cells_to_cells=_augment(
             costs.cells_to_cells, pairs.cells_to_cells, dest_cell_lu),
+        cells_to_zones=_augment(
+            costs.cells_to_zones, pairs.cells_to_zones, dest_zone_lu),
         zones_to_zones=_augment(
             costs.zones_to_zones, pairs.zones_to_zones, dest_zone_lu),
-        zones_to_regions=_augment(
-            costs.zones_to_regions, pairs.zones_to_regions, dest_region_lu),
     )
 
 
@@ -462,11 +472,10 @@ def add_geo_overheads(
     origin_zone: pd.Series | dict | None = None,
     dest_cell: pd.Series | dict | None = None,
     dest_zone: pd.Series | dict | None = None,
-    dest_region: pd.Series | dict | None = None,
 ) -> TieredODGeoPairs:
     """Add per-geo-unit origin and destination overheads to a geo-keyed cost ODM.
 
-    Geo-keyed twin of `add_node_overheads`. Six independent overhead lookups,
+    Geo-keyed twin of `add_node_overheads`. Four independent overhead lookups,
     one per (side × tier-granularity) combination. Each kwarg is a per-unit
     lookup (`pd.Series` indexed by unit ID or `dict[unit_id -> value]`); units
     absent from a lookup contribute 0 overhead.
@@ -474,25 +483,24 @@ def add_geo_overheads(
     Origin (looked up by origin unit ID at each tier):
 
     - `origin_cell`: per-cell-id overhead, added to every `cells_to_cells`
-      OD cost. Use for per-cell first-mile (e.g. cell-centroid → assigned
-      network node, mode-specific). Mode-specific origin overhead baked here
-      propagates correctly through `aggregate_across_modes`.
+      AND `cells_to_zones` OD cost (both tiers have cell-id origins). Use for
+      per-cell first-mile (e.g. cell-centroid → assigned network node,
+      mode-specific). Mode-specific origin overhead baked here propagates
+      correctly through `aggregate_across_modes`.
     - `origin_zone`: per-zone-id overhead, added to every `zones_to_zones`
-      AND `zones_to_regions` OD cost. Use the per-zone average of per-cell
-      first-mile overheads (cells in the same zone share a zone-tier OD
-      pair, so we collapse to a single zone-level scalar — see
-      `add_origin_cell_overhead` for the canonical convenience wrapper).
+      OD cost. Use the per-zone average of per-cell first-mile overheads
+      (cells in the same zone share a far-tier OD pair, so we collapse to
+      a single zone-level scalar — see `add_origin_cell_overhead` for the
+      canonical convenience wrapper).
 
     Destination (looked up by dest unit ID at each tier):
 
     - `dest_cell`: per-cell-id overhead, added to every `cells_to_cells`
       destination. Use for per-cell last-mile.
-    - `dest_zone`: per-zone-id overhead, added to every `zones_to_zones`
-      destination. Plug in the output of
-      `aggregate_dest_overhead_per_group_euclidean` (or `_routed`) directly
-      — no zone-id → zone-node-id detour needed.
-    - `dest_region`: per-region-id overhead, added to every
-      `zones_to_regions` destination. Same as `dest_zone` but at region tier.
+    - `dest_zone`: per-zone-id overhead, added to every `cells_to_zones`
+      AND `zones_to_zones` destination (both tiers have zone-id dests).
+      Plug in the output of `aggregate_dest_overhead_per_group_euclidean`
+      (or `_routed`) directly — no zone-id → zone-node-id detour needed.
 
     Tiers not present in `costs` pass through as `None`. The input is not
     mutated; a new `TieredODGeoPairs` is returned.
@@ -501,7 +509,6 @@ def add_geo_overheads(
     o_zone_lu = _as_lookup(origin_zone)
     d_cell_lu = _as_lookup(dest_cell)
     d_zone_lu = _as_lookup(dest_zone)
-    d_region_lu = _as_lookup(dest_region)
 
     def _augment(cost_tier: dict | None,
                  pair_tier: dict | None,
@@ -511,15 +518,18 @@ def add_geo_overheads(
             return None
         out: dict = {}
         for orig, cost_arr in cost_tier.items():
-            new_arr = np.asarray(cost_arr, dtype=np.float64).copy()
+            # Preserve input dtype (typically FP32 for cost ODMs) — silent
+            # FP64 upcast here would double memory for the whole result.
+            new_arr = np.asarray(cost_arr).copy()
+            dt = new_arr.dtype
             if origin_lookup is not None:
-                new_arr = new_arr + float(origin_lookup.get(orig, 0.0))
+                new_arr = new_arr + dt.type(origin_lookup.get(orig, 0.0))
             if dest_lookup is not None and pair_tier is not None:
                 dest_ids = pair_tier.get(orig)
                 if dest_ids is not None:
                     dest_arr = np.fromiter(
-                        (float(dest_lookup.get(d, 0.0)) for d in dest_ids),
-                        dtype=np.float64, count=len(dest_ids))
+                        (dest_lookup.get(d, 0.0) for d in dest_ids),
+                        dtype=dt, count=len(dest_ids))
                     new_arr = new_arr + dest_arr
             out[orig] = new_arr
         return out
@@ -527,10 +537,10 @@ def add_geo_overheads(
     return TieredODGeoPairs(
         cells_to_cells=_augment(
             costs.cells_to_cells, pairs.cells_to_cells, o_cell_lu, d_cell_lu),
+        cells_to_zones=_augment(
+            costs.cells_to_zones, pairs.cells_to_zones, o_cell_lu, d_zone_lu),
         zones_to_zones=_augment(
             costs.zones_to_zones, pairs.zones_to_zones, o_zone_lu, d_zone_lu),
-        zones_to_regions=_augment(
-            costs.zones_to_regions, pairs.zones_to_regions, o_zone_lu, d_region_lu),
     )
 
 
@@ -565,8 +575,10 @@ def add_origin_cell_overhead(
             `overhead_column` and (when zone-tier is populated) `zone_id_column`.
         overhead_column: per-cell overhead column on `cells`.
         zone_id_column: column on `cells` mapping each cell to its zone.
-            Required iff `costs.zones_to_zones` or `costs.zones_to_regions`
-            is populated.
+            Required iff `costs.zones_to_zones` is populated (only the
+            far tier uses zone-level origin overhead — the cells_to_cells
+            and cells_to_zones tiers both have cell-id origins and consume
+            `origin_cell` directly).
         zone_aggregator: pandas-compatible string aggregator (default `'mean'`),
             applied to per-cell overhead values within each zone.
 
@@ -577,13 +589,12 @@ def add_origin_cell_overhead(
         raise ValueError(f"`cells` is missing column {overhead_column!r}.")
     origin_cell = cells[overhead_column]
     origin_zone: pd.Series | None = None
-    needs_zone = (costs.zones_to_zones is not None
-                  or costs.zones_to_regions is not None)
+    needs_zone = costs.zones_to_zones is not None
     if needs_zone:
         if zone_id_column not in cells.columns:
             raise ValueError(
                 f"`cells` is missing zone-link column {zone_id_column!r} "
-                f"(required because zone- or region-tier costs are populated).")
+                f"(required because zones_to_zones costs are populated).")
         origin_zone = cells.groupby(zone_id_column)[overhead_column].agg(zone_aggregator)
     return add_geo_overheads(
         costs, pairs,

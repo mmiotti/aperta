@@ -42,7 +42,7 @@ function will add it to every cell's destination utilities — units match
 For **logsum** (cross-modal) accessibility, combine per-mode utility ODMs with
 `od_pairs.aggregate_across_modes(utilities_by_mode, aggregator='logsum')`,
 then run gravity (with β = 1) or other downstream metrics on the combined
-ODM. See the minimal example notebook for a worked demonstration.
+ODM. See the walkthrough notebook for a worked demonstration.
 
 ## Known limitations
 
@@ -136,7 +136,7 @@ def route_utility(
     utility: Utility,
     *,
     mask: TieredODPairs | None = None,
-    dtype: np.dtype | type = np.float64,
+    dtype: np.dtype | type = np.float32,
 ) -> TieredODPairs:
     """Compute the route-dependent components of utility for every OD pair.
 
@@ -219,8 +219,8 @@ def route_utility(
 
     return TieredODNodePairs(
         cells_to_cells=_combine_per_tier('cells_to_cells'),
+        cells_to_zones=_combine_per_tier('cells_to_zones'),
         zones_to_zones=_combine_per_tier('zones_to_zones'),
-        zones_to_regions=_combine_per_tier('zones_to_regions'),
     )
 
 
@@ -247,7 +247,6 @@ def add_endpoint_utility(
     *,
     cells: pd.DataFrame | None = None,
     zones: pd.DataFrame | None = None,
-    regions: pd.DataFrame | None = None,
     node_column: str = 'node_id',
 ) -> TieredODPairs:
     """Add constant, origin, and destination components to route utility.
@@ -259,15 +258,16 @@ def add_endpoint_utility(
                      + Σ_d destination_features[d] * feature_d(j)
 
     Origin features are looked up at the origin node. For the
-    `cells_to_cells` tier, origins are cell-tier nodes (`cells` is used);
-    for `zones_to_zones` and `zones_to_regions`, origins are zone-tier
+    `cells_to_cells` and `cells_to_zones` tiers, origins are cell-tier
+    nodes (`cells` is used); for `zones_to_zones`, origins are zone-tier
     nodes (`zones` is used). If multiple cells / zones map to the same
     network node, their feature values are averaged.
 
     Destination features are looked up via `od_pairs.dest_values` —
-    cell-tier dests look up in `cells`, zone-tier in `zones`, region-tier in
-    `regions`. Missing feature columns at a given tier silently contribute
-    zero to that tier (the OD pairs still get the other components).
+    cell-tier dests look up in `cells`, while `cells_to_zones` and
+    `zones_to_zones` dests look up in `zones`. Missing feature columns at
+    a given tier silently contribute zero to that tier (the OD pairs still
+    get the other components).
 
     Cell-mode handling: this function operates at the network-node level
     (its origins are nodes). Per-cell origin features (different for two
@@ -285,11 +285,11 @@ def add_endpoint_utility(
         route_utility: per-OD route utility from `route_utility(...)`.
         pairs: tiered destination IDs (same as used in `route_utility`).
         utility: the `Utility` spec.
-        cells, zones, regions: per-unit DataFrames carrying the named
-            features. Each must have `node_column` mapping to the network
-            node ID for that tier.
-        node_column: column name in cells/zones/regions giving the network
-            node. Default `'node_id'`.
+        cells, zones: per-unit DataFrames carrying the named features.
+            Each must have `node_column` mapping to the network node ID
+            for that tier.
+        node_column: column name in cells/zones giving the network node.
+            Default `'node_id'`.
 
     Returns:
         `TieredODPairs` of full per-OD utility (float64).
@@ -304,8 +304,6 @@ def add_endpoint_utility(
         d = od_pairs.dest_values(
             feature_col, pairs, cells, node_column,
             zones=zones if zones is not None and feature_col in zones.columns else None,
-            regions=(regions if regions is not None
-                     and feature_col in regions.columns else None),
         )
         dest_value_odms[feature_col] = (d, beta)
 
@@ -347,6 +345,6 @@ def add_endpoint_utility(
 
     return TieredODNodePairs(
         cells_to_cells=_combine_per_tier('cells_to_cells', origin_cell_lookups),
+        cells_to_zones=_combine_per_tier('cells_to_zones', origin_cell_lookups),
         zones_to_zones=_combine_per_tier('zones_to_zones', origin_zone_lookups),
-        zones_to_regions=_combine_per_tier('zones_to_regions', origin_zone_lookups),
     )

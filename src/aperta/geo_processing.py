@@ -1,8 +1,6 @@
 import logging
-import warnings
 
 import geopandas as gpd
-import libpysal
 import numpy as np
 import pandas as pd
 import shapely
@@ -200,70 +198,96 @@ def angular_diff_deg(a, b, undirected: bool = False):
 
 
 @utils.timeit
-def custom_spatial_lag(
+def sum_within_radius(
     gdf: gpd.GeoDataFrame,
     cols: list[str],
     radius: int | float,
     return_densities: bool,
     add_filled_densities: bool,
 ) -> pd.DataFrame:
-    """Calculate regular and filled averages of columns `cols' in gdf `gdf' within `radius` around each cell.
+    """Same-set neighbourhood sum: for each cell in `gdf`, sum the values
+    of `cols` over all cells (including itself) within `radius`.
 
-    The regular average for a column representing the population in each cell will be the population density per km².
-    The filled average is the population density per km² area of gdf where at least one value in cols is larger than
-    zero, that is, the population density per occupied area.
+    For the cross-set case (`targets × sources` with two different
+    GeoDataFrames) use [[cross_sum_within_radius]] instead.
 
-    The CRS of `gdf` must represent meters if densities are returned. Densities are returned per km².
+    The regular sum, divided by the circular query area when
+    `return_densities=True`, gives per-km² density. The "filled" variant
+    additionally divides by the *occupied* area (cells where at least one
+    value in `cols` is > 0) — useful where occupancy is sparse and the
+    circular-area normaliser dilutes the signal (e.g. employment
+    concentrated at an airport).
+
+    The CRS of `gdf` must represent meters if densities are returned.
+    Densities are returned per km².
+
+    Implementation: builds a `scipy.spatial.KDTree` on cell centroids and
+    constructs a sparse 0/1 adjacency matrix from `query_ball_point(radius)`;
+    each cell's own row is implicitly included (since `dist(p, p) = 0 ≤ radius`).
+    Per-cell sums are then `adj @ values` in one vectorised pass.
     """
-
     if not return_densities and add_filled_densities:
         raise ValueError("`add_filled_densities` can only be True when `return_densities` is True.")
 
-    w = libpysal.weights.DistanceBand.from_dataframe(
-        gdf, threshold=radius, binary=True, silence_warnings=True,
-    )
+    from scipy.sparse import csr_matrix
+    from scipy.spatial import KDTree
 
-    # Each cell itself (focal) should be included when calculating its own spatial average.
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="The weights matrix is not fully connected")
-        w = libpysal.weights.fill_diagonal(w, 1.0)
-    # We are not transforming row weights to yield average
-    # w.transform = 'r'
+    centroids = gdf.geometry.centroid
+    xy = np.column_stack([centroids.x.to_numpy(dtype=float),
+                          centroids.y.to_numpy(dtype=float)])
+    tree = KDTree(xy)
+    idx_lists = tree.query_ball_point(xy, r=radius)
+
+    # Sparse 0/1 adjacency matrix: row i has 1s at the neighbour positions
+    # of cell i (within `radius`, inclusive of i itself). `adj @ values`
+    # then computes per-cell spatial sums in one vectorised pass.
+    n = len(gdf)
+    row_lens = np.fromiter((len(nbrs) for nbrs in idx_lists),
+                           dtype=np.int64, count=n)
+    cols_idx = np.concatenate([np.asarray(nbrs, dtype=np.int64)
+                               for nbrs in idx_lists])
+    rows = np.repeat(np.arange(n, dtype=np.int64), row_lens)
+    data = np.ones(len(rows), dtype=float)
+    adj = csr_matrix((data, (rows, cols_idx)), shape=(n, n), dtype=float)
+
+    values = gdf[cols].to_numpy(dtype=float)
+    spatial_sums = np.asarray(adj @ values)
 
     res = pd.DataFrame(index=gdf.index)
-    circular_area = (radius ** 2 * 3.14159) / 1e6
-    cell_areas = gdf.geometry.area / 1e6
-
-    spatial_sums = np.array(libpysal.weights.lag_spatial(w, gdf[cols]))
-    values = spatial_sums / circular_area if return_densities else spatial_sums
-    df = pd.DataFrame(values, index=gdf.index, columns=[f'{col}_r{radius}' for col in cols])
+    circular_area_km2 = (np.pi * radius ** 2) / 1e6
+    out_values = spatial_sums / circular_area_km2 if return_densities else spatial_sums
+    df = pd.DataFrame(out_values, index=gdf.index,
+                      columns=[f'{col}_r{radius}' for col in cols])
     res = res.join(df)
 
-    # Calculate filled cell areas (total area within radius around each cell where at least one column is > 0)
     if add_filled_densities:
-        # Note 1: "filled" densities currently include any cell that has at least something one it (regardless of column)
-        # Note 2: "filled" densities currently lead to some dramatically high values around e.g. Zurich airport, where
-        # a lot of jobs are allocated to very few cells.
-        is_filled = gdf.index[gdf[cols].sum(axis=1) > 0]
-        if len(np.unique(cell_areas.round(decimals=4))) > 1:
-            raise NotImplementedError("Cells must currently be same size to calculate filled densities.")
-        fill_cell_areas = []
-        for cell_area, idx in zip(cell_areas, gdf.index):
-            # Count number of cells that have something on it (at least one variable is > 0)
-            fill_cell_areas.append(cell_area * len([1 for cell_idx in w[idx].keys() if cell_idx in is_filled]))
-        fill_cell_areas = np.array(fill_cell_areas)
+        # "Filled" densities: divide each cell's spatial sum by the total
+        # area of *occupied* cells within its neighbourhood, instead of the
+        # circular query area. Useful where occupancy is sparse — e.g.
+        # employment concentrated at an airport with empty cells around.
+        cell_areas_km2 = gdf.geometry.area.to_numpy(dtype=float) / 1e6
+        if len(np.unique(cell_areas_km2.round(decimals=4))) > 1:
+            raise NotImplementedError(
+                "Cells must currently be same size to calculate filled densities.")
+        is_filled = (gdf[cols].sum(axis=1) > 0).to_numpy()
+        # `adj @ is_filled` = per-cell count of filled neighbours.
+        n_filled_neighbours = np.asarray(adj @ is_filled.astype(float))
+        fill_cell_areas = cell_areas_km2 * n_filled_neighbours
         f = fill_cell_areas > 0
-        spatial_sums[f, :] = spatial_sums[f, :] / fill_cell_areas[f, np.newaxis]
-        spatial_sums[~f, :] = 0
-        df = pd.DataFrame(spatial_sums, index=gdf.index, columns=[f'{col}_r{radius}_filled' for col in cols])
-        res = res.join(df)
+        filled_values = spatial_sums.copy()
+        filled_values[f, :] = filled_values[f, :] / fill_cell_areas[f, np.newaxis]
+        filled_values[~f, :] = 0
+        df_filled = pd.DataFrame(
+            filled_values, index=gdf.index,
+            columns=[f'{col}_r{radius}_filled' for col in cols])
+        res = res.join(df_filled)
 
     res = res.fillna(0)
     return res
 
 
 @utils.timeit
-def aggregate_within_radius(
+def cross_sum_within_radius(
     targets: gpd.GeoDataFrame | gpd.GeoSeries,
     sources: gpd.GeoDataFrame | gpd.GeoSeries,
     radius: float,
@@ -272,21 +296,19 @@ def aggregate_within_radius(
     return_density: bool = False,
     name: str = 'aggregate',
 ) -> pd.Series:
-    """For each target geometry, aggregate over source geometries within `radius`.
+    """Cross-set neighbourhood sum: for each target geometry, count source
+    geometries (or sum a `weight_column` over them) within `radius` of the
+    target's centroid.
 
-    Cross-set buffer aggregation. For each target's centroid, finds source
-    centroids within `radius` and either counts them (default) or sums a
-    chosen column. Returns a Series indexed by `targets.index`.
+    For the same-set case (one `gdf`, queried against itself with
+    self-inclusion, multiple value columns at once, optional "filled-area"
+    densities) use [[sum_within_radius]] instead. The two helpers are
+    deliberately separate: same-set and cross-set queries differ in input
+    shape (one gdf vs two) and in optimal backend (single sparse-matrix
+    multiply vs per-target KDTree query).
 
     Backend: scipy `cKDTree` on source coordinates — O(N_src log N_src) one-
-    time build, O(log N_src + k) per query. Much faster (and bounded-memory)
-    versus a libpysal weights matrix for the cross-set case.
-
-    For SAME-set spatial lag (`gdf × gdf` with reusable weights, multiple
-    columns at once, optional "filled-area" densities) use
-    [[custom_spatial_lag]] instead. The two helpers are deliberately separate:
-    same-set lag and cross-set buffer queries are distinct operations with
-    different optimal backends.
+    time build, O(log N_src + k) per query.
 
     Both `targets` and `sources` must share a metric CRS for densities (and
     the radius) to be meaningful in real-world units. The function uses the
