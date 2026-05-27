@@ -334,8 +334,8 @@ def tiered_path_costs(
 
     Every tier is routed across the same `graph`. All node IDs referenced
     anywhere in `pairs` — cell nodes (cells_to_cells keys + values), zone
-    nodes (zones_to_zones keys + values, zones_to_regions keys), and region
-    nodes (zones_to_regions values) — must therefore be present in `graph`.
+    nodes (cells_to_zones values, zones_to_zones keys + values) — must
+    therefore be present in `graph`.
 
     Args:
         pairs: TieredODPairs of destination IDs (typically from `od_pairs.get_pairs`).
@@ -435,12 +435,12 @@ def tiered_path_costs(
         return out
 
     cells_mask = mask.cells_to_cells if mask is not None else None
+    c2z_mask = mask.cells_to_zones if mask is not None else None
     zones_mask = mask.zones_to_zones if mask is not None else None
-    z2r_mask = mask.zones_to_regions if mask is not None else None
     return TieredODNodePairs(
         cells_to_cells=_process('cells_to_cells', pairs.cells_to_cells, cells_mask),
+        cells_to_zones=_process('cells_to_zones', pairs.cells_to_zones, c2z_mask),
         zones_to_zones=_process('zones_to_zones', pairs.zones_to_zones, zones_mask),
-        zones_to_regions=_process('zones_to_regions', pairs.zones_to_regions, z2r_mask),
     )
 
 
@@ -548,8 +548,8 @@ def tiered_path_costs_mp(
     nx_to_ig = idx_maps['node_nx_to_ig']
 
     cells_mask = mask.cells_to_cells if mask is not None else None
+    c2z_mask = mask.cells_to_zones if mask is not None else None
     zones_mask = mask.zones_to_zones if mask is not None else None
-    z2r_mask = mask.zones_to_regions if mask is not None else None
 
     def _build_tasks(tier: dict, mask_tier: dict | None) -> list:
         return [(orig,
@@ -582,8 +582,8 @@ def tiered_path_costs_mp(
     try:
         return TieredODNodePairs(
             cells_to_cells=_process('cells_to_cells', pairs.cells_to_cells, cells_mask),
+            cells_to_zones=_process('cells_to_zones', pairs.cells_to_zones, c2z_mask),
             zones_to_zones=_process('zones_to_zones', pairs.zones_to_zones, zones_mask),
-            zones_to_regions=_process('zones_to_regions', pairs.zones_to_regions, z2r_mask),
         )
     finally:
         pool.close()
@@ -968,23 +968,23 @@ def tiered_path_aggregate(
         return cost_out, agg_outs
 
     cells_mask = mask.cells_to_cells if mask is not None else None
+    c2z_mask = mask.cells_to_zones if mask is not None else None
     zones_mask = mask.zones_to_zones if mask is not None else None
-    z2r_mask = mask.zones_to_regions if mask is not None else None
 
     cells_res = _process('cells_to_cells', pairs.cells_to_cells, cells_mask)
+    c2z_res = _process('cells_to_zones', pairs.cells_to_zones, c2z_mask)
     zones_res = _process('zones_to_zones', pairs.zones_to_zones, zones_mask)
-    z2r_res = _process('zones_to_regions', pairs.zones_to_regions, z2r_mask)
 
     costs = TieredODNodePairs(
         cells_to_cells=cells_res[0] if cells_res is not None else {},
+        cells_to_zones=c2z_res[0] if c2z_res is not None else None,
         zones_to_zones=zones_res[0] if zones_res is not None else None,
-        zones_to_regions=z2r_res[0] if z2r_res is not None else None,
     )
     aggregations_by_name = {
         name: TieredODNodePairs(
             cells_to_cells=cells_res[1][name] if cells_res is not None else {},
+            cells_to_zones=c2z_res[1][name] if c2z_res is not None else None,
             zones_to_zones=zones_res[1][name] if zones_res is not None else None,
-            zones_to_regions=z2r_res[1][name] if z2r_res is not None else None,
         )
         for name in names
     }
@@ -998,7 +998,6 @@ def add_trip_overhead(
     cell_info: pd.DataFrame,
     *,
     zone_info: pd.DataFrame | None = None,
-    region_info: pd.DataFrame | None = None,
     origin_overhead: Callable | None = None,
     dest_overhead: Callable | None = None,
     verify_finite: bool = True,
@@ -1014,8 +1013,8 @@ def add_trip_overhead(
     where the info dataframe depends on the tier and the endpoint side:
 
         cells_to_cells:    info_o = cell_info,   info_d = cell_info
+        cells_to_zones:    info_o = cell_info,   info_d = zone_info
         zones_to_zones:    info_o = zone_info,   info_d = zone_info
-        zones_to_regions:  info_o = zone_info,   info_d = region_info
 
     Each info DataFrame is one row per network node at that tier, indexed by
     node ID. It can mix native node-level attributes (e.g. local density,
@@ -1047,9 +1046,8 @@ def add_trip_overhead(
         pairs: TieredODPairs of destination IDs (typically from `od_pairs.get_pairs`).
         costs: TieredODPairs of cost arrays to augment; same shape as `pairs`.
         cell_info: per-cell-node info DataFrame, indexed by the cell-tier node ID.
-        zone_info, region_info: per-zone-node / per-region-node info DataFrames,
-            indexed by the corresponding node IDs. Required iff the matching tier
-            (zones_to_zones / zones_to_regions) is present in `costs`.
+        zone_info: per-zone-node info DataFrame, indexed by the zone-tier node ID.
+            Required iff `cells_to_zones` or `zones_to_zones` is present in `costs`.
         origin_overhead: callable, see above. None to skip the origin contribution.
         dest_overhead: callable, see above. None to skip the dest contribution.
         verify_finite: if True, a ValueError is raised when output is not finite (NaN or Inf).
@@ -1068,8 +1066,8 @@ def add_trip_overhead(
     # (tier_attr) -> (origin_info_df, dest_info_df) lookup.
     tier_infos: dict[str, tuple[pd.DataFrame | None, pd.DataFrame | None]] = {
         'cells_to_cells':   (cell_info, cell_info),
+        'cells_to_zones':   (cell_info, zone_info),
         'zones_to_zones':   (zone_info, zone_info),
-        'zones_to_regions': (zone_info, region_info),
     }
 
     def _process(tier_attr: str) -> dict | None:
@@ -1116,8 +1114,8 @@ def add_trip_overhead(
 
     return type(costs)(
         cells_to_cells=_process('cells_to_cells'),
+        cells_to_zones=_process('cells_to_zones'),
         zones_to_zones=_process('zones_to_zones'),
-        zones_to_regions=_process('zones_to_regions'),
     )
 
 
@@ -1149,9 +1147,9 @@ def set_min_intrazonal_cost(
     and flooring `nan` would silently invent data; both behaviours would be
     incorrect.
 
-    Only `cells_to_cells` is modified — zone- and region-tier costs are
-    routed between distinct zone / region nodes and don't have the same
-    zero-self-cost degeneracy. Tiers that are `None` pass through.
+    Only `cells_to_cells` is modified — `cells_to_zones` and `zones_to_zones`
+    are routed between distinct cell-zone / zone-zone pairs and don't have the
+    same zero-self-cost degeneracy. Tiers that are `None` pass through.
 
     Args:
         costs: TieredODPairs of cost arrays.
@@ -1190,6 +1188,6 @@ def set_min_intrazonal_cost(
 
     return type(costs)(
         cells_to_cells=new_cells_to_cells,
+        cells_to_zones=costs.cells_to_zones,
         zones_to_zones=costs.zones_to_zones,
-        zones_to_regions=costs.zones_to_regions,
     )

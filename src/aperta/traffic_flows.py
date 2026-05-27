@@ -63,27 +63,28 @@ def _zone_tier_dests_and_scores(
     cost_to_weight: Callable,
     mask: TieredODPairs | None = None,
 ) -> dict:
-    """Pre-compute per-zone shared (zone_dests, zone_score, region_dests, region_score)
-    with optional mask applied. Done once per zone — reused across every cell in
-    that zone during sampling, amortizing both the `cost_to_weight` call and the
-    mask-filter step.
+    """Pre-compute per-zone shared (zone_dests, zone_score) with optional mask
+    applied. Done once per zone — reused across every cell in that zone during
+    sampling, amortizing both the `cost_to_weight` call and the mask-filter
+    step.
 
-    Empty arrays when a zone has no zone- or zones-to-regions-tier dests.
+    Empty arrays when a zone has no zone-tier dests.
+
+    Phase A note: previously also pre-computed region-tier dests/scores. The
+    region tier has been replaced by `cells_to_zones` (cell-keyed origin,
+    zone-keyed dest), which can't be amortised per-zone the same way — each
+    cell has its own dest set. Re-integration of the cells_to_zones tier into
+    `nested_node_sample` is a Phase B / D follow-up.
     """
     z2z_d = pairs.zones_to_zones or {}
-    z2r_d = pairs.zones_to_regions or {}
     z2z_w = weights.zones_to_zones or {}
-    z2r_w = weights.zones_to_regions or {}
     z2z_c = costs.zones_to_zones or {}
-    z2r_c = costs.zones_to_regions or {}
     z2z_m = (mask.zones_to_zones if mask is not None else None) or {}
-    z2r_m = (mask.zones_to_regions if mask is not None else None) or {}
     empty_dest = np.empty(0, dtype=object)
     empty_score = np.empty(0)
 
     out: dict = {}
-    for zn in set(z2z_d) | set(z2r_d):
-        # Zone tier
+    for zn in z2z_d:
         if zn in z2z_d and len(z2z_d[zn]):
             zd, zw, zc = z2z_d[zn], z2z_w[zn], z2z_c[zn]
             if zn in z2z_m:
@@ -93,17 +94,7 @@ def _zone_tier_dests_and_scores(
             zone_score = zw * cost_to_weight(zc)
         else:
             zone_dests, zone_score = empty_dest, empty_score
-        # Region tier
-        if zn in z2r_d and len(z2r_d[zn]):
-            rd, rw, rc = z2r_d[zn], z2r_w[zn], z2r_c[zn]
-            if zn in z2r_m:
-                m = z2r_m[zn]
-                rd, rw, rc = rd[m], rw[m], rc[m]
-            region_dests = rd
-            region_score = rw * cost_to_weight(rc)
-        else:
-            region_dests, region_score = empty_dest, empty_score
-        out[zn] = (zone_dests, zone_score, region_dests, region_score)
+        out[zn] = (zone_dests, zone_score)
     return out
 
 
@@ -122,17 +113,24 @@ def nested_node_sample(
     mask: TieredODPairs | None = None,
 ) -> dict:
     """Sample `n_dest` destinations for `n_orig` weighted-sampled origin cells,
-    integrating cell, zone, and zones-to-regions tiers.
+    integrating cell and zone tiers.
 
-    Per origin cell, the three tier dest arrays are concatenated on the fly into
-    one combined dest pool with per-pair scores `weight * cost_to_weight(cost)`.
+    Per origin cell, the tier dest arrays are concatenated on the fly into one
+    combined dest pool with per-pair scores `weight * cost_to_weight(cost)`.
     Sampling is then a single `np.random.choice`-equivalent (JITted) over the
     pool. Peak memory is bounded by the largest single per-origin concatenation,
     not by `n_orig × total_dests`.
 
-    The per-zone shared scores (zone-tier + zones-to-regions tier) are computed
-    once per zone (not per cell), so the `cost_to_weight` call is amortized
-    across all cells in the zone.
+    The per-zone shared scores (zone-tier) are computed once per zone (not per
+    cell), so the `cost_to_weight` call is amortized across all cells in the
+    zone.
+
+    Phase A note: the previous version also integrated a zones_to_regions
+    tier. After the tier-restructure refactor that tier is replaced by
+    `cells_to_zones` (cell-keyed origin, zone-keyed dest). Re-integrating it
+    into the nested sample (which needs a custom scipy-Brandes-style
+    algorithm given the cell-keyed origin set) is deferred — see memory
+    `aperta-flat-refactor-plan` Phase 4.
 
     Args:
         pairs: destination IDs per tier.
@@ -183,8 +181,8 @@ def nested_node_sample(
 
     out: dict = {}
     for zone_node, cells_here in chosen_by_zone.items():
-        zone_dests, zone_score, region_dests, region_score = z_combo.get(
-            zone_node, (empty_dest, empty_score, empty_dest, empty_score),
+        zone_dests, zone_score = z_combo.get(
+            zone_node, (empty_dest, empty_score),
         )
         for c in cells_here:
             cell_dests = pairs.cells_to_cells[c]
@@ -194,8 +192,8 @@ def nested_node_sample(
                 m = cell_mask_dict[c]
                 cell_dests, cell_costs, cell_weights = cell_dests[m], cell_costs[m], cell_weights[m]
             cell_score = cell_weights * cost_to_weight(cell_costs)
-            all_dests = np.concatenate([cell_dests, zone_dests, region_dests])
-            all_score = np.concatenate([cell_score, zone_score, region_score])
+            all_dests = np.concatenate([cell_dests, zone_dests])
+            all_score = np.concatenate([cell_score, zone_score])
             rvals = random_state.random(n_dest)
             indices = _weighted_sample_indices(all_score, rvals)
             out[c] = all_dests[indices]

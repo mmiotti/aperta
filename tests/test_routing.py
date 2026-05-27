@@ -54,11 +54,11 @@ class SetMinIntrazonalCostTestCase(unittest.TestCase):
         np.testing.assert_array_equal(out.cells_to_cells['b'], np.array([1., 300.]))
 
     def test_other_tiers_unchanged(self):
-        """zones_to_zones and zones_to_regions pass through untouched."""
+        """cells_to_zones and zones_to_zones pass through untouched."""
         costs = self._costs()
         out = set_min_intrazonal_cost(costs, min_cost=10.0)
         self.assertIs(out.zones_to_zones, costs.zones_to_zones)
-        self.assertIsNone(out.zones_to_regions)
+        self.assertIsNone(out.cells_to_zones)
 
     def test_dict_per_origin(self):
         """Per-origin floors apply independently."""
