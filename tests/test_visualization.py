@@ -167,9 +167,13 @@ class PlotTieredDestinationsTestCase(unittest.TestCase):
     def setUp(self):
         self.cells, self.zones = _toy_cells_zones()
         # Pairs: from C1's node (N1), reach C2 (N2) at cell tier; from C1's
-        # zone (Z1 → ZN1), reach Z2 (ZN2) at zone tier.
+        # node also reach Z2 (ZN2) at the middle tier; from C1's zone
+        # (Z1 → ZN1), reach Z2 (ZN2) at the far tier. (Z2 appears at both
+        # middle + far tiers in this toy — fine, the function just draws
+        # each layer separately.)
         self.pairs = TieredODNodePairs(
             cells_to_cells={'N1': np.array(['N2'])},
+            cells_to_zones={'N1': np.array(['ZN2'])},
             zones_to_zones={'ZN1': np.array(['ZN2'])},
         )
         # Toy graph with the four cell nodes + two zone nodes positioned.

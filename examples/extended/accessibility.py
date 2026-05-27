@@ -34,7 +34,7 @@
 #   `is_traffic_signal`. Edge travel times are computed inline in
 #   section 2 below by applying published coefficients to these
 #   features.
-# - H3 cells (res 10), zones (res 8), regions (res 6) with `population`,
+# - H3 cells (res 10) + zones (res 8) with `population`,
 #   `employment_*`, `poi_*` columns, plus pre-snapped
 #   `node_id_{walk,bike,car}` / `snap_dist_*` from
 #   `prepare/3_unit_mapping`.
@@ -118,19 +118,12 @@ print(f"Car:  {car_graph.number_of_nodes():>7,} nodes / "
       f"{car_graph.number_of_edges():>7,} edges")
 
 # %%
-cells   = gpd.read_file(PREPARED_DIR / 'cells.gpkg').set_index('cell_id')
-zones   = gpd.read_file(PREPARED_DIR / 'zones.gpkg').set_index('zone_id')
-regions = gpd.read_file(PREPARED_DIR / 'regions.gpkg').set_index('region_id')
+cells = gpd.read_file(PREPARED_DIR / 'cells.gpkg').set_index('cell_id')
+zones = gpd.read_file(PREPARED_DIR / 'zones.gpkg').set_index('zone_id')
 
-# H3 cells nest, so `region_id` for each zone is its parent at res 6
-# (zones are res 8, regions are res 6). `get_pairs` requires this
-# column to build the zones-to-regions tier.
-import h3
-zones['region_id'] = zones.index.map(lambda zid: h3.cell_to_parent(zid, 6))
-print(f"Cells:   {len(cells):>6,}  (Σ pop {cells['population'].sum():>10,.0f}, "
+print(f"Cells: {len(cells):>6,}  (Σ pop {cells['population'].sum():>10,.0f}, "
       f"Σ jobs {cells['employment_total'].sum():>10,.0f})")
-print(f"Zones:   {len(zones):>6,}")
-print(f"Regions: {len(regions):>6,}")
+print(f"Zones: {len(zones):>6,}")
 
 DESTINATIONS = ['employment_total', 'poi_errands_groceries', 'poi_leisure_hiking']
 for d in DESTINATIONS:
@@ -244,29 +237,41 @@ for label, graph, attr in [('walk', walk_graph, 'walk_time_s'),
 # %% [markdown]
 # ## 3. Build tiered OD pairs — per network
 #
-# Same tier cutoffs for all 3 networks so the per-mode ODMs share a
-# geo-unit grid and can be lifted to `TieredODGeoPairs` for cross-modal
-# aggregation.
+# Per-mode tier cutoffs (Euclidean metres). The three tiers split each
+# origin's destination universe into:
 #
-# Choice of cutoffs:
-# - `r_cells = 1500 m` — dense cell-to-cell within ~20 min walk
-# - `r_zones = 8000 m` — zone-tier covers ~30 min walk, ~15 min bike,
-#   ~10 min car. Anything beyond is zone-to-region.
+# - `cells_to_cells` (dest distance `< r_cells`): per-cell origin and
+#   dest — the highest-precision tier, kept small to bound storage.
+# - `cells_to_zones` (`r_cells ≤ d < r_medium`): per-cell origin,
+#   zone-aggregated dest — preserves the origin precision where the
+#   cell-to-cell pair count would explode but the relative cost of a
+#   specific dest cell within its zone is still meaningful.
+# - `zones_to_zones` (`r_medium ≤ d < r_zones`): zone-aggregated both
+#   sides — coarse but cheap, sized for long-haul.
+#
+# Per-mode reasoning: faster modes reach further, so `r_zones` scales
+# with mode speed. Walk barely needs a far tier (the 5 km mask in
+# section 4 drops anything longer anyway); car runs all the way to the
+# dest-polygon edge. The shared geo-unit grid (same cells / zones)
+# means the per-mode ODMs can be lifted to `TieredODGeoPairs` and fed
+# to `od_pairs.aggregate_across_modes` for the cross-modal logsum at
+# the bottom of this notebook.
 
 # %%
-R_CELLS = 1000.0
-R_ZONES = 7500.0
-R_REGIONS = 100_000.0  # >> dest polygon extent → keep every region pair
+TIER_CUTOFFS = {
+    'walk': dict(r_cells=1_000.0, r_medium=2_000.0,  r_zones=5_000.0),
+    'bike': dict(r_cells=1_000.0, r_medium=5_000.0,  r_zones=25_000.0),
+    'car':  dict(r_cells=1_000.0, r_medium=10_000.0, r_zones=100_000.0),
+}
 
 PAIRS = {}
 for label, graph in [('walk', walk_graph),
                      ('bike', bike_graph),
                      ('car',  car_graph)]:
     pairs = od_pairs.get_pairs(
-        cells, r_cells=R_CELLS, node_column=f'node_id_{label}',
-        zones=zones, r_zones=R_ZONES,
-        regions=regions, r_regions=R_REGIONS,
-        orig_cells=ORIG_MASK,
+        cells, node_column=f'node_id_{label}',
+        zones=zones, orig_cells=ORIG_MASK,
+        **TIER_CUTOFFS[label],
     )
     PAIRS[label] = pairs
     print(f"  {label:5s} {pairs}")
@@ -297,7 +302,7 @@ MASKS = {
 
 def _mask_kept_pct(mask):
     tot = kept = 0
-    for tier_name in ('cells_to_cells', 'zones_to_zones', 'zones_to_regions'):
+    for tier_name in ('cells_to_cells', 'cells_to_zones', 'zones_to_zones'):
         tier = getattr(mask, tier_name)
         if tier is None:
             continue
@@ -317,13 +322,19 @@ print(f"  bike mask: keeps {_mask_kept_pct(MASKS['bike']):.1f}% of pairs")
 # specified edge attribute along each shortest path. Pairs with a
 # `False` mask entry are skipped (the cost ODM stores `inf` for them,
 # which gravity / cumulative metrics treat as unreachable).
+#
+# `cutoff=` truncates each per-origin Dijkstra once it crosses the
+# given network-cost threshold. Picked per mode as a comfortable upper
+# bound on plausible trip duration — destinations beyond it return
+# `inf` and gravity / cumulative metrics drop them. Large speed-up on
+# country-scale graphs without changing any answer.
 
 # %%
 ROUTING_PLAN = [
-    # (label,             graph,      pairs,           mask,           edge attr)
-    ('walk',              walk_graph, PAIRS['walk'],   MASKS['walk'],  'walk_time_s'),
-    ('bike_regular',      bike_graph, PAIRS['bike'],   MASKS['bike'],  'bike_time_s'),
-    ('car_offpeak',       car_graph,  PAIRS['car'],    None,           'car_time_s_offpeak'),
+    # (label,             graph,      pairs,         mask,           edge attr,            cutoff_s)
+    ('walk',              walk_graph, PAIRS['walk'], MASKS['walk'],  'walk_time_s',         60 * 60),
+    ('bike_regular',      bike_graph, PAIRS['bike'], MASKS['bike'],  'bike_time_s',         60 * 60),
+    ('car_offpeak',       car_graph,  PAIRS['car'],  None,           'car_time_s_offpeak', 120 * 60),
 ]
 # This showcase uses one representative variant per mode. The published
 # paper has more (e-bike 25/45, car peak/night) — see projects/lumos/ for
@@ -332,10 +343,10 @@ ROUTING_PLAN = [
 import time
 COSTS = {}
 ROUTING_TIMES = {}
-for label, graph, pairs, mask, weight in ROUTING_PLAN:
+for label, graph, pairs, mask, weight, cutoff_s in ROUTING_PLAN:
     t0 = time.perf_counter()
     COSTS[label] = routing.tiered_path_costs(
-        pairs, graph, weight=weight, mask=mask,
+        pairs, graph, weight=weight, mask=mask, cutoff=cutoff_s,
     )
     ROUTING_TIMES[label] = time.perf_counter() - t0
     print(f"  Routed {label:14s} ({weight:22s}) in {ROUTING_TIMES[label]:>6.1f} s",
@@ -368,12 +379,9 @@ for net_label in ('walk', 'bike', 'car'):
         PAIRS[net_label], PAIRS[net_label], cells,
         cell_node_column=node_col,
         zones=zones, zone_node_column=node_col,
-        regions=regions, region_node_column=node_col,
     )
     dest_vals = {
-        d: od_pairs.dest_values_geo(
-            d, pairs_geo, cells, zones=zones, regions=regions,
-        )
+        d: od_pairs.dest_values_geo(d, pairs_geo, cells, zones=zones)
         for d in DESTINATIONS
     }
     REINDEXED[net_label] = (pairs_geo, dest_vals)
@@ -381,14 +389,13 @@ for net_label in ('walk', 'bike', 'car'):
 # Per-variant: lift the cost ODM into geo-space.
 GEO_PAIRS = {}
 GEO_COSTS = {}
-for label, _, pairs, _, _ in ROUTING_PLAN:
+for label, _, pairs, _, _, _ in ROUTING_PLAN:
     net_label = NETWORK_OF[label]
     node_col = f'node_id_{net_label}'
     pairs_geo, cost_geo = od_pairs.reindex_by_geo_unit(
         pairs, COSTS[label], cells,
         cell_node_column=node_col,
         zones=zones, zone_node_column=node_col,
-        regions=regions, region_node_column=node_col,
     )
     GEO_PAIRS[label] = pairs_geo
     GEO_COSTS[label] = cost_geo
@@ -417,7 +424,7 @@ CELL_TO_ZONE = cells['zone_id'].to_dict()
 # pipeline in `projects/lumos/` uses the full per-mode value.
 #
 # We apply overheads only at the cell tier (origin + destination). The
-# zone / region tier overheads (which would weight cell-to-centroid
+# middle / far tier overheads (which would weight cell-to-centroid
 # distance by an aggregate of nearby cells) are deferred to the
 # production version — the showcase keeps things simple.
 
@@ -452,7 +459,7 @@ OVERHEAD_COEF = {
 # %%
 # Bake the per-mode cell-tier overheads into each cost ODM.
 GEO_COSTS_WITH_OVERHEAD = {}
-for label, _, _, _, _ in ROUTING_PLAN:
+for label, _, _, _, _, _ in ROUTING_PLAN:
     coef = OVERHEAD_COEF[label]
 
     # Per-cell origin & destination overhead = constant + density * density_norm.
@@ -463,7 +470,7 @@ for label, _, _, _, _ in ROUTING_PLAN:
         feature_coefficients={'density_norm': coef['density']},
     )
 
-    # Cell-tier overheads only. Zone / region tiers get nothing added
+    # Cell-tier overheads only. Middle / far tiers get nothing added
     # (the showcase doesn't aggregate dest overhead at coarser tiers —
     # see footer for what production does differently).
     GEO_COSTS_WITH_OVERHEAD[label] = overhead.add_geo_overheads(
@@ -492,7 +499,7 @@ DECAYS = {
 }
 
 ACC = {}  # (variant_label, destination) -> per-cell pd.Series
-for label, _, _, _, _ in ROUTING_PLAN:
+for label, _, _, _, _, _ in ROUTING_PLAN:
     net_label = NETWORK_OF[label]
     _, dest_vals = REINDEXED[net_label]
     cost_floored = routing.set_min_intrazonal_cost(
@@ -558,7 +565,7 @@ logsum_costs_floored = routing.set_min_intrazonal_cost(logsum_costs, min_cost=30
 # Destination weights: any of the per-network dest_vals will do — they're
 # the same per-cell counts; geo-pairs alignment is handled internally.
 logsum_dest_vals = {
-    d: od_pairs.dest_values_geo(d, logsum_pairs, cells, zones=zones, regions=regions)
+    d: od_pairs.dest_values_geo(d, logsum_pairs, cells, zones=zones)
     for d in DESTINATIONS
 }
 logsum_decay = accessibility.exp_decay('logsum', 1.0 / LOGSUM_SCALE)
@@ -590,7 +597,7 @@ plt.show()
 #   for the full variant matrix with peak vs off-peak congestion deltas
 #   and bike vs e-bike comparisons.
 # - **Cell-tier overheads only.** Production aggregates destination
-#   overhead at zone / region tiers via centroid-to-centroid distance.
+#   overhead at middle / far tiers via centroid-to-centroid distance.
 #   Cells are small enough here that the difference is minor for a
 #   showcase.
 # - **No `overhead_*_dist` term.** The published coefficient table

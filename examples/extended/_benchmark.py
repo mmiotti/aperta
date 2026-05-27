@@ -19,12 +19,12 @@ across the three aperta variants — only the origin set differs:
 
 Pandana (always all-nodes) is reported as a reference baseline for variant A.
 
-Each tiered variant runs twice: once via igraph (no cutoff) and once via
-scipy with `cutoff=metric_t_s` to show the cutoff speedup.
+All aperta variants route via scipy `csgraph.dijkstra` (aperta's only
+routing backend) with `cutoff=metric_t_s` applied uniformly.
 
 Toggle `TEST_MODE = True` for a fast end-to-end smoke test on a small
 bbox subset (~30 s); set `TEST_MODE = False` for the full Bern + 25 km
-run (probably 30 min+).
+run (~5–10 min).
 
 Run from `aperta/examples/extended/`. Prep outputs assumed available
 under `data/prepared/`.
@@ -159,10 +159,10 @@ def run_pandana(graph, time_attr, cells, node_col, weight_col, t_metric):
 
 
 def run_variant_a_all_nodes(graph, time_attr, cells, node_col, weight_col,
-                            r_outer_m, t_metric, cutoff_s=None):
+                            r_outer_m, t_metric, *, cutoff_s=None):
     """Variant A: every graph node is its own 'cell', single-tier — the
     tiered destination structure can't help when every node is already an
-    origin. With `cutoff_s` set, routing uses scipy; otherwise igraph.
+    origin.
 
     Returns `(acc, total_s, n_origins)`.
     """
@@ -201,7 +201,6 @@ def run_variant_tiered(graph, time_attr, cells, zones, node_col,
     - `orig_cells=<bool array aligned to cells.index>` → variant C (e.g.
       AOI-restricted origins).
 
-    With `cutoff_s` set, routing uses scipy; otherwise igraph (no cutoff).
     Returns `(acc, total_s, n_origins)`.
     """
     t0 = time.time()
@@ -303,35 +302,29 @@ def main():
               f"set+aggregate {t_a:5.1f}s  → total {t_c+t_p+t_a:6.1f}s")
 
         # --- Variant A: all graph nodes (single tier) ---------------------
-        for backend, kwargs in [('igraph', {}),
-                                ('scipy', {'cutoff_s': cfg['metric_t_s']})]:
-            print(f"  [A] Aperta all-nodes ({backend}) ...", end=' ', flush=True)
-            _, t, n_origins = run_variant_a_all_nodes(
-                graph, attr, mode_cells, node_col, 'employment_total',
-                cfg['r_zones_m'], cfg['metric_t_s'], **kwargs)
-            print(f"({n_origins:,} origins)  → {t:6.1f} s")
+        print(f"  [A] Aperta all-nodes ...", end=' ', flush=True)
+        _, t, n_origins = run_variant_a_all_nodes(
+            graph, attr, mode_cells, node_col, 'employment_total',
+            cfg['r_zones_m'], cfg['metric_t_s'], cutoff_s=cfg['metric_t_s'])
+        print(f"({n_origins:,} origins)  → {t:6.1f} s")
 
         # --- Variant B: all cell-snap origins (3-tier) --------------------
-        for backend, kwargs in [('igraph', {}),
-                                ('scipy', {'cutoff_s': cfg['metric_t_s']})]:
-            print(f"  [B] Aperta cell-snap ({backend}) ...", end=' ', flush=True)
-            _, t, n_origins = run_variant_tiered(
-                graph, attr, mode_cells, mode_zones, node_col,
-                'employment_total',
-                cfg['r_cells_m'], r_medium_m, cfg['r_zones_m'],
-                cfg['metric_t_s'], **kwargs)
-            print(f"({n_origins:,} origins from {len(mode_cells):,} cells)  → {t:6.1f} s")
+        print(f"  [B] Aperta cell-snap ...", end=' ', flush=True)
+        _, t, n_origins = run_variant_tiered(
+            graph, attr, mode_cells, mode_zones, node_col,
+            'employment_total',
+            cfg['r_cells_m'], r_medium_m, cfg['r_zones_m'],
+            cfg['metric_t_s'], cutoff_s=cfg['metric_t_s'])
+        print(f"({n_origins:,} origins from {len(mode_cells):,} cells)  → {t:6.1f} s")
 
         # --- Variant C: AOI cell-snap origins (3-tier) --------------------
-        for backend, kwargs in [('igraph', {}),
-                                ('scipy', {'cutoff_s': cfg['metric_t_s']})]:
-            print(f"  [C] Aperta AOI cell-snap ({backend}) ...", end=' ', flush=True)
-            _, t, n_origins = run_variant_tiered(
-                graph, attr, mode_cells, mode_zones, node_col,
-                'employment_total',
-                cfg['r_cells_m'], r_medium_m, cfg['r_zones_m'],
-                cfg['metric_t_s'], orig_cells=in_aoi, **kwargs)
-            print(f"({n_origins:,} origins from {n_aoi:,} AOI cells)  → {t:6.1f} s")
+        print(f"  [C] Aperta AOI cell-snap ...", end=' ', flush=True)
+        _, t, n_origins = run_variant_tiered(
+            graph, attr, mode_cells, mode_zones, node_col,
+            'employment_total',
+            cfg['r_cells_m'], r_medium_m, cfg['r_zones_m'],
+            cfg['metric_t_s'], orig_cells=in_aoi, cutoff_s=cfg['metric_t_s'])
+        print(f"({n_origins:,} origins from {n_aoi:,} AOI cells)  → {t:6.1f} s")
 
 
 if __name__ == '__main__':

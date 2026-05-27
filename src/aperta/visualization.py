@@ -211,15 +211,21 @@ def plot_tiered_destinations(
 ) -> plt.Axes:
     """Visualise the tiered OD structure from one origin cell.
 
-    Draws:
+    Draws, in z-order back-to-front:
         - All cells in pale grey (background).
         - All zone boundaries (faint outlines).
-        - Zone-tier destination zones for the origin (light blue fill).
-        - Cell-tier destination cells for the origin (gold fill).
+        - **Far-tier** destination zones (`zones_to_zones`) for the origin's
+          zone (pale blue fill).
+        - **Middle-tier** destination zones (`cells_to_zones`) for the
+          origin cell (mid blue-green fill — distinct from far-tier so the
+          two layers read separately when they overlap).
+        - **Cell-tier** destination cells (`cells_to_cells`) for the origin
+          (gold fill).
         - The origin cell itself (red).
         - (If `graph` given) Network nodes as markers: origin (red star),
-          cell-tier dest nodes (small orange dots), zone-tier dest nodes
-          (larger blue squares).
+          cell-tier dest nodes (small orange dots), middle-tier dest zone
+          nodes (medium teal squares), far-tier dest zone nodes (larger
+          blue squares).
 
     Currently supports `TieredODNodePairs` only (the node-keyed pairs
     returned by `od_pairs.get_pairs`). For geo-keyed pairs, lookup happens
@@ -229,9 +235,9 @@ def plot_tiered_destinations(
         cells: cell-indexed GeoDataFrame. Must have `cell_node_column` and
             a `'zone_id'` column.
         zones: zone-indexed GeoDataFrame. Must have `zone_node_column`.
-        pairs: `TieredODNodePairs` (node-keyed). `cells_to_cells` keys are
-            cell-tier network nodes; `zones_to_zones` keys are zone-tier
-            network nodes.
+        pairs: `TieredODNodePairs` (node-keyed). `cells_to_cells` and
+            `cells_to_zones` keys are cell-tier network nodes;
+            `zones_to_zones` keys are zone-tier network nodes.
         origin_cell_id: index value of the cell to highlight as the
             origin (looked up in `cells`).
         cell_node_column: column on `cells` carrying the cell-tier network
@@ -259,14 +265,19 @@ def plot_tiered_destinations(
 
     cell_dest_nodes = pairs.cells_to_cells.get(origin_node, np.array([]))
     cell_dest_cells = cells[cells[cell_node_column].isin(cell_dest_nodes)]
-    zone_dest_nodes = (pairs.zones_to_zones.get(origin_zone_node, np.array([]))
-                       if pairs.zones_to_zones is not None else np.array([]))
-    zone_dest_zones = zones[zones[zone_node_column].isin(zone_dest_nodes)]
+    middle_dest_nodes = (pairs.cells_to_zones.get(origin_node, np.array([]))
+                         if pairs.cells_to_zones is not None else np.array([]))
+    middle_dest_zones = zones[zones[zone_node_column].isin(middle_dest_nodes)]
+    far_dest_nodes = (pairs.zones_to_zones.get(origin_zone_node, np.array([]))
+                      if pairs.zones_to_zones is not None else np.array([]))
+    far_dest_zones = zones[zones[zone_node_column].isin(far_dest_nodes)]
 
     cells.plot(ax=ax, color='whitesmoke', edgecolor='lightgray', linewidth=0.1)
     zones.boundary.plot(ax=ax, color='gray', linewidth=0.3, alpha=0.5)
-    zone_dest_zones.plot(ax=ax, color='lightblue', alpha=0.5,
-                         edgecolor='steelblue', linewidth=0.5)
+    far_dest_zones.plot(ax=ax, color='lightblue', alpha=0.5,
+                        edgecolor='steelblue', linewidth=0.5)
+    middle_dest_zones.plot(ax=ax, color='mediumaquamarine', alpha=0.55,
+                           edgecolor='seagreen', linewidth=0.5)
     cell_dest_cells.plot(ax=ax, color='gold', alpha=0.6,
                          edgecolor='darkorange', linewidth=0.2)
     cells.loc[[origin_cell_id]].plot(ax=ax, color='red',
@@ -279,12 +290,18 @@ def plot_tiered_destinations(
             ax.scatter(*zip(*cell_xy), color='darkorange', s=4, marker='o',
                        zorder=5,
                        label=f'Cell-tier dest nodes ({len(cell_xy)})')
-        zone_xy = [(graph.nodes[n]['x'], graph.nodes[n]['y'])
-                   for n in zone_dest_nodes if n in graph.nodes]
-        if zone_xy:
-            ax.scatter(*zip(*zone_xy), color='steelblue', s=40, marker='s',
+        middle_xy = [(graph.nodes[n]['x'], graph.nodes[n]['y'])
+                     for n in middle_dest_nodes if n in graph.nodes]
+        if middle_xy:
+            ax.scatter(*zip(*middle_xy), color='seagreen', s=25, marker='s',
                        edgecolor='black', linewidth=0.3, zorder=6,
-                       label=f'Zone-tier dest nodes ({len(zone_xy)})')
+                       label=f'Middle-tier dest nodes ({len(middle_xy)})')
+        far_xy = [(graph.nodes[n]['x'], graph.nodes[n]['y'])
+                  for n in far_dest_nodes if n in graph.nodes]
+        if far_xy:
+            ax.scatter(*zip(*far_xy), color='steelblue', s=40, marker='s',
+                       edgecolor='black', linewidth=0.3, zorder=7,
+                       label=f'Far-tier dest nodes ({len(far_xy)})')
         if origin_node in graph.nodes:
             ax.scatter([graph.nodes[origin_node]['x']],
                        [graph.nodes[origin_node]['y']],

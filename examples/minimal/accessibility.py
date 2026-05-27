@@ -31,10 +31,15 @@
 # 2. **Map data to units** — Uber H3 hex cells (resolution 10, ~66 m edge) and
 #    parent zones (resolution 8, ~460 m edge). H3's native parent-child
 #    relationship makes the cell→zone mapping deterministic and zero-cost.
-# 3. **Build sparse OD pairs** — Two tiers: cells-to-cells for near pairs,
-#    zones-to-zones for far pairs.
+# 3. **Build sparse OD pairs** — Three tiers based on zone-pair distance:
+#    `cells_to_cells` (close — both endpoints at cell precision),
+#    `cells_to_zones` (medium — cell origin, zone-aggregated dest),
+#    `zones_to_zones` (far — both endpoints at zone precision). The middle
+#    tier preserves per-cell origin precision in the regime where cell
+#    variation matters relative to trip cost.
 # 4. *(skipped here)* Estimate traffic flows — not relevant for walking.
-# 5. **Estimate travel costs** — Dijkstra shortest paths over the walking graph.
+# 5. **Estimate travel costs** — Dijkstra shortest paths over the walking
+#    graph (scipy `csgraph.dijkstra`, FP32 by default).
 # 6. **Calculate accessibilities** — Cumulative-opportunity, gravity, and
 #    nearest-*k* metrics.
 #
@@ -321,26 +326,49 @@ print(f"Cells with at least one supermarket: {(cells['supermarkets'] > 0).sum()}
 
 # %% [markdown]
 # ## 5. Build tiered origin-destination pairs
+#
+# Three radii classify every zone-pair into one of three tiers:
+#
+# - `cells_to_cells` (`d(Z, Z') < r_cells`): cell origin and cell dest —
+#   highest precision, kept small to bound storage.
+# - `cells_to_zones` (`r_cells ≤ d < r_medium`): cell origin, zone-
+#   aggregated dest — preserves per-cell origin precision in the regime
+#   where the per-cell dest precision starts being washed out by the
+#   trip cost.
+# - `zones_to_zones` (`r_medium ≤ d < r_zones`): zone-aggregated both
+#   sides — cheapest tier, used for far destinations where neither
+#   endpoint's individual cell identity matters much.
+#
+# `r_medium` defaults to `min(r_cells * 10, r_zones)` if not given —
+# we pass it explicitly here so all three tiers are visible.
 
 # %%
-R_CELLS = 1500.0   # 1.5 km: cell-tier near pairs (covers ~20 min of walking)
-R_ZONES = 5000.0   # 5 km:   zone-tier far pairs
+R_CELLS  = 1_500.0   # 1.5 km — cells_to_cells (within ~20 min walking)
+R_MEDIUM = 3_000.0   # 3 km   — cells_to_zones middle tier
+R_ZONES  = 8_000.0   # 8 km   — zones_to_zones outer cutoff
 
 pairs = od_pairs.get_pairs(
     cells, r_cells=R_CELLS, node_column='node_id',
-    zones=zones, r_zones=R_ZONES,
+    zones=zones, r_zones=R_ZONES, r_medium=R_MEDIUM,
 )
 print(pairs)
 
 # %% [markdown]
-# Visualising the tiered structure from one origin. For any origin cell,
-# aperta routes to *cell-tier destinations* (other cells within
-# `r_cells`, at full cell resolution) and to *zone-tier destinations*
-# (zones within `r_zones` but beyond cell-tier coverage, at zone
-# resolution). This is the trade-off the multi-scale tiered architecture
-# makes: high resolution where it matters (near the origin, where short
-# trips dominate) and coarser resolution where it doesn't (farther away,
-# where individual cell identity becomes statistically interchangeable).
+# Visualising the tiered structure from one origin. `plot_tiered_destinations`
+# draws each tier's destinations in a distinct colour:
+#
+# - **Red** — origin cell
+# - **Gold** — `cells_to_cells` destinations (cell precision)
+# - **Teal** — `cells_to_zones` destinations (zone-aggregated, mid-distance)
+# - **Blue** — `zones_to_zones` destinations (zone-aggregated, far)
+#
+# The three layers fan out concentrically: the per-cell tier is the
+# small high-resolution core, the middle tier is the surrounding annulus
+# of zone-aggregated dests, the far tier is the outer ring (often
+# overlapping the middle tier in the visualisation since the same
+# destination zone may show up at different tiers from different
+# origins). High resolution where it matters, coarser resolution where it
+# doesn't.
 
 # %%
 # Pick an origin cell near the centre of the AOI for the illustration.
@@ -354,8 +382,9 @@ viz.plot_tiered_destinations(
     graph=graph,
     boundary=boundary.to_crs(boundary_proj_crs),
     title=('Tiered destinations from one origin cell\n'
-           'red = origin · gold = cell-tier dests (within r_cells) · '
-           'blue = zone-tier dests (within r_zones, beyond r_cells)'),
+           'red = origin · gold = cells_to_cells · '
+           'teal = cells_to_zones (middle) · '
+           'blue = zones_to_zones (far)'),
 )
 plt.tight_layout()
 plt.show()
@@ -363,13 +392,33 @@ plt.show()
 
 # %% [markdown]
 # ## 6. Compute travel times (Dijkstra over the walking graph)
+#
+# `tiered_path_costs` routes every OD pair in `pairs` via
+# `scipy.sparse.csgraph.dijkstra` (one single-source call per origin)
+# and returns a `TieredODNodePairs` of cost arrays — same shape as
+# `pairs`, position-aligned with the per-origin dest arrays.
+#
+# `cutoff=T` (optional) caps each per-origin search at `T` weight-units
+# (seconds here, since edge weight is travel time). Worth using when
+# the graph is much larger than the longest realistic trip: scipy's
+# `limit=` parameter truncates the Dijkstra frontier once it exceeds T,
+# which can be a big speed-up on country-scale networks. At Central
+# Paris scale (graph diameter ≈ 30 min walking) the cutoff barely
+# matters, but we set it for illustration.
+#
+# Output dtype is `np.float32` by default (halves storage versus FP64
+# with no meaningful precision loss for travel costs in seconds). Pass
+# `dtype=np.float64` if downstream arithmetic needs the extra range.
 
 # %%
 # Convert each edge's length (m) into a walking time (s).
 for u, v, k, data in graph.edges(keys=True, data=True):
     data['walk_time_s'] = data['length'] / WALK_SPEED_MS
 
-times = routing.tiered_path_costs(pairs, graph, weight='walk_time_s')
+times = routing.tiered_path_costs(
+    pairs, graph, weight='walk_time_s',
+    cutoff=45 * 60,  # 45 min upper bound; r_zones * (1/walk_speed) gives ≈30 min
+)
 print(times)
 
 
@@ -385,7 +434,8 @@ print(times)
 #
 # 1. `reindex_by_geo_unit` — fan out node-keyed entries to cell/zone entries.
 # 2. `add_origin_cell_overhead` — bake per-cell first-mile into the cost ODM
-#    (per-cell at cell tier, per-zone-mean at zone tier).
+#    (per-cell at `cells_to_cells` + `cells_to_zones`, per-zone-mean at
+#    `zones_to_zones` since the far tier is keyed by zone, not cell).
 # 3. `dest_values_geo` — build per-cell destination weight ODMs directly.
 
 # %%

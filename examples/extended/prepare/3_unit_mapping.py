@@ -14,12 +14,12 @@
 # ---
 
 # %% [markdown]
-# # Prep notebook 3: Build H3 cells/zones/regions and map them to networks
+# # Prep notebook 3: Build H3 cells / zones and map them to networks
 #
 # Two related concerns in one notebook:
 #
-# 1. **Aggregate data to H3 cells** (and roll up to zones / regions).
-#    Sets up the geo-unit hierarchy that downstream notebooks consume.
+# 1. **Aggregate data to H3 cells** (and roll up to zones). Sets up the
+#    geo-unit hierarchy that downstream notebooks consume.
 # 2. **Snap each unit to network nodes** for each of the three networks
 #    (walk, bike, car). Pre-computes the `node_id_*` + `snap_dist_*`
 #    columns that downstream OD-pair construction needs.
@@ -32,17 +32,15 @@
 # - **Buildings** → per-cell count.
 # - **POIs** (per-category counts + weights) → per-cell sums.
 #
-# **Three tiers.** Built on H3's hierarchical hex grid:
+# **Two geo layers**, built on H3's hierarchical hex grid:
 #
 # - **Cells** at resolution 10 (~15,000 m² / ~66 m edge) — the finest
 #   analysis unit; matches the minimal example for consistency.
 # - **Zones** at resolution 8 (~700,000 m² / ~460 m edge) — parent of
-#   cells; the natural zone-tier index for aperta's `get_pairs`.
-# - **Regions** at resolution 6 (~36 km² / ~3.2 km edge) — parent of
-#   cells skipping resolutions 9 / 8 / 7; the coarsest tier used for
-#   long-range OD pairs.
+#   cells; the zone-tier index aperta's `get_pairs` uses for the middle
+#   (`cells_to_zones`) and far (`zones_to_zones`) tiers.
 #
-# Per-tier data columns (population, employment, POIs, etc.) are
+# Per-zone data columns (population, employment, POIs, etc.) are
 # pre-aggregated by sum from cells; aperta's `dest_values` reads them
 # directly during accessibility computation.
 #
@@ -88,7 +86,6 @@ CRS_GEO = 'EPSG:4326'      # H3 always works in lat/lng
 
 H3_RES_CELLS = 10    # ~66 m edge  / ~15,000 m² per hex
 H3_RES_ZONES = 8     # ~460 m edge / ~700,000 m² per hex; parent of res-10
-H3_RES_REGIONS = 6   # ~3.2 km edge / ~36 km² per hex; parent skipping 9/8/7
 
 
 # %% [markdown]
@@ -225,9 +222,8 @@ def _h3_cell_to_polygon(cell: str) -> Polygon:
 cells['geometry'] = [_h3_cell_to_polygon(c) for c in cells.index]
 cells = gpd.GeoDataFrame(cells, geometry='geometry', crs=CRS_GEO).to_crs(CRS_METRIC)
 
-# Add zone_id (H3 res-8 parent) and region_id (H3 res-6 parent).
+# Add zone_id (H3 res-8 parent of each res-10 cell).
 cells['zone_id'] = [h3.cell_to_parent(c, H3_RES_ZONES) for c in cells.index]
-cells['region_id'] = [h3.cell_to_parent(c, H3_RES_REGIONS) for c in cells.index]
 
 
 # %% [markdown]
@@ -251,55 +247,44 @@ print(f"Cells: {n_before:,} → {len(cells):,} after filtering empty "
 
 
 # %% [markdown]
-# ## 6. Build zones and regions (sum-aggregated from cells)
+# ## 6. Build zones (sum-aggregated from cells)
 #
-# Zones (H3 res 8) and regions (H3 res 6) are derived from
-# `cells['zone_id']` / `cells['region_id']`, so by construction every
-# zone/region contains at least one non-empty cell — no separate
-# filter step needed.
+# Zones (H3 res 8) are derived from `cells['zone_id']`, so by construction
+# every zone contains at least one non-empty cell — no separate filter
+# step needed.
 #
 # All cell-level data columns (population, employment, building count,
-# POI counts + weights) are aggregated by **sum** to the parent zone /
-# region. Aperta's `dest_values` reads these pre-aggregated columns at
-# accessibility-computation time for the zone-tier and region-tier OD
-# pairs.
+# POI counts + weights) are aggregated by **sum** to the parent zone.
+# Aperta's `dest_values` reads these pre-aggregated columns at
+# accessibility-computation time for the `cells_to_zones` (middle) and
+# `zones_to_zones` (far) tiers.
 
 # %%
 # Identify the numeric data columns to sum-aggregate (everything except
 # the structural columns).
 DATA_COLS = [c for c in cells.columns
-             if c not in ('geometry', 'zone_id', 'region_id')]
+             if c not in ('geometry', 'zone_id')]
 
-def _build_tier(parent_col: str, name_for_log: str) -> gpd.GeoDataFrame:
-    """Group cells by `parent_col`, sum data columns, materialise the
-    parent-hex geometry. The output GeoDataFrame is indexed by the
-    parent ID column (with `name_for_log` for the index name)."""
-    agg = cells.groupby(parent_col)[DATA_COLS].sum()
-    parent_ids = sorted(agg.index)
-    gdf = gpd.GeoDataFrame(
-        agg.reindex(parent_ids).assign(
-            geometry=[_h3_cell_to_polygon(p) for p in parent_ids],
-        ),
-        geometry='geometry', crs=CRS_GEO,
-    ).to_crs(CRS_METRIC)
-    gdf.index.name = name_for_log
-    print(f"{name_for_log.capitalize()}s: {len(gdf):,} "
-          f"(avg {len(cells)/len(gdf):.1f} cells each).")
-    return gdf
-
-zones = _build_tier('zone_id', 'zone_id')
-regions = _build_tier('region_id', 'region_id')
+agg = cells.groupby('zone_id')[DATA_COLS].sum()
+zone_ids = sorted(agg.index)
+zones = gpd.GeoDataFrame(
+    agg.reindex(zone_ids).assign(
+        geometry=[_h3_cell_to_polygon(z) for z in zone_ids],
+    ),
+    geometry='geometry', crs=CRS_GEO,
+).to_crs(CRS_METRIC)
+zones.index.name = 'zone_id'
+print(f"Zones: {len(zones):,} (avg {len(cells)/len(zones):.1f} cells each).")
 
 
 # %% [markdown]
 # ## 7. Snap units to network nodes — per network
 #
-# For each tier (cells, zones, regions), find the nearest node on each
-# of the three networks (walk, bike, car). Result is stored as
-# per-mode columns (`node_id_walk`, `node_id_bike`, `node_id_car`,
-# plus `snap_dist_*` in metres) — keeping all three in one DataFrame
-# means downstream OD-pair construction just passes the right
-# `node_column=` argument.
+# For each geo layer (cells, zones), find the nearest node on each of the
+# three networks (walk, bike, car). Result is stored as per-mode columns
+# (`node_id_walk`, `node_id_bike`, `node_id_car`, plus `snap_dist_*` in
+# metres) — keeping all three in one DataFrame means downstream OD-pair
+# construction just passes the right `node_column=` argument.
 #
 # Snap distances are reused downstream as the cell-to-network-node
 # first-mile / last-mile component of trip overheads.
@@ -325,7 +310,7 @@ def snap_layer_to_all_networks(layer: gpd.GeoDataFrame) -> None:
         layer[f'snap_dist_{label}'] = dist
 
 
-for layer, name in [(cells, 'cells'), (zones, 'zones'), (regions, 'regions')]:
+for layer, name in [(cells, 'cells'), (zones, 'zones')]:
     snap_layer_to_all_networks(layer)
     print(f"  Snapped {name}: "
           f"walk {layer['node_id_walk'].notna().sum():>6,} "
@@ -338,12 +323,11 @@ for layer, name in [(cells, 'cells'), (zones, 'zones'), (regions, 'regions')]:
 # ## 8. Save outputs
 #
 # - `cells.gpkg` — cell-indexed GeoDataFrame with geometry + every
-#   aggregated attribute column + `zone_id` + `region_id` linkers +
+#   aggregated attribute column + `zone_id` linker +
 #   `node_id_{walk,bike,car}` + `snap_dist_{walk,bike,car}`.
 #   Consumed directly by `accessibility.ipynb`.
 # - `zones.gpkg` — zone-indexed GeoDataFrame; same data + node-id
 #   columns as `cells`, sum-aggregated for data columns.
-# - `regions.gpkg` — region-indexed GeoDataFrame; same shape as zones.
 # - `building_to_cell.csv` — `building_id → cell_id` mapping. Used to
 #   port cell-level accessibility metrics back to individual buildings
 #   for fine-grained visualisation (same values, more granular display).
@@ -353,26 +337,24 @@ for layer, name in [(cells, 'cells'), (zones, 'zones'), (regions, 'regions')]:
 # %%
 cells.to_file(PREPARED_DIR / 'cells.gpkg', driver='GPKG')
 zones.to_file(PREPARED_DIR / 'zones.gpkg', driver='GPKG')
-regions.to_file(PREPARED_DIR / 'regions.gpkg', driver='GPKG')
 buildings[['cell_id']].to_csv(PREPARED_DIR / 'building_to_cell.csv')
 print(f"\nSaved:")
 print(f"  cells.gpkg              ({len(cells):,} cells)")
 print(f"  zones.gpkg              ({len(zones):,} zones)")
-print(f"  regions.gpkg            ({len(regions):,} regions)")
 print(f"  building_to_cell.csv    ({len(buildings):,} rows)")
 
 
 # %% [markdown]
 # ## 9. Validation
 #
-# Cross-tier validation: the sum-aggregation is exact, so per-data-column
-# totals are identical across the three tiers (and match the input
-# totals to the extent that the input got assigned to a cell that
-# survived the empty-cell filter).
+# Cross-layer validation: the sum-aggregation is exact, so per-data-column
+# totals are identical at both layers (and match the input totals to the
+# extent that the input got assigned to a cell that survived the
+# empty-cell filter).
 
 # %%
-print(f"\n--- Per-tier validation (sums should all match) ---")
-print(f"                       cells           zones         regions      input")
+print(f"\n--- Per-layer validation (sums should all match) ---")
+print(f"                       cells           zones         input")
 for col, input_total in [
     ('population',       pop_df['population'].sum()),
     ('employment_total', buildings['employment_total'].sum()),
@@ -380,26 +362,24 @@ for col, input_total in [
 ]:
     print(f"  {col:18s} {cells[col].sum():>10,.0f}    "
           f"{zones[col].sum():>10,.0f}    "
-          f"{regions[col].sum():>10,.0f}    "
           f"{input_total:>10,.0f}")
 
 
 # %% [markdown]
 # ## Appendix: visualisation
 #
-# Two optional figures. First: the same data (population) at all three
-# H3 tiers — shows the progressive aggregation from fine-grained cells
-# (~95k) to coarse regions (~50). Useful for eyeballing tier coverage
-# and the resolution trade-off in aperta's tiered OD design. Second:
-# per-cell triptych showing population, employment density, and total
+# Two optional figures. First: the same data (population) at both H3
+# layers — shows the progressive aggregation from fine-grained cells
+# (~95k) to coarser zones (~5.5k). Useful for eyeballing layer
+# coverage and the resolution trade-off in aperta's tiered OD design.
+# Second: per-cell triptych showing population, employment, and total
 # POI count side by side.
 
 # %%
-fig, axes = plt.subplots(1, 3, figsize=(18, 7))
+fig, axes = plt.subplots(1, 2, figsize=(13, 7))
 for ax, gdf, title in [
-    (axes[0], cells,   f'Cells (H3 res 10): {len(cells):,}'),
-    (axes[1], zones,   f'Zones (H3 res 8): {len(zones):,}'),
-    (axes[2], regions, f'Regions (H3 res 6): {len(regions):,}'),
+    (axes[0], cells, f'Cells (H3 res 10): {len(cells):,}'),
+    (axes[1], zones, f'Zones (H3 res 8): {len(zones):,}'),
 ]:
     gdf.plot(
         column='population', ax=ax, legend=True, cmap='viridis',
@@ -411,7 +391,7 @@ for ax, gdf, title in [
     )
     ax.set_title(title)
     ax.set_axis_off()
-plt.suptitle('Population at three H3 tiers — aperta cells / zones / regions',
+plt.suptitle('Population at both H3 layers — aperta cells / zones',
              y=1.02, fontsize=12)
 plt.tight_layout()
 plt.show()

@@ -242,10 +242,9 @@ print(f"Wrote calibrated graph + edge layer to {PREPARED_DIR}/.")
 # )
 # ```
 #
-# The same `.graphml` loads into NetworkX, igraph (via aperta's bridges),
-# r5py, and any custom Dijkstra implementation. Calibration is a one-time
-# step whose product is a standard graph file — downstream tooling is
-# the caller's choice.
+# The same `.graphml` loads into NetworkX, igraph, r5py, and any custom
+# Dijkstra implementation. Calibration is a one-time step whose product
+# is a standard graph file — downstream tooling is the caller's choice.
 
 
 # %% [markdown]
