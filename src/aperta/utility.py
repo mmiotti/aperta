@@ -136,7 +136,7 @@ def route_utility(
     utility: Utility,
     *,
     mask: TieredODPairs | None = None,
-    dtype: np.dtype | type = np.float64,
+    dtype: np.dtype | type = np.float32,
 ) -> TieredODPairs:
     """Compute the route-dependent components of utility for every OD pair.
 

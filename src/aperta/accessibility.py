@@ -145,7 +145,8 @@ def _stitched_weights(origin: int | str,
                       weights: TieredODPairs,
                       n_cell: int,
                       n_c2z: int,
-                      n_zone: int) -> np.ndarray:
+                      n_zone: int,
+                      dtype: np.dtype | type = np.float32) -> np.ndarray:
     """Stitch a single property's three-tier value arrays for one origin.
 
     Tiers that are `None` (or where the origin / zone has no entry) contribute
@@ -153,7 +154,7 @@ def _stitched_weights(origin: int | str,
     `_stitched_for`.
     """
     total = n_cell + n_c2z + n_zone
-    out = np.zeros(total, dtype=np.float64)
+    out = np.zeros(total, dtype=dtype)
     cell_w = weights.cells_to_cells.get(origin)
     if cell_w is not None and n_cell:
         out[:n_cell] = cell_w
@@ -171,6 +172,22 @@ def _stitched_weights(origin: int | str,
 def _origin_index_name(costs: TieredODPairs) -> str:
     """Output-DataFrame index name based on the input ODM's key space."""
     return 'cell' if isinstance(costs, TieredODGeoPairs) else 'node'
+
+
+def _sniff_dtype(costs: TieredODPairs) -> np.dtype:
+    """Return the dtype of the first non-empty per-tier cost array.
+
+    Used to make accessibility output dtype follow the input costs dtype
+    (FP32 by default, FP64 if the caller opted in upstream) without an
+    explicit kwarg on every accessibility function.
+    """
+    for tier in (costs.cells_to_cells, costs.cells_to_zones,
+                 costs.zones_to_zones):
+        if tier is None:
+            continue
+        for arr in tier.values():
+            return np.asarray(arr).dtype
+    return np.dtype(np.float32)
 
 
 @timeit
@@ -201,8 +218,9 @@ def count_in_bins(
 
     Returns:
         DataFrame indexed by origin key with `(bin_name, property_name)`
-        MultiIndex on columns. Order: bins outer, properties inner. Dtype:
-        float64.
+        MultiIndex on columns. Order: bins outer, properties inner. Dtype
+        follows the input `costs` ODM (FP32 by default, FP64 if the caller
+        opted in upstream).
 
     Per-cell overhead: for `TieredODGeoPairs` inputs, bake per-cell origin
     overhead into the cost ODM upfront via `overhead.add_origin_cell_overhead`.
@@ -211,7 +229,8 @@ def count_in_bins(
     origins = list(costs.cells_to_cells.keys())
     columns = pd.MultiIndex.from_product([[b.name for b in bins], prop_names],
                                          names=['bin', 'property'])
-    out = np.zeros((len(origins), len(bins) * len(prop_names)), dtype=np.float64)
+    dtype = _sniff_dtype(costs)
+    out = np.zeros((len(origins), len(bins) * len(prop_names)), dtype=dtype)
 
     for i, origin in enumerate(origins):
         stitched_cost, cell_sl, c2z_sl, zone_sl = _stitched_for(
@@ -221,10 +240,10 @@ def count_in_bins(
         n_zone = zone_sl.stop - zone_sl.start
         zone_key = cell_to_zone.get(origin)
 
-        prop_weights = np.empty((len(prop_names), len(stitched_cost)), dtype=np.float64)
+        prop_weights = np.empty((len(prop_names), len(stitched_cost)), dtype=dtype)
         for p, name in enumerate(prop_names):
             prop_weights[p] = _stitched_weights(origin, zone_key, weights[name],
-                                                n_cell, n_c2z, n_zone)
+                                                n_cell, n_c2z, n_zone, dtype=dtype)
 
         for b, bin_ in enumerate(bins):
             mask = (stitched_cost >= bin_.lo) & (stitched_cost < bin_.hi)
@@ -270,7 +289,8 @@ def gravity(
 
     Returns:
         DataFrame indexed by origin key with MultiIndex columns
-        `(decay, property)`. Dtype: float64.
+        `(decay, property)`. Dtype follows the input `costs` ODM
+        (FP32 by default, FP64 if the caller opted in upstream).
     """
     if isinstance(decays, Decay):
         decays = [decays]
@@ -283,7 +303,8 @@ def gravity(
     columns = pd.MultiIndex.from_product([decay_names, prop_names],
                                          names=['decay', 'property'])
     n_props = len(prop_names)
-    out = np.zeros((len(origins), len(decays) * n_props), dtype=np.float64)
+    dtype = _sniff_dtype(costs)
+    out = np.zeros((len(origins), len(decays) * n_props), dtype=dtype)
 
     for i, origin in enumerate(origins):
         stitched_cost, cell_sl, c2z_sl, zone_sl = _stitched_for(
@@ -293,10 +314,10 @@ def gravity(
         n_zone = zone_sl.stop - zone_sl.start
         zone_key = cell_to_zone.get(origin)
 
-        prop_weights = np.empty((n_props, len(stitched_cost)), dtype=np.float64)
+        prop_weights = np.empty((n_props, len(stitched_cost)), dtype=dtype)
         for p, name in enumerate(prop_names):
             prop_weights[p] = _stitched_weights(origin, zone_key, weights[name],
-                                                n_cell, n_c2z, n_zone)
+                                                n_cell, n_c2z, n_zone, dtype=dtype)
 
         finite_mask = np.isfinite(stitched_cost)
         if not finite_mask.any():
@@ -366,7 +387,9 @@ def nearest_k(
 
     Returns:
         DataFrame indexed by origin key with MultiIndex columns `(k, property)`.
-        Dtype: float64. NaN where the `k`-th opportunity is unreachable.
+        Dtype follows the input `costs` ODM (FP32 by default, FP64 if the
+        caller opted in upstream). NaN where the `k`-th opportunity is
+        unreachable.
     """
     if aggregator not in ('cost_mean', 'cost_at_k'):
         raise ValueError(
@@ -382,8 +405,9 @@ def nearest_k(
     origins = list(costs.cells_to_cells.keys())
     columns = pd.MultiIndex.from_product([ks, prop_names], names=['k', 'property'])
     n_props = len(prop_names)
-    out = np.full((len(origins), len(ks) * n_props), np.nan, dtype=np.float64)
-    ks_arr = np.asarray(ks, dtype=np.float64)
+    dtype = _sniff_dtype(costs)
+    out = np.full((len(origins), len(ks) * n_props), np.nan, dtype=dtype)
+    ks_arr = np.asarray(ks, dtype=dtype)
 
     for i, origin in enumerate(origins):
         stitched_cost, cell_sl, c2z_sl, zone_sl = _stitched_for(
@@ -393,10 +417,10 @@ def nearest_k(
         n_zone = zone_sl.stop - zone_sl.start
         zone_key = cell_to_zone.get(origin)
 
-        prop_weights = np.empty((n_props, len(stitched_cost)), dtype=np.float64)
+        prop_weights = np.empty((n_props, len(stitched_cost)), dtype=dtype)
         for p, name in enumerate(prop_names):
             prop_weights[p] = _stitched_weights(origin, zone_key, weights[name],
-                                                n_cell, n_c2z, n_zone)
+                                                n_cell, n_c2z, n_zone, dtype=dtype)
 
         finite_mask = np.isfinite(stitched_cost)
         if not finite_mask.any():

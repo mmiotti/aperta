@@ -423,15 +423,18 @@ def add_node_overheads(
             return None
         out: dict = {}
         for orig, cost_arr in cost_tier.items():
-            new_arr = np.asarray(cost_arr, dtype=np.float64).copy()
+            # Preserve input dtype (typically FP32 for cost ODMs) — silent
+            # FP64 upcast here would double memory for the whole result.
+            new_arr = np.asarray(cost_arr).copy()
+            dt = new_arr.dtype
             if origin_lu is not None:
-                new_arr = new_arr + float(origin_lu.get(orig, 0.0))
+                new_arr = new_arr + dt.type(origin_lu.get(orig, 0.0))
             if dest_lookup is not None and pair_tier is not None:
                 dest_ids = pair_tier.get(orig)
                 if dest_ids is not None:
                     dest_arr = np.fromiter(
-                        (float(dest_lookup.get(d, 0.0)) for d in dest_ids),
-                        dtype=np.float64, count=len(dest_ids))
+                        (dest_lookup.get(d, 0.0) for d in dest_ids),
+                        dtype=dt, count=len(dest_ids))
                     new_arr = new_arr + dest_arr
             out[orig] = new_arr
         return out
@@ -505,15 +508,18 @@ def add_geo_overheads(
             return None
         out: dict = {}
         for orig, cost_arr in cost_tier.items():
-            new_arr = np.asarray(cost_arr, dtype=np.float64).copy()
+            # Preserve input dtype (typically FP32 for cost ODMs) — silent
+            # FP64 upcast here would double memory for the whole result.
+            new_arr = np.asarray(cost_arr).copy()
+            dt = new_arr.dtype
             if origin_lookup is not None:
-                new_arr = new_arr + float(origin_lookup.get(orig, 0.0))
+                new_arr = new_arr + dt.type(origin_lookup.get(orig, 0.0))
             if dest_lookup is not None and pair_tier is not None:
                 dest_ids = pair_tier.get(orig)
                 if dest_ids is not None:
                     dest_arr = np.fromiter(
-                        (float(dest_lookup.get(d, 0.0)) for d in dest_ids),
-                        dtype=np.float64, count=len(dest_ids))
+                        (dest_lookup.get(d, 0.0) for d in dest_ids),
+                        dtype=dt, count=len(dest_ids))
                     new_arr = new_arr + dest_arr
             out[orig] = new_arr
         return out

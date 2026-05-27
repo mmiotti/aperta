@@ -700,6 +700,8 @@ def dest_values(
     cells: pd.DataFrame,
     node_column: str,
     zones: pd.DataFrame | None = None,
+    *,
+    dtype: np.dtype | type = np.float32,
 ) -> TieredODPairs:
     """Look up `column` for every destination in `pairs`, tier by tier.
 
@@ -711,6 +713,14 @@ def dest_values(
     consistently aggregated cells → zones, then for each origin cell `i` the sum
     of values across all three tiers equals the total of `cells[column]` within
     the routing cutoff (no double-counting across tiers).
+
+    Args:
+        column, pairs, cells, node_column, zones: see above.
+        dtype: dtype of returned value arrays (default `np.float32` —
+            matches the default for `routing.tiered_path_costs` so that
+            downstream accessibility arithmetic stays in FP32 end-to-end).
+            Missing destinations get `np.nan`, so `dtype` must be a float
+            dtype.
     """
     if column not in cells.columns:
         raise ValueError(f"`cells` is missing column {column!r}.")
@@ -725,7 +735,9 @@ def dest_values(
             raise ValueError(f"`zones` is missing column {column!r}.")
 
     def _lookup_for(d: dict, lookup: dict) -> dict:
-        return {origin: np.array([lookup.get(dest, np.nan) for dest in dests])
+        return {origin: np.fromiter(
+                    (lookup.get(dest, np.nan) for dest in dests),
+                    dtype=dtype, count=len(dests))
                 for origin, dests in d.items()}
 
     cells_lookup = _node_to_value_lookup(cells, node_column, column)
@@ -930,6 +942,8 @@ def dest_values_geo(
     pairs: TieredODGeoPairs,
     cells: pd.DataFrame,
     zones: pd.DataFrame | None = None,
+    *,
+    dtype: np.dtype | type = np.float32,
 ) -> TieredODGeoPairs:
     """Look up `column` for every destination in a geo-keyed `pairs`, per tier.
 
@@ -948,6 +962,11 @@ def dest_values_geo(
         cells: cell-level DataFrame indexed by `cell_id`.
         zones: optional zones DataFrame indexed by `zone_id`. Required iff
             `pairs.cells_to_zones` or `pairs.zones_to_zones` is set.
+        dtype: dtype of returned value arrays (default `np.float32` —
+            matches the default for `routing.tiered_path_costs` so
+            downstream accessibility arithmetic stays in FP32 end-to-end).
+            Missing destinations get `np.nan`, so `dtype` must be a float
+            dtype.
 
     Returns:
         `TieredODGeoPairs` of value arrays, paired position-wise with the
@@ -966,7 +985,9 @@ def dest_values_geo(
             raise ValueError(f"`zones` is missing column {column!r}.")
 
     def _lookup_for(d: dict, lookup: dict) -> dict:
-        return {origin: np.array([lookup.get(dest, np.nan) for dest in dests])
+        return {origin: np.fromiter(
+                    (lookup.get(dest, np.nan) for dest in dests),
+                    dtype=dtype, count=len(dests))
                 for origin, dests in d.items()}
 
     cells_lookup = cells[column].to_dict()
@@ -1140,6 +1161,17 @@ def aggregate_across_modes(
                     f"Tier {tier_name!r}: some modes populate it, others don't. "
                     f"Cross-modal aggregation requires consistent tier structure.")
             return None, None
+        # Inherit dtype from any populated per-mode cost array (FP32 by
+        # default after the costs/weights dtype convention; FP64 if the
+        # caller opted in). Fall back to FP32 if every mode-tier is empty.
+        dt: np.dtype = np.dtype(np.float32)
+        for c in per_mode_costs:
+            for arr in c.values():
+                dt = np.asarray(arr).dtype
+                break
+            else:
+                continue
+            break
         # Union of origin keys across modes.
         origin_union: set = set()
         for p in per_mode_pairs:
@@ -1155,20 +1187,20 @@ def aggregate_across_modes(
             if not dest_union:
                 continue
             dest_sorted = np.asarray(sorted(dest_union))
-            # Build per-mode aligned cost arrays.
+            # Build per-mode aligned cost arrays in the shared dtype.
             aligned = []
             for p, c in zip(per_mode_pairs, per_mode_costs):
                 if origin not in p:
-                    aligned.append(np.full(len(dest_sorted), np.inf, dtype=float))
+                    aligned.append(np.full(len(dest_sorted), np.inf, dtype=dt))
                     continue
                 # Build a {dest_id -> cost} lookup for this mode's per-origin
                 # entry, then look up each dest in the union.
                 mode_dests = p[origin]
-                mode_costs = np.asarray(c[origin], dtype=float)
+                mode_costs = np.asarray(c[origin], dtype=dt)
                 lookup = dict(zip(mode_dests.tolist(), mode_costs.tolist()))
                 aligned.append(np.fromiter(
                     (lookup.get(d, np.inf) for d in dest_sorted),
-                    dtype=float, count=len(dest_sorted)))
+                    dtype=dt, count=len(dest_sorted)))
             out_pairs[origin] = dest_sorted
             out_costs[origin] = _aggregate_modes_tier(aligned, aggregator, scale)
         return out_pairs, out_costs
@@ -1193,7 +1225,7 @@ def aggregate_across_modes(
 def get_euclidian_dists(
     nodes: pd.DataFrame | gpd.GeoDataFrame,
     pairs: TieredODPairs,
-    dtype: np.dtype | type = np.float64,
+    dtype: np.dtype | type = np.float32,
 ) -> TieredODPairs:
     """Euclidean origin→destination distance for every pair in `pairs`, per tier.
 

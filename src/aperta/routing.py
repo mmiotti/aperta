@@ -321,7 +321,7 @@ def tiered_path_costs(
     *,
     mask: TieredODPairs | None = None,
     cutoff: float | None = None,
-    dtype: np.dtype | type = np.float64,
+    dtype: np.dtype | type = np.float32,
 ) -> TieredODPairs:
     """Shortest-path cost (sum of edge `weight` along the path) for every OD pair
     in `pairs`, across all tiers.
@@ -361,8 +361,11 @@ def tiered_path_costs(
             cutoff are stored as `np.inf` — same convention as unreachable, so
             downstream metrics (`count_in_bins` etc.) handle them naturally.
             Default `None` = igraph backend (no cutoff).
-        dtype: dtype of returned cost arrays (default `np.float64`; pass
-            `context.config.DTYPE_COSTS` for `float32`).
+        dtype: dtype of returned cost arrays (default `np.float32` — halves
+            memory + on-disk size vs `float64`, with seconds-resolution
+            precision more than sufficient for travel costs). Pass
+            `np.float64` if downstream arithmetic needs the extra range
+            (e.g. logsum with very small scale parameter).
 
     Returns:
         `TieredODPairs` of cost arrays paired position-wise with `pairs`. Each
@@ -502,7 +505,7 @@ def tiered_path_costs_mp(
     *,
     mask: TieredODPairs | None = None,
     n_workers: int = 4,
-    dtype: np.dtype | type = np.float64,
+    dtype: np.dtype | type = np.float32,
 ) -> TieredODPairs:
     """Experimental: multi-process variant of `tiered_path_costs`.
 
@@ -693,7 +696,7 @@ def aggregate_along_paths(
     *,
     edge_aggregations: list[PathAggregation] = (),
     node_aggregations: list[NodeAggregation] = (),
-    dtype: np.dtype | type = np.float64,
+    dtype: np.dtype | type = np.float32,
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     """Walk realised paths and aggregate per-edge / per-node features along each.
 
@@ -726,7 +729,7 @@ def aggregate_along_paths(
         node_aggregations: list of `NodeAggregation` specs (per-node).
             At least one of `edge_aggregations` / `node_aggregations` must
             be non-empty. Names must be unique across both lists.
-        dtype: dtype of returned arrays (default `np.float64`).
+        dtype: dtype of returned arrays (default `np.float32`).
 
     Returns:
         `(costs, aggregations_by_name)`:
@@ -820,7 +823,7 @@ def tiered_path_aggregate(
     node_aggregations: list[NodeAggregation] = (),
     mask: TieredODPairs | None = None,
     cutoff: float | None = None,
-    dtype: np.dtype | type = np.float64,
+    dtype: np.dtype | type = np.float32,
 ) -> tuple[TieredODPairs, dict[str, TieredODPairs]]:
     """Route shortest paths and aggregate per-edge / per-node features along each.
 
@@ -1176,7 +1179,8 @@ def set_min_intrazonal_cost(
 
     new_cells_to_cells: dict = {}
     for origin, cost_arr in costs.cells_to_cells.items():
-        new_arr = np.asarray(cost_arr, dtype=np.float64).copy()
+        # Preserve input dtype (typically FP32).
+        new_arr = np.asarray(cost_arr).copy()
         floor = scalar_floor if scalar_floor is not None else cost_lookup.get(origin)
         if floor is None:
             new_cells_to_cells[origin] = new_arr
