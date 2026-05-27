@@ -30,9 +30,9 @@ def _chain_graph(n: int = 20, edge_len: float = 100.0,
     Each edge has `length=edge_len` and `speed_kph=speed_kph`. A random
     `slow_zone` (0 or 1) is assigned to each edge with probability
     `slow_zone_frac`. Chosen specifically so every origin-destination pair
-    has a *unique* shortest path — no ties for the calibration's igraph
-    backend vs the ground-truth nx backend to break differently
-    (a tie-breaker mismatch silently corrupts the recovered coefficients).
+    has a *unique* shortest path — tie-breaking between equally-optimal
+    paths is implementation-defined and would silently corrupt the
+    recovered coefficients.
     """
     rng = np.random.default_rng(seed)
     g = nx.MultiDiGraph(crs='EPSG:2056')
