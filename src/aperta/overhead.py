@@ -98,7 +98,6 @@ import numpy as np
 import pandas as pd
 
 from aperta.od_pairs import TieredODGeoPairs, TieredODPairs
-from aperta.utils import timeit
 
 
 def aggregate_dest_overhead_per_node(
@@ -265,7 +264,6 @@ def aggregate_dest_overhead_per_group_euclidean(
     )
 
 
-@timeit
 def aggregate_dest_overhead_per_group_routed(
     cells: pd.DataFrame,
     target_groups: pd.DataFrame,
@@ -380,7 +378,6 @@ def _as_lookup(x: pd.Series | dict | None) -> dict | None:
     return dict(x)
 
 
-@timeit
 def add_node_overheads(
     costs: TieredODPairs,
     pairs: TieredODPairs,
@@ -466,7 +463,6 @@ def add_node_overheads(
 # ---------------------------------------------------------------------------
 
 
-@timeit
 def add_geo_overheads(
     costs: TieredODGeoPairs,
     pairs: TieredODGeoPairs,

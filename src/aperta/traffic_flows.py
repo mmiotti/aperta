@@ -25,7 +25,7 @@ import numpy as np
 import pandas as pd
 from numba import njit
 
-from aperta import network_processing, utils
+from aperta import network_processing
 from aperta.od_pairs import TieredODPairs
 
 
@@ -119,7 +119,6 @@ def _zone_tier_dests_and_scores(
     return out
 
 
-@utils.timeit
 def nested_node_sample(
     pairs: TieredODPairs,
     weights: TieredODPairs,

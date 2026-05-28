@@ -17,8 +17,6 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 
-from aperta import utils
-
 
 def remove_duplicate_indices(df: pd.DataFrame) -> pd.DataFrame:
     """Remove duplicate indices from DataFrame or Series. Often useful after spatial join."""
@@ -136,7 +134,6 @@ def angular_diff_deg(a, b, undirected: bool = False):
     return diff
 
 
-@utils.timeit
 def sum_within_radius(
     gdf: gpd.GeoDataFrame,
     cols: list[str],
@@ -222,7 +219,6 @@ def sum_within_radius(
     return res
 
 
-@utils.timeit
 def cross_sum_within_radius(
     targets: gpd.GeoDataFrame | gpd.GeoSeries,
     sources: gpd.GeoDataFrame | gpd.GeoSeries,
@@ -307,7 +303,6 @@ def cross_sum_within_radius(
     return pd.Series(agg, index=targets.index, name=name)
 
 
-@utils.timeit
 def sample_raster_at_points(
     points: gpd.GeoDataFrame | gpd.GeoSeries,
     raster_path,

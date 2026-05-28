@@ -135,7 +135,6 @@ Runnable end-to-end version (with plotting): [examples/minimal/accessibility.ipy
 | `osm_helpers` | OSM data fetching + per-edge categorisation via `osmnx` (`fetch_network`, `fetch_pois`, `categorize_edges`). Requires `aperta[osm]`. |
 | `topography` | Copernicus GLO-30 DEM download + raster sampling (`fetch_copernicus_dem`). Requires `aperta[topo]`. |
 | `visualization` | Plot helpers — `plot_cell_values` (single-panel choropleth), `plot_cell_values_comparison` (multi-panel with shared scale), `plot_tiered_destinations` (origin-cell tier viz), `plot_edge_values` (LineCollection-based with sort/z-order control), `add_styled_colorbar`. |
-| `utils` | `timeit` decorator. |
 | `errors` | Aperta-specific exception types (`ContextError`, `DataError`, `ProcessingError`). |
 
 ## Design

@@ -46,6 +46,5 @@ topography
 :maxdepth: 1
 
 visualization
-utils
 errors
 ```

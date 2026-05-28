@@ -84,7 +84,6 @@ from aperta.routing import (
     tiered_path_aggregate,
     tiered_path_costs,
 )
-from aperta.utils import timeit
 
 
 class RouteFeature(NamedTuple):
@@ -132,7 +131,6 @@ class Utility:
     destination_features: dict[str, float] = field(default_factory=dict)
 
 
-@timeit
 def route_utility(
     pairs: TieredODPairs,
     graph: nx.Graph,
@@ -174,6 +172,7 @@ def route_utility(
     """
     has_route_features = len(utility.route_features) > 0
 
+    costs: TieredODPairs
     if has_route_features:
         path_aggs = [
             PathAggregation(name=rf.name, attribute=rf.attribute, aggregator=rf.aggregator)
@@ -251,7 +250,6 @@ def _origin_lookup(
     return df.set_index(node_column)[column].groupby(level=0).mean().to_dict()
 
 
-@timeit
 def add_endpoint_utility(
     route_utility: TieredODPairs,
     pairs: TieredODPairs,

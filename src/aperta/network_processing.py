@@ -30,7 +30,6 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 
-from aperta import utils
 from aperta.errors import DataError
 
 # OSM highway-type ranking used by `collapse_highway_lists_by_rank` and
@@ -135,7 +134,6 @@ def set_nx_edge_attributes_filled(
     return g
 
 
-@utils.timeit
 def get_nested_edge_betweenness(
     g: nx.Graph,
     nested_node_sample: dict,

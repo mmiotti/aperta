@@ -62,8 +62,6 @@ import pandas as pd
 from numba import njit
 from shapely.geometry import Point
 
-from aperta.utils import timeit
-
 
 @dataclass(frozen=True)
 class TieredODPairs:
@@ -436,7 +434,6 @@ def _mask_to_node_set(
     return set(sub[sub[node_column].notna()][node_column].unique().tolist())
 
 
-@timeit
 def get_pairs(
     cells: gpd.GeoDataFrame,
     r_cells: float,
@@ -453,9 +450,9 @@ def get_pairs(
     """Build a tiered OD-pair table with cells_to_cells + cells_to_zones +
     zones_to_zones tiers.
 
-    Tier classification uses ZONE-PAIR distance (for clean mutual exclusion):
+    Tier classification uses ZONE-PAIR distance (for clean mutual exclusion)::
 
-        d(Z, Z') < r_cells           → cells_to_cells (close)
+        d(Z, Z') < r_cells            → cells_to_cells (close)
         r_cells ≤ d(Z, Z') < r_medium → cells_to_zones (medium — cell origin, zone dest)
         r_medium ≤ d(Z, Z') < r_zones → zones_to_zones (far — zone origin, zone dest)
         else                          → drop
@@ -466,11 +463,9 @@ def get_pairs(
     the medium-tier radius — cell variation within a zone is ~10% of trip
     cost at ~10 km medium-tier distances.
 
-    Required input contract:
-        cells:   GeoDataFrame; `node_column` must give the network node for each
-                 cell (NaN cells contribute no destinations). If `zones` is given,
-                 also requires `zone_id` column.
-        zones:   if provided, must have `node_column`.
+    Input contract: `cells` must have `node_column` (and `zone_id` if `zones`
+    is given). `zones`, if provided, must also have `node_column`. NaN values
+    in `node_column` mean the cell / zone contributes no destinations.
 
     Args:
         cells: cell-level GeoDataFrame.
@@ -871,7 +866,6 @@ def _reindex_tier(
     return new_pairs, new_odm
 
 
-@timeit
 def reindex_by_geo_unit(
     pairs: TieredODNodePairs,
     odm: TieredODNodePairs | None,

@@ -45,7 +45,6 @@ import pandas as pd
 
 from aperta.errors import DataError
 from aperta.od_pairs import TieredODNodePairs, TieredODPairs
-from aperta.utils import timeit
 
 # ---------------------------------------------------------------------------
 # Edge weighting
@@ -361,7 +360,6 @@ def _aggregate(values: np.ndarray, weights: np.ndarray, agg: str, feature: str) 
 # ---------------------------------------------------------------------------
 
 
-@timeit
 def tiered_path_costs(
     pairs: TieredODPairs,
     graph: nx.Graph,
@@ -701,7 +699,6 @@ def aggregate_along_paths(
     return costs, aggs
 
 
-@timeit
 def tiered_path_aggregate(
     pairs: TieredODPairs,
     graph: nx.Graph,
@@ -863,7 +860,6 @@ def tiered_path_aggregate(
     return costs, aggregations_by_name
 
 
-@timeit
 def add_trip_overhead(
     pairs: TieredODPairs,
     costs: TieredODPairs,
@@ -877,12 +873,12 @@ def add_trip_overhead(
     """Add per-trip origin and/or destination overhead to each OD pair's cost.
 
     For each (origin_node, dest_node) pair in `costs` (paired position-wise with
-    `pairs`), the returned cost is:
+    `pairs`), the returned cost is::
 
         new_cost = old_cost + origin_overhead(info_o.loc[orig])
                             + dest_overhead (info_d.loc[dest])
 
-    where the info dataframe depends on the tier and the endpoint side:
+    where the info dataframe depends on the tier and the endpoint side::
 
         cells_to_cells:    info_o = cell_info,   info_d = cell_info
         cells_to_zones:    info_o = cell_info,   info_d = zone_info
@@ -895,7 +891,8 @@ def add_trip_overhead(
     which is which, just looks up by node ID and hands the row(s) to the
     callback.
 
-    When multiple units share a node (typical for cells), aggregate upstream:
+    When multiple units share a node (typical for cells), aggregate upstream::
+
         cell_info = (cells.groupby('node_id_nw').agg({
                         'dist_to_node': 'mean',
                         'population': 'sum',

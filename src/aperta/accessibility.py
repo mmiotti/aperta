@@ -64,7 +64,6 @@ import numpy as np
 import pandas as pd
 
 from aperta.od_pairs import TieredODGeoPairs, TieredODPairs
-from aperta.utils import timeit
 
 
 def _require_cell_tier(costs: TieredODPairs) -> dict:
@@ -203,7 +202,6 @@ def _sniff_dtype(costs: TieredODPairs) -> np.dtype:
     return np.dtype(np.float32)
 
 
-@timeit
 def count_in_bins(
     costs: TieredODPairs,
     weights: dict[str, TieredODPairs],
@@ -274,7 +272,6 @@ def count_in_bins(
     )
 
 
-@timeit
 def gravity(
     costs: TieredODPairs,
     weights: dict[str, TieredODPairs],
@@ -285,11 +282,12 @@ def gravity(
     `f(cost)`, over all destinations — for one or more decay specs in a single
     call.
 
-    For each origin `i`, each property `w`, and each decay spec `f`:
+    For each origin `i`, each property `w`, and each decay spec `f`::
+
         A_i^{f,w} = Σ_j w_j · f(cost_ij)
 
     Multiple decay specs share the per-OD stitching, so calling with a list of
-    `Decay`s is much cheaper than calling once per spec — useful for sensitivity
+    `Decay` specs is much cheaper than calling once per spec — useful for sensitivity
     analyses across decay-coefficient ranges.
 
     For utility-based accessibility, pass the per-OD utility values as the cost
@@ -299,7 +297,7 @@ def gravity(
 
     Args:
         costs, weights, cell_to_zone: see `count_in_bins`.
-        decays: a single `Decay` or list of `Decay`s. Output columns are
+        decays: a single `Decay` or list of `Decay` specs. Output columns are
             MultiIndex `(decay_name, property_name)` with decay names outer.
 
     Returns:
@@ -358,7 +356,6 @@ def gravity(
     )
 
 
-@timeit
 def nearest_k(
     costs: TieredODPairs,
     weights: dict[str, TieredODPairs],
