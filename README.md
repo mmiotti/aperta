@@ -1,6 +1,9 @@
 # aperta
 
 [![tests](https://github.com/mmiotti/aperta/actions/workflows/test.yml/badge.svg)](https://github.com/mmiotti/aperta/actions/workflows/test.yml)
+[![docs](https://readthedocs.org/projects/aperta/badge/?version=latest)](https://aperta.readthedocs.io/en/latest/)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![license](https://img.shields.io/github/license/mmiotti/aperta.svg)](LICENSE)
 
 A Python toolkit for **accessibility analysis on multimodal transport networks** — routing, distance/time computation, and gravity-/utility-/logsum-based accessibility metrics on `networkx` graphs (routed via `scipy.sparse.csgraph`).
 
