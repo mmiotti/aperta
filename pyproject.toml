@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aperta"
 version = "0.1.0a0"
-description = "Python toolkit for accessibility analysis on multimodal transport networks."
+description = "Python toolkit for cross-modal accessibility analysis on transport networks."
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}

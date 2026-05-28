@@ -1,5 +1,5 @@
 """
-aperta — accessibility analysis on multimodal transport networks.
+aperta — cross-modal accessibility analysis on transport networks.
 
 The library is organized around a six-phase workflow:
 

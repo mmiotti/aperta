@@ -5,15 +5,13 @@
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![license](https://img.shields.io/github/license/mmiotti/aperta.svg)](LICENSE)
 
-A Python toolkit for **accessibility analysis on multimodal transport networks** — routing, distance/time computation, and gravity-/utility-/logsum-based accessibility metrics on `networkx` graphs (routed via `scipy.sparse.csgraph`).
+A Python toolkit for **cross-modal accessibility analysis on transport networks** — routing, distance/time computation, and gravity-/utility-/logsum-based accessibility metrics on `networkx` graphs (routed via `scipy.sparse.csgraph`).
 
-The name is Latin/Italian for *open*.
+The name is Latin/Italian for *open* — the condition that accessibility, at root, measures.
 
 ## Status
 
 **Pre-1.0, alpha.** Published alongside a toolkit paper (in submission). APIs may change without notice until v1.0.
-
-The boundary rule for what belongs in aperta: *if the code could run 1:1 on a different country's data, it goes here. Filesystem layout, project conventions, and specific input schemas belong in an application repo built on top.*
 
 ## Install
 
@@ -65,7 +63,7 @@ The extended example splits its prep across five notebooks and its analysis acro
 Runnable examples, in increasing depth:
 
 - [examples/minimal/accessibility.ipynb](examples/minimal/accessibility.ipynb) — what aperta does in ~40 lines using only OpenStreetMap. Cambridge MA, ~10 s.
-- [examples/walkthrough/accessibility.ipynb](examples/walkthrough/accessibility.ipynb) — guided tour of every primitive; multi-modal walk + bike, cross-modal logsum, path-first per-edge feature aggregation. Central Paris, ~1 min end-to-end.
+- [examples/walkthrough/accessibility.ipynb](examples/walkthrough/accessibility.ipynb) — guided tour of every primitive; walking + cycling, cross-modal logsum, path-first per-edge feature aggregation. Central Paris, ~1 min end-to-end.
 - [examples/extended/](examples/extended/) — production-scale Bern + 25 km: prep pipeline, calibration against observed travel times, traffic-flow estimation, accessibility analysis. ~30 min.
 
 The toy-world end-to-end test in [tests/test_workflow.py](tests/test_workflow.py) doubles as the smallest possible walk-through (~150 lines, runs in a second).
@@ -141,14 +139,22 @@ Runnable end-to-end version (with plotting): [examples/minimal/accessibility.ipy
 
 What aperta is:
 
-- **Path-first.** Every routing call returns the realised route alongside the OD travel cost as a single primitive. Per-edge features (gradient, perceived safety, surface type) can be aggregated along the realised route in the same pass — the architectural prerequisite for utility-based accessibility, logsum, and route-aware exposure analyses.
+- **Path-first.** Every routing call returns the realised route alongside the OD travel cost as a single primitive — so any per-edge or per-node attribute (gradient, perceived safety, surface type, air-pollution exposure, road stress, ...) can be aggregated along each route in the same pass. This is the architectural prerequisite for utility-based travel costs, logsum accessibility, joint accessibility-and-exposure assessment, route-aware infrastructure-quality metrics, and any other analysis that depends on what happens *along* the route, not just at its endpoints.
+- **Cross-modal.** Mode and network are orthogonal: one network per mode, where "mode" generalises to any independently-varying network — walking vs cycling vs driving, but also day-time vs night-time street access, congested vs free-flow edge weights, with vs without a proposed bike-lane scenario. Cross-mode aggregation (`min`, `logsum`) over per-network cost ODMs is a first-class operation. Logsum aggregation closes the utility loop — discrete-choice-consistent accessibility across modes from per-mode utilities.
 - **Multi-scale by construction.** The tiered cells / zones / three-distance-tier OD structure bounds per-origin computation independently of the network's geographic extent. Country-scale reach without country-scale destination counts; intermediate cost matrices stay small enough to persist to disk and share.
-- **Live-graph routing.** Shortest paths run on the graph directly via `scipy.sparse.csgraph.dijkstra` — no precomputed routing index. Per-query routing is slower than contraction-hierarchy-based tools (OSRM, Pandana), but edge-weight changes are immediate, which is what makes iterative calibration, traffic-flow estimation, and scenario comparison practical. Edge weights are written by plain Python callables; no Lua / YAML / JSON profile format to learn.
+- **Live-graph routing.** Shortest paths run on the graph directly via `scipy.sparse.csgraph.dijkstra` — no precomputed routing index. Per-query routing is slower than contraction-hierarchy-based tools (OSRM, Pandana/pandarm), but edge-weight changes are immediate, which is what makes iterative calibration, traffic-flow estimation, and scenario comparison practical. Edge weights are written by plain Python callables; no Lua / YAML / JSON profile format to learn.
 
 What aperta is not:
 
 - **No filesystem assumptions.** Algorithm functions take plain `networkx` graphs, `pandas` / `geopandas` frames, and `numpy` arrays. They don't read or write files.
 - **No DAG engine, no global state.** No caching, no dependency tracking, no orchestration. Every function takes its inputs explicitly. For DAG features, layer [DVC](https://dvc.org/) or [Snakemake](https://snakemake.readthedocs.io/) on top.
+
+## Interoperability with other accessibility tools
+
+Aperta deliberately doesn't try to do everything in-house. Two interoperability patterns are worth flagging:
+
+- **Public transit via R5.** Aperta has no native public-transit support right now (no GTFS reader, no RAPTOR-style time-dependent routing). Anything that can be expressed as a `networkx` graph with appropriate edge weights — including simplified transit-as-graph models — will route in aperta like any other network. For full GTFS-based transit routing (calendars, transfers, frequency-based services), the pragmatic pattern is to compute the transit OD cost matrix with [R5](https://github.com/conveyal/r5) (via [r5py](https://r5py.readthedocs.io/)), align its origins/destinations to the same cell layer aperta uses, and feed the resulting per-mode cost ODM into `od_pairs.aggregate_across_modes` alongside the walk / cycle / car ODMs computed by aperta. The cross-modal aggregation proceeds identically whether each per-mode ODM came from aperta's router or elsewhere.
+- **Faster cost-only routing via Pandana/pandarm.** Aperta's live-graph routing is the right trade-off for path-first, iterative, and scenario-comparative workloads, but for one-shot cost-only accessibility on a large fixed network, contraction-hierarchy backends like [Pandana](https://udst.github.io/pandana/) (and its recent modernized fork pandarm) route faster per query. The calibrated edge weights produced by `calibration.calibrate_edge_weights` are plain per-edge attributes on the `networkx` graph and transfer cleanly to a Pandana/pandarm network built from the same OSM extract — i.e., you can calibrate edge weights in aperta and then route with them in Pandana/pandarm.
 
 ## Contributing
 
@@ -156,36 +162,49 @@ Internal repository for now. External contributions will open after the toolkit-
 
 ## Editing notebooks
 
-Notebook outputs (matplotlib figures, dataframe HTML, etc.) bloat git
-quickly — a single Bern map can be 2 MB of embedded PNGs. This repo
-uses [`nbstripout`](https://github.com/kynan/nbstripout) as a clean
-filter to strip output cells on commit. The filter is declared in
-[`.gitattributes`](.gitattributes); to activate it in your local clone,
-run once after cloning:
+Notebooks here are **jupytext-paired**: each `.ipynb` has a `.py` shadow
+under the same basename. Edits in either form propagate to the other via
+`jupytext --sync <file>`. The `.py` shadow is the human-readable form for
+code review; the `.ipynb` carries the executed outputs.
+
+Two pieces of automation handle the friction. Both need to be activated
+once per local clone:
 
 ```bash
+# 1. Auto-sync .py <-> .ipynb on every commit (jupytext via pre-commit).
+pip install pre-commit
+pre-commit install
+
+# 2. Strip outputs from non-example notebooks on commit
+#    (keeps git history clean; example notebooks are exempt and ship
+#    with their outputs intact so figures render on GitHub).
 pip install nbstripout
 nbstripout --install
 ```
 
-The filter then runs transparently on every commit — `git diff` and
-`git log` on .ipynb files show only code + markdown changes.
+After this setup:
 
-**Exception**: notebooks under [`examples/`](examples/) are exempt from
-the filter and ship with their outputs intact, so figures render
-directly on GitHub. Before committing changes to an example notebook,
-execute it end-to-end (in VSCode / Jupyter, or via
-`jupytext --sync --execute <file>`) so the committed outputs reflect
-the current code.
+- Edit either the `.py` or the `.ipynb` — the pre-commit hook keeps the
+  pair in sync (if your commit changes only one side, the hook updates
+  the other and asks you to re-stage).
+- `git diff` and `git log` on non-example `.ipynb` files show only code
+  and markdown changes (outputs stripped by `nbstripout`).
+- Notebooks under [`examples/`](examples/) are exempt from output-stripping
+  via [`.gitattributes`](.gitattributes) and ship with their executed
+  outputs intact. Before committing changes to an example notebook,
+  execute it end-to-end (in VSCode / Jupyter, or via
+  `jupytext --sync --execute <file>`) so the committed outputs reflect
+  the current code.
 
-Notebooks here are jupytext-paired: each `.ipynb` has a `.py` shadow
-under the same basename. Edits in either form propagate to the other
-via `jupytext --sync <file>`. The `.py` shadow is the human-readable
-form for code review; the `.ipynb` carries the executed outputs.
+If you skip the `nbstripout --install` step, your commits to non-example
+notebooks will include output cells (large diffs, slow GitHub renders).
+If you skip the `pre-commit install` step, you'll need to run
+`jupytext --sync` manually after notebook edits so the `.py` and `.ipynb`
+don't drift apart. Both are one-time setups; install them.
 
-If you skip the `nbstripout --install` step, your commits to non-
-example notebooks will include output cells (large diffs, slow GitHub
-renders). Just install it.
+## Acknowledgments
+
+Aperta was developed at the [Chair of Ecological Systems Design](https://esd.ifu.ethz.ch/) at [ETH Zurich](https://ethz.ch) in the context of the [BlueCity](https://www.epfl.ch/schools/enac/blue-city-project/) project and [LUMOS](https://csfm.ethz.ch/en/research/projects/lumos.html).
 
 ## License
 

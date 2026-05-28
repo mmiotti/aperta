@@ -4,7 +4,7 @@ hide-toc: true
 
 # aperta
 
-**Path-first, multi-modal accessibility analysis on transport networks.**
+**Path-first, cross-modal accessibility analysis in Python.**
 
 A Python library for routing, distance/time computation, and gravity- /
 utility- / logsum-based accessibility metrics on

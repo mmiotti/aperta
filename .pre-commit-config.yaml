@@ -1,0 +1,18 @@
+# Pre-commit hooks. Install once per clone:
+#     pip install pre-commit
+#     pre-commit install
+#
+# After install, the configured hooks run automatically on every `git commit`.
+# Run on demand:
+#     pre-commit run --all-files
+
+repos:
+  # Keep jupytext-paired .py / .ipynb files in sync. After install, editing
+  # either side and committing will auto-update the other side and re-stage
+  # the change, so the two never drift.
+  - repo: https://github.com/mwouts/jupytext
+    rev: v1.17.1
+    hooks:
+      - id: jupytext
+        args: [--sync]
+        files: ^examples/.*\.(py|ipynb)$
