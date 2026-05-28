@@ -1,31 +1,28 @@
-import logging
+"""Geometric and raster-sampling utilities used across aperta.
+
+Two broad concerns:
+
+1. **Geometric helpers** — building hectare / H3 grids, generating point or
+   polygon geometries from coordinate data, projecting between coordinate
+   reference systems, computing per-cell spatial neighborhoods. Distinct
+   from `geo_mapping`, which is specifically about mapping data between
+   geo units.
+
+2. **Raster sampling** — `sample_raster_at_points` reads values from a
+   raster file at given point coordinates (used for elevation lookups in
+   `topography.py`). Requires the optional `topo` extra (`rasterio`).
+"""
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-import shapely
-from pyproj import Transformer
 
 from aperta import utils
 
 
-def get_hectare_geometries(df: pd.DataFrame, crs: str) -> gpd.GeoSeries:
-    """Get 100m hectare square geometries.
-
-    `crs` is the CRS of the (x, y) coordinates in `df.index` (e.g. 'EPSG:2056' for
-    Swiss LV95). Library function — does not assume a particular country/CRS key.
-    """
-    geom = gpd.points_from_xy(
-        df.index.get_level_values(0),
-        df.index.get_level_values(1),
-        crs=crs,
-    ).buffer(50, cap_style=3)
-    return geom
-
-
 def remove_duplicate_indices(df: pd.DataFrame) -> pd.DataFrame:
     """Remove duplicate indices from DataFrame or Series. Often useful after spatial join."""
-    df = df.loc[~df.index.duplicated(keep='first'), :]
+    df = df.loc[~df.index.duplicated(keep="first"), :]
     return df
 
 
@@ -37,7 +34,7 @@ def _line_segments(line) -> np.ndarray | None:
     """
     if line is None or line.is_empty:
         return None
-    parts = list(line.geoms) if hasattr(line, 'geoms') else [line]
+    parts = list(line.geoms) if hasattr(line, "geoms") else [line]
     rows = []
     for part in parts:
         if part is None or part.is_empty:
@@ -58,13 +55,13 @@ def _bearing_at(segs: np.ndarray, dist_along: float) -> float:
     seg_lens = segs[:, 2]
     total = seg_lens.sum()
     if total == 0:
-        return float('nan')
+        return float("nan")
     pos = max(0.0, min(float(dist_along), total))
-    i = int(np.searchsorted(np.cumsum(seg_lens), pos, side='right'))
+    i = int(np.searchsorted(np.cumsum(seg_lens), pos, side="right"))
     i = min(i, len(seg_lens) - 1)
     dx, dy = segs[i, 0], segs[i, 1]
     if dx == 0 and dy == 0:
-        return float('nan')
+        return float("nan")
     return float(np.degrees(np.arctan2(dx, dy)) % 360.0)
 
 
@@ -88,13 +85,14 @@ def line_bearings_deg(geoms: gpd.GeoSeries) -> pd.Series:
     error. Degenerate or empty geometries (no length, missing, or fewer than 2
     vertices) return `NaN`.
     """
+
     def _bearing(line) -> float:
         segs = _line_segments(line)
         if segs is None:
-            return float('nan')
+            return float("nan")
         return _bearing_at(segs, segs[:, 2].sum() / 2)
 
-    return pd.Series([_bearing(g) for g in geoms], index=geoms.index, dtype='float64')
+    return pd.Series([_bearing(g) for g in geoms], index=geoms.index, dtype="float64")
 
 
 def line_segment_bearing_at(line, dist_along: float) -> float:
@@ -111,67 +109,8 @@ def line_segment_bearing_at(line, dist_along: float) -> float:
     """
     segs = _line_segments(line)
     if segs is None:
-        return float('nan')
+        return float("nan")
     return _bearing_at(segs, dist_along)
-
-
-def add_lat_lon(
-    df: pd.DataFrame,
-    prefix: str,
-    from_crs: str,
-    to_crs: str = 'EPSG:4326',
-) -> pd.DataFrame:
-    """Add `<prefix>_lat` and `<prefix>_lon` columns by transforming `<prefix>_x/y`."""
-    transformer = Transformer.from_crs(from_crs, to_crs)
-    lat, lon = transformer.transform(df[f'{prefix}_x'].to_numpy(),
-                                     df[f'{prefix}_y'].to_numpy())
-    df[f'{prefix}_lat'] = lat
-    df[f'{prefix}_lon'] = lon
-    return df
-
-
-def add_straight_line_dist(
-    df: pd.DataFrame,
-    orig_prefix: str = 'orig',
-    dest_prefix: str = 'dest',
-    out_col: str = 'dist_line',
-) -> pd.DataFrame:
-    """Add euclidean origin→destination distance, in CRS units (typically metres)."""
-    dx = df[f'{orig_prefix}_x'] - df[f'{dest_prefix}_x']
-    dy = df[f'{orig_prefix}_y'] - df[f'{dest_prefix}_y']
-    df[out_col] = np.hypot(dx, dy)
-    return df
-
-
-def simplify_geometry(
-    geometry: shapely.LineString,
-    target_size: int,
-    maximum_size: int,
-    max_precision_m: float = 10.0,
-    min_precision_m: float = 250.0,
-) -> tuple[shapely.LineString, int, float]:
-    """Simplify `geometry` toward `target_size` vertices using a per-line precision.
-
-    Returns `(simplified, new_size, new_size / old_size)`. Precision is bounded
-    between `max_precision_m` and `min_precision_m`. Logs a warning if the
-    result still exceeds `maximum_size`.
-
-    Assumes input is in a lat/lon CRS (EPSG:4326). Uses the 0.00001-degree ≈ 1 m
-    approximation appropriate for central-European latitudes.
-    """
-    old_size = len(geometry.xy[0])
-    total_length_m_approx = geometry.length / 0.00001
-    target_precision_m = max(
-        max_precision_m, min(total_length_m_approx / target_size, min_precision_m)
-    )
-    precision = 0.00001 * target_precision_m
-    new_geometry = geometry.simplify(precision)
-    new_size = len(new_geometry.xy[0])
-    if new_size > maximum_size:
-        logging.warning(
-            f"Could not reduce geometry to target size with precision "
-            f"{precision:.5f}: {maximum_size} ({new_size:,})")
-    return new_geometry, new_size, new_size / old_size
 
 
 def angular_diff_deg(a, b, undirected: bool = False):
@@ -233,8 +172,7 @@ def sum_within_radius(
     from scipy.spatial import KDTree
 
     centroids = gdf.geometry.centroid
-    xy = np.column_stack([centroids.x.to_numpy(dtype=float),
-                          centroids.y.to_numpy(dtype=float)])
+    xy = np.column_stack([centroids.x.to_numpy(dtype=float), centroids.y.to_numpy(dtype=float)])
     tree = KDTree(xy)
     idx_lists = tree.query_ball_point(xy, r=radius)
 
@@ -242,10 +180,8 @@ def sum_within_radius(
     # of cell i (within `radius`, inclusive of i itself). `adj @ values`
     # then computes per-cell spatial sums in one vectorised pass.
     n = len(gdf)
-    row_lens = np.fromiter((len(nbrs) for nbrs in idx_lists),
-                           dtype=np.int64, count=n)
-    cols_idx = np.concatenate([np.asarray(nbrs, dtype=np.int64)
-                               for nbrs in idx_lists])
+    row_lens = np.fromiter((len(nbrs) for nbrs in idx_lists), dtype=np.int64, count=n)
+    cols_idx = np.concatenate([np.asarray(nbrs, dtype=np.int64) for nbrs in idx_lists])
     rows = np.repeat(np.arange(n, dtype=np.int64), row_lens)
     data = np.ones(len(rows), dtype=float)
     adj = csr_matrix((data, (rows, cols_idx)), shape=(n, n), dtype=float)
@@ -254,10 +190,9 @@ def sum_within_radius(
     spatial_sums = np.asarray(adj @ values)
 
     res = pd.DataFrame(index=gdf.index)
-    circular_area_km2 = (np.pi * radius ** 2) / 1e6
+    circular_area_km2 = (np.pi * radius**2) / 1e6
     out_values = spatial_sums / circular_area_km2 if return_densities else spatial_sums
-    df = pd.DataFrame(out_values, index=gdf.index,
-                      columns=[f'{col}_r{radius}' for col in cols])
+    df = pd.DataFrame(out_values, index=gdf.index, columns=[f"{col}_r{radius}" for col in cols])
     res = res.join(df)
 
     if add_filled_densities:
@@ -268,7 +203,8 @@ def sum_within_radius(
         cell_areas_km2 = gdf.geometry.area.to_numpy(dtype=float) / 1e6
         if len(np.unique(cell_areas_km2.round(decimals=4))) > 1:
             raise NotImplementedError(
-                "Cells must currently be same size to calculate filled densities.")
+                "Cells must currently be same size to calculate filled densities."
+            )
         is_filled = (gdf[cols].sum(axis=1) > 0).to_numpy()
         # `adj @ is_filled` = per-cell count of filled neighbours.
         n_filled_neighbours = np.asarray(adj @ is_filled.astype(float))
@@ -278,8 +214,8 @@ def sum_within_radius(
         filled_values[f, :] = filled_values[f, :] / fill_cell_areas[f, np.newaxis]
         filled_values[~f, :] = 0
         df_filled = pd.DataFrame(
-            filled_values, index=gdf.index,
-            columns=[f'{col}_r{radius}_filled' for col in cols])
+            filled_values, index=gdf.index, columns=[f"{col}_r{radius}_filled" for col in cols]
+        )
         res = res.join(df_filled)
 
     res = res.fillna(0)
@@ -294,7 +230,7 @@ def cross_sum_within_radius(
     *,
     weight_column: str | None = None,
     return_density: bool = False,
-    name: str = 'aggregate',
+    name: str = "aggregate",
 ) -> pd.Series:
     """Cross-set neighbourhood sum: for each target geometry, count source
     geometries (or sum a `weight_column` over them) within `radius` of the
@@ -336,11 +272,13 @@ def cross_sum_within_radius(
     from scipy.spatial import KDTree
 
     src_centroids = sources.geometry.centroid
-    src_xy = np.column_stack([src_centroids.x.to_numpy(dtype=float),
-                              src_centroids.y.to_numpy(dtype=float)])
+    src_xy = np.column_stack(
+        [src_centroids.x.to_numpy(dtype=float), src_centroids.y.to_numpy(dtype=float)]
+    )
     tgt_centroids = targets.geometry.centroid
-    tgt_xy = np.column_stack([tgt_centroids.x.to_numpy(dtype=float),
-                              tgt_centroids.y.to_numpy(dtype=float)])
+    tgt_xy = np.column_stack(
+        [tgt_centroids.x.to_numpy(dtype=float), tgt_centroids.y.to_numpy(dtype=float)]
+    )
     tree = KDTree(src_xy)
 
     if weight_column is None:
@@ -351,21 +289,21 @@ def cross_sum_within_radius(
             dtype=float,
         )
     else:
-        if (not isinstance(sources, gpd.GeoDataFrame)
-                or weight_column not in sources.columns):
+        if not isinstance(sources, gpd.GeoDataFrame) or weight_column not in sources.columns:
             raise ValueError(
                 f"`sources` must be a GeoDataFrame containing column "
-                f"{weight_column!r} when `weight_column` is given.")
+                f"{weight_column!r} when `weight_column` is given."
+            )
         weights = sources[weight_column].to_numpy(dtype=float)
         idx_lists = tree.query_ball_point(tgt_xy, r=radius)
         agg = np.fromiter(
-            (float(weights[idxs].sum()) if len(idxs) else 0.0
-             for idxs in idx_lists),
-            dtype=float, count=len(idx_lists),
+            (float(weights[idxs].sum()) if len(idxs) else 0.0 for idxs in idx_lists),
+            dtype=float,
+            count=len(idx_lists),
         )
 
     if return_density:
-        agg = agg / (np.pi * radius ** 2)
+        agg = agg / (np.pi * radius**2)
     return pd.Series(agg, index=targets.index, name=name)
 
 
@@ -375,8 +313,8 @@ def sample_raster_at_points(
     raster_path,
     *,
     band: int = 1,
-    method: str = 'bilinear',
-    name: str = 'raster_value',
+    method: str = "bilinear",
+    name: str = "raster_value",
 ) -> pd.Series:
     """Sample raster values at point centroids — vectorized, single-pass.
 
@@ -435,24 +373,23 @@ def sample_raster_at_points(
     cols_f, rows_f = inv_transform * (xs, ys)
 
     out = np.full(len(points), np.nan, dtype=float)
-    if method == 'nearest':
+    if method == "nearest":
         cols = np.floor(cols_f).astype(int)
         rows = np.floor(rows_f).astype(int)
         valid = (cols >= 0) & (cols < width) & (rows >= 0) & (rows < height)
         if valid.any():
             out[valid] = arr[rows[valid], cols[valid]]
-    elif method == 'bilinear':
+    elif method == "bilinear":
         from scipy.ndimage import map_coordinates
+
         # `map_coordinates` expects (row, col) at pixel CENTRES (an integer
         # coord = that pixel's centre). Subtract 0.5 to convert from corner-
         # based pixel coords. mode='constant', cval=nan returns NaN out-of-
         # bounds; NaN inputs propagate to NaN outputs via the weighted sum.
-        valid = ((cols_f >= 0) & (cols_f <= width)
-                 & (rows_f >= 0) & (rows_f <= height))
+        valid = (cols_f >= 0) & (cols_f <= width) & (rows_f >= 0) & (rows_f <= height)
         if valid.any():
             coords = np.vstack([rows_f[valid] - 0.5, cols_f[valid] - 0.5])
-            out[valid] = map_coordinates(arr, coords, order=1,
-                                         mode='constant', cval=np.nan)
+            out[valid] = map_coordinates(arr, coords, order=1, mode="constant", cval=np.nan)
     else:
         raise ValueError(f"method must be 'bilinear' or 'nearest', got {method!r}")
 
@@ -463,9 +400,9 @@ def build_h3_grid(
     polygon,
     resolution: int,
     *,
-    polygon_crs: str = 'EPSG:4326',
+    polygon_crs: str = "EPSG:4326",
     target_crs: str | None = None,
-    id_column: str = 'cell_id',
+    id_column: str = "cell_id",
 ) -> gpd.GeoDataFrame:
     """Build a GeoDataFrame of H3 hex cells covering `polygon`.
 
@@ -474,10 +411,10 @@ def build_h3_grid(
     input polygon is reprojected if `polygon_crs != 'EPSG:4326'`, and the
     output is optionally reprojected to `target_crs`.
 
-    For nested tiers (e.g. cells at H3 res 10, zones at res 8, regions at
-    res 6 — a common multi-scale convention), call once per resolution OR
-    derive the coarser tiers by `h3.cell_to_parent` on the finest tier
-    (cheaper, and the nesting is exact). Pure replacement of the private
+    For nested tiers (e.g. cells at H3 res 10, zones at res 8), call once
+    per resolution OR derive the coarser tier by `h3.cell_to_parent` on the
+    finer one (cheaper, and the nesting is exact). Pure replacement of the
+    private
     `_h3_cells_for_polygon` / `_h3_cell_to_polygon` helpers seen across
     aperta example notebooks.
 
@@ -495,27 +432,24 @@ def build_h3_grid(
     import h3
     from shapely.geometry import Polygon as ShPolygon
 
-    if polygon_crs != 'EPSG:4326':
-        polygon = gpd.GeoSeries([polygon], crs=polygon_crs).to_crs('EPSG:4326').iloc[0]
+    if polygon_crs != "EPSG:4326":
+        polygon = gpd.GeoSeries([polygon], crs=polygon_crs).to_crs("EPSG:4326").iloc[0]
 
-    parts = (list(polygon.geoms) if polygon.geom_type == 'MultiPolygon'
-             else [polygon])
+    parts = list(polygon.geoms) if polygon.geom_type == "MultiPolygon" else [polygon]
     cell_ids: list[str] = []
     for part in parts:
         # shapely uses (lng, lat); H3 wants (lat, lng).
         exterior = [(lat, lng) for lng, lat in part.exterior.coords]
-        interiors = [[(lat, lng) for lng, lat in ring.coords]
-                     for ring in part.interiors]
+        interiors = [[(lat, lng) for lng, lat in ring.coords] for ring in part.interiors]
         h3_poly = h3.LatLngPoly(exterior, *interiors)
         cell_ids.extend(h3.h3shape_to_cells(h3_poly, resolution))
 
     cell_ids = sorted(set(cell_ids))
-    geoms = [ShPolygon([(lng, lat) for lat, lng in h3.cell_to_boundary(c)])
-             for c in cell_ids]
+    geoms = [ShPolygon([(lng, lat) for lat, lng in h3.cell_to_boundary(c)]) for c in cell_ids]
     gdf = gpd.GeoDataFrame(
-        {'geometry': geoms},
+        {"geometry": geoms},
         index=pd.Index(cell_ids, name=id_column),
-        crs='EPSG:4326',
+        crs="EPSG:4326",
     )
     if target_crs is not None:
         gdf = gdf.to_crs(target_crs)

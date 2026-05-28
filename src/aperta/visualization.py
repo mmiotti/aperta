@@ -19,7 +19,8 @@ every plotting need — drop down to matplotlib directly for one-off custom
 visuals. Future work can extend this module with helpers for path-feature
 maps, density choropleths, route-line overlays, and so on.
 """
-from typing import Any, Callable
+
+from typing import Any, Callable, TypeAlias
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
@@ -29,7 +30,6 @@ import pandas as pd
 
 from aperta.od_pairs import TieredODPairs
 
-
 # ---------------------------------------------------------------------------
 # Type aliases
 # ---------------------------------------------------------------------------
@@ -37,16 +37,17 @@ from aperta.od_pairs import TieredODPairs
 # A per-cell value series — either a pd.Series indexed by cell_id, a dict
 # {cell_id -> value}, or the name of a column already on the `cells`
 # GeoDataFrame.
-CellValues = pd.Series | dict | str
+CellValues: TypeAlias = pd.Series | dict | str
 
 # Optional overlays: list of (GeoDataFrame, kwargs-for-GeoDataFrame.plot)
 # tuples. Drawn on top of the choropleth in the order given.
-Overlays = list[tuple[gpd.GeoDataFrame, dict]] | None
+Overlays: TypeAlias = list[tuple[gpd.GeoDataFrame, dict]] | None
 
 
 # ---------------------------------------------------------------------------
 # Cell choropleths
 # ---------------------------------------------------------------------------
+
 
 def plot_cell_values(
     cells: gpd.GeoDataFrame,
@@ -54,10 +55,10 @@ def plot_cell_values(
     *,
     ax: plt.Axes | None = None,
     title: str | None = None,
-    cmap: str = 'viridis',
+    cmap: str = "viridis",
     vmin: float | None = None,
     vmax: float | None = None,
-    missing_color: str = 'lightgrey',
+    missing_color: str = "lightgrey",
     overlays: Overlays = None,
     boundary: gpd.GeoDataFrame | None = None,
     legend: bool = True,
@@ -99,19 +100,24 @@ def plot_cell_values(
         s = values if isinstance(values, pd.Series) else pd.Series(values)
         if treat_neg_inf_as_missing:
             s = s.replace(-np.inf, np.nan)
-        column = '__plot_value__'
+        column = "__plot_value__"
         cells_plot = cells.join(s.rename(column))
 
     cells_plot.plot(
-        column=column, ax=ax, legend=legend,
-        cmap=cmap, vmin=vmin, vmax=vmax, edgecolor='none',
-        missing_kwds={'color': missing_color},
+        column=column,
+        ax=ax,
+        legend=legend,
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+        edgecolor="none",
+        missing_kwds={"color": missing_color},
     )
     if overlays:
         for overlay, kw in overlays:
             overlay.plot(ax=ax, **kw)
     if boundary is not None:
-        boundary.boundary.plot(ax=ax, color='black', linewidth=0.5)
+        boundary.boundary.plot(ax=ax, color="black", linewidth=0.5)
     if title is not None:
         ax.set_title(title)
     ax.set_axis_off()
@@ -124,8 +130,8 @@ def plot_cell_values_comparison(
     *,
     suptitle: str | None = None,
     figsize: tuple[float, float] | None = None,
-    cmap: str = 'viridis',
-    missing_color: str = 'lightgrey',
+    cmap: str = "viridis",
+    missing_color: str = "lightgrey",
     overlays: Overlays = None,
     boundary: gpd.GeoDataFrame | None = None,
     shared_scale: bool = True,
@@ -141,8 +147,8 @@ def plot_cell_values_comparison(
             column-name (same as `plot_cell_values`).
         suptitle: optional figure-level super-title.
         figsize: figure size; defaults to `(7 × n_panels, 7)`.
-        cmap, missing_color, overlays, boundary, legend,
-            treat_neg_inf_as_missing: see `plot_cell_values`.
+        cmap, missing_color, overlays, boundary, legend, treat_neg_inf_as_missing:
+            see `plot_cell_values`.
         shared_scale: if True, all panels share `vmin` / `vmax` derived
             from the global min/max across all value series. If False,
             each panel auto-scales independently.
@@ -179,9 +185,16 @@ def plot_cell_values_comparison(
 
     for ax, (title, vals) in zip(axes, values_by_label.items()):
         plot_cell_values(
-            cells, vals, ax=ax, title=title, cmap=cmap,
-            vmin=vmin, vmax=vmax, missing_color=missing_color,
-            overlays=overlays, boundary=boundary,
+            cells,
+            vals,
+            ax=ax,
+            title=title,
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            missing_color=missing_color,
+            overlays=overlays,
+            boundary=boundary,
             treat_neg_inf_as_missing=treat_neg_inf_as_missing,
             legend=legend,
         )
@@ -195,14 +208,15 @@ def plot_cell_values_comparison(
 # Tiered destinations viz
 # ---------------------------------------------------------------------------
 
+
 def plot_tiered_destinations(
     cells: gpd.GeoDataFrame,
     zones: gpd.GeoDataFrame,
     pairs: TieredODPairs,
     origin_cell_id,
     *,
-    cell_node_column: str = 'node_id',
-    zone_node_column: str = 'node_id',
+    cell_node_column: str = "node_id",
+    zone_node_column: str = "node_id",
     graph=None,
     boundary: gpd.GeoDataFrame | None = None,
     ax: plt.Axes | None = None,
@@ -260,62 +274,106 @@ def plot_tiered_destinations(
         _fig, ax = plt.subplots(figsize=(10, 10))
 
     origin_node = cells.loc[origin_cell_id, cell_node_column]
-    origin_zone_id = cells.loc[origin_cell_id, 'zone_id']
+    origin_zone_id = cells.loc[origin_cell_id, "zone_id"]
     origin_zone_node = zones.loc[origin_zone_id, zone_node_column]
 
-    cell_dest_nodes = pairs.cells_to_cells.get(origin_node, np.array([]))
+    cell_dest_nodes = (
+        pairs.cells_to_cells.get(origin_node, np.array([]))
+        if pairs.cells_to_cells is not None
+        else np.array([])
+    )
     cell_dest_cells = cells[cells[cell_node_column].isin(cell_dest_nodes)]
-    middle_dest_nodes = (pairs.cells_to_zones.get(origin_node, np.array([]))
-                         if pairs.cells_to_zones is not None else np.array([]))
+    middle_dest_nodes = (
+        pairs.cells_to_zones.get(origin_node, np.array([]))
+        if pairs.cells_to_zones is not None
+        else np.array([])
+    )
     middle_dest_zones = zones[zones[zone_node_column].isin(middle_dest_nodes)]
-    far_dest_nodes = (pairs.zones_to_zones.get(origin_zone_node, np.array([]))
-                      if pairs.zones_to_zones is not None else np.array([]))
+    far_dest_nodes = (
+        pairs.zones_to_zones.get(origin_zone_node, np.array([]))
+        if pairs.zones_to_zones is not None
+        else np.array([])
+    )
     far_dest_zones = zones[zones[zone_node_column].isin(far_dest_nodes)]
 
-    cells.plot(ax=ax, color='whitesmoke', edgecolor='lightgray', linewidth=0.1)
-    zones.boundary.plot(ax=ax, color='gray', linewidth=0.3, alpha=0.5)
-    far_dest_zones.plot(ax=ax, color='lightblue', alpha=0.5,
-                        edgecolor='steelblue', linewidth=0.5)
-    middle_dest_zones.plot(ax=ax, color='mediumaquamarine', alpha=0.55,
-                           edgecolor='seagreen', linewidth=0.5)
-    cell_dest_cells.plot(ax=ax, color='gold', alpha=0.6,
-                         edgecolor='darkorange', linewidth=0.2)
-    cells.loc[[origin_cell_id]].plot(ax=ax, color='red',
-                                     edgecolor='darkred', linewidth=1.5)
+    cells.plot(ax=ax, color="whitesmoke", edgecolor="lightgray", linewidth=0.1)
+    zones.boundary.plot(ax=ax, color="gray", linewidth=0.3, alpha=0.5)
+    far_dest_zones.plot(ax=ax, color="lightblue", alpha=0.5, edgecolor="steelblue", linewidth=0.5)
+    middle_dest_zones.plot(
+        ax=ax, color="mediumaquamarine", alpha=0.55, edgecolor="seagreen", linewidth=0.5
+    )
+    cell_dest_cells.plot(ax=ax, color="gold", alpha=0.6, edgecolor="darkorange", linewidth=0.2)
+    cells.loc[[origin_cell_id]].plot(ax=ax, color="red", edgecolor="darkred", linewidth=1.5)
 
     if graph is not None:
-        cell_xy = [(graph.nodes[n]['x'], graph.nodes[n]['y'])
-                   for n in cell_dest_nodes if n in graph.nodes]
+        cell_xy = [
+            (graph.nodes[n]["x"], graph.nodes[n]["y"]) for n in cell_dest_nodes if n in graph.nodes
+        ]
         if cell_xy:
-            ax.scatter(*zip(*cell_xy), color='darkorange', s=4, marker='o',
-                       zorder=5,
-                       label=f'Cell-tier dest nodes ({len(cell_xy)})')
-        middle_xy = [(graph.nodes[n]['x'], graph.nodes[n]['y'])
-                     for n in middle_dest_nodes if n in graph.nodes]
+            xs, ys = zip(*cell_xy)
+            ax.scatter(
+                xs,
+                ys,
+                color="darkorange",
+                s=4,
+                marker="o",
+                zorder=5,
+                label=f"Cell-tier dest nodes ({len(cell_xy)})",
+            )
+        middle_xy = [
+            (graph.nodes[n]["x"], graph.nodes[n]["y"])
+            for n in middle_dest_nodes
+            if n in graph.nodes
+        ]
         if middle_xy:
-            ax.scatter(*zip(*middle_xy), color='seagreen', s=25, marker='s',
-                       edgecolor='black', linewidth=0.3, zorder=6,
-                       label=f'Middle-tier dest nodes ({len(middle_xy)})')
-        far_xy = [(graph.nodes[n]['x'], graph.nodes[n]['y'])
-                  for n in far_dest_nodes if n in graph.nodes]
+            xs, ys = zip(*middle_xy)
+            ax.scatter(
+                xs,
+                ys,
+                color="seagreen",
+                s=25,
+                marker="s",
+                edgecolor="black",
+                linewidth=0.3,
+                zorder=6,
+                label=f"Middle-tier dest nodes ({len(middle_xy)})",
+            )
+        far_xy = [
+            (graph.nodes[n]["x"], graph.nodes[n]["y"]) for n in far_dest_nodes if n in graph.nodes
+        ]
         if far_xy:
-            ax.scatter(*zip(*far_xy), color='steelblue', s=40, marker='s',
-                       edgecolor='black', linewidth=0.3, zorder=7,
-                       label=f'Far-tier dest nodes ({len(far_xy)})')
+            xs, ys = zip(*far_xy)
+            ax.scatter(
+                xs,
+                ys,
+                color="steelblue",
+                s=40,
+                marker="s",
+                edgecolor="black",
+                linewidth=0.3,
+                zorder=7,
+                label=f"Far-tier dest nodes ({len(far_xy)})",
+            )
         if origin_node in graph.nodes:
-            ax.scatter([graph.nodes[origin_node]['x']],
-                       [graph.nodes[origin_node]['y']],
-                       color='red', s=150, marker='*',
-                       edgecolor='black', linewidth=0.5,
-                       zorder=10, label='Origin node')
+            ax.scatter(
+                [graph.nodes[origin_node]["x"]],
+                [graph.nodes[origin_node]["y"]],
+                color="red",
+                s=150,
+                marker="*",
+                edgecolor="black",
+                linewidth=0.5,
+                zorder=10,
+                label="Origin node",
+            )
 
     if boundary is not None:
-        boundary.boundary.plot(ax=ax, color='black', linewidth=0.5)
+        boundary.boundary.plot(ax=ax, color="black", linewidth=0.5)
     if title is not None:
         ax.set_title(title)
     ax.set_axis_off()
     if legend and graph is not None:
-        ax.legend(loc='upper right', fontsize=9, framealpha=0.9)
+        ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
     return ax
 
 
@@ -324,8 +382,17 @@ def plot_tiered_destinations(
 # ---------------------------------------------------------------------------
 
 
-def add_styled_colorbar(ax, *, cmap, vmin: float, vmax: float, label: str,
-                        size: str = '3%', pad: float = 0.10, extend: str = 'max'):
+def add_styled_colorbar(
+    ax,
+    *,
+    cmap,
+    vmin: float,
+    vmax: float,
+    label: str,
+    size: str = "3%",
+    pad: float = 0.10,
+    extend: str = "max",
+):
     """Append a height-matched colour bar to the right of `ax`.
 
     Wraps the `mpl_toolkits.axes_grid1.make_axes_locatable` +
@@ -352,7 +419,7 @@ def add_styled_colorbar(ax, *, cmap, vmin: float, vmax: float, label: str,
     from mpl_toolkits.axes_grid1 import make_axes_locatable
 
     divider = make_axes_locatable(ax)
-    cax = divider.append_axes('right', size=size, pad=pad)
+    cax = divider.append_axes("right", size=size, pad=pad)
     sm = ScalarMappable(cmap=cmap, norm=Normalize(vmin=vmin, vmax=vmax))
     plt.colorbar(sm, cax=cax, label=label, extend=extend)
     return cax
@@ -363,7 +430,7 @@ def plot_edge_values(
     values: dict | pd.Series,
     *,
     ax=None,
-    cmap='viridis',
+    cmap="viridis",
     vmin: float | None = None,
     vmax: float | None = None,
     edge_widths: dict[tuple, float] | float = 1.0,
@@ -419,12 +486,14 @@ def plot_edge_values(
     widths: list = []
     vals: list = []
     for u, v, k, d in edges:
-        geom = d.get('geometry')
+        geom = d.get("geometry")
         if geom is not None:
             coords = list(geom.coords)
         else:
-            coords = [(graph.nodes[u]['x'], graph.nodes[u]['y']),
-                      (graph.nodes[v]['x'], graph.nodes[v]['y'])]
+            coords = [
+                (graph.nodes[u]["x"], graph.nodes[u]["y"]),
+                (graph.nodes[v]["x"], graph.nodes[v]["y"]),
+            ]
         geoms.append(coords)
         if isinstance(edge_widths, dict):
             widths.append(float(edge_widths.get((u, v, k), 1.0)))

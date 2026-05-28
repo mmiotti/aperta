@@ -50,15 +50,15 @@ which preserves per-cell origin variation in the medium-distance regime
 where it matters most. Drops one geo layer (regions) for a simpler API.
 See memory `aperta-flat-refactor-plan` for the design discussion.
 """
+
+import logging
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable
-import logging
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-
 from numba import njit
 from shapely.geometry import Point
 
@@ -74,10 +74,12 @@ class TieredODPairs:
     [[TieredODGeoPairs]] below. Functions that don't care about key space (e.g.
     `make_mask`, `__repr__`, `describe`) accept this base type.
 
-    `cells_to_zones` and `zones_to_zones` are `None` when the corresponding
-    tier wasn't requested.
+    Any tier may be `None` when the corresponding tier wasn't requested or
+    produced. `cells_to_cells` is populated by `get_pairs` in normal usage,
+    but intermediate / utility constructors may leave it unset.
     """
-    cells_to_cells: dict
+
+    cells_to_cells: dict | None = None
     cells_to_zones: dict | None = None
     zones_to_zones: dict | None = None
 
@@ -88,15 +90,16 @@ class TieredODPairs:
         # report their own name.
         def _summary(d: dict | None) -> str:
             if d is None:
-                return 'None'
+                return "None"
             n_orig = len(d)
             n_dest = sum(len(v) for v in d.values())
-            return f'{n_orig:,} orig → {n_dest:,} dest'
+            return f"{n_orig:,} orig → {n_dest:,} dest"
+
         return (
-            f'{type(self).__name__}('
-            f'cells_to_cells: {_summary(self.cells_to_cells)}; '
-            f'cells_to_zones: {_summary(self.cells_to_zones)}; '
-            f'zones_to_zones: {_summary(self.zones_to_zones)})'
+            f"{type(self).__name__}("
+            f"cells_to_cells: {_summary(self.cells_to_cells)}; "
+            f"cells_to_zones: {_summary(self.cells_to_zones)}; "
+            f"zones_to_zones: {_summary(self.zones_to_zones)})"
         )
 
     def describe(self) -> str:
@@ -114,7 +117,7 @@ class TieredODPairs:
         elsewhere (e.g. into a log file).
         """
         lines = [f"=== {type(self).__name__} ==="]
-        for tier_name in ('cells_to_cells', 'cells_to_zones', 'zones_to_zones'):
+        for tier_name in ("cells_to_cells", "cells_to_zones", "zones_to_zones"):
             d: dict | None = getattr(self, tier_name)
             if d is None:
                 lines.append(f"  {tier_name}: None")
@@ -132,13 +135,14 @@ class TieredODPairs:
             if all_values.size == 0:
                 continue
             kind = all_values.dtype.kind
-            if kind == 'b':
+            if kind == "b":
                 n_true = int(all_values.sum())
                 lines.append(
                     f"    True: {n_true:,} / {all_values.size:,} "
-                    f"({n_true / all_values.size * 100:.1f}%)")
+                    f"({n_true / all_values.size * 100:.1f}%)"
+                )
                 continue
-            if kind not in ('f', 'i', 'u'):
+            if kind not in ("f", "i", "u"):
                 continue  # not numeric (e.g. string IDs) — counts only
             finite = all_values[np.isfinite(all_values)]
             n_non_finite = int(all_values.size - finite.size)
@@ -155,7 +159,7 @@ class TieredODPairs:
             if n_non_finite:
                 line += f" / non-finite {n_non_finite:,}"
             lines.append(line)
-        out = '\n'.join(lines)
+        out = "\n".join(lines)
         print(out)
         return out
 
@@ -183,13 +187,15 @@ class TieredODNodePairs(TieredODPairs):
 class TieredODGeoPairs(TieredODPairs):
     """Tiered OD pairs keyed by geo-unit IDs (cell_id / zone_id).
 
-    Dict keys are mode-agnostic geo-unit IDs:
+    Dict keys are mode-agnostic geo-unit IDs::
+
         cells_to_cells:    cell_id  ->  array of dest cell_ids
         cells_to_zones:    cell_id  ->  array of dest zone_ids
         zones_to_zones:    zone_id  ->  array of dest zone_ids
 
     Created via `od_pairs.reindex_by_geo_unit` from a `TieredODNodePairs` +
     cells (+ optional zones). Required input to:
+
       - `od_pairs.aggregate_across_modes` for cross-modal accessibility,
       - accessibility metrics that should return cell/zone-indexed output,
       - `add_geo_overheads` / `add_origin_cell_overhead` for geo-unit-keyed
@@ -215,8 +221,13 @@ def _points_within_buffer(
     shapely's `.within()` boundary semantics: a point at exactly `buffer` distance
     is excluded.
     """
-    matches = np.nonzero(np.sqrt(np.power(xy_destinations[:, 0] - x_origin, 2) +
-                                 np.power(xy_destinations[:, 1] - y_origin, 2)) < buffer)[0]
+    matches = np.nonzero(
+        np.sqrt(
+            np.power(xy_destinations[:, 0] - x_origin, 2)
+            + np.power(xy_destinations[:, 1] - y_origin, 2)
+        )
+        < buffer
+    )[0]
     return matches
 
 
@@ -231,7 +242,7 @@ def _build_node_xy_map(nodes: pd.DataFrame | gpd.GeoDataFrame) -> dict:
     coords are silently skipped.
     """
     out: dict = {}
-    if isinstance(nodes, gpd.GeoDataFrame) and 'geometry' in nodes.columns:
+    if isinstance(nodes, gpd.GeoDataFrame) and "geometry" in nodes.columns:
         for nid, geom in nodes.geometry.items():
             if geom is None or geom.is_empty:
                 continue
@@ -240,14 +251,16 @@ def _build_node_xy_map(nodes: pd.DataFrame | gpd.GeoDataFrame) -> dict:
                     f"Node {nid!r}: geometry is {type(geom).__name__}, expected Point. "
                     f"For non-Point geometries, precompute centroids "
                     f"(e.g. nodes.assign(geometry=nodes.geometry.centroid)) or pass a "
-                    f"plain DataFrame with 'x' and 'y' columns.")
+                    f"plain DataFrame with 'x' and 'y' columns."
+                )
             out[nid] = (float(geom.x), float(geom.y))
         return out
-    if 'x' not in nodes.columns or 'y' not in nodes.columns:
+    if "x" not in nodes.columns or "y" not in nodes.columns:
         raise ValueError(
             "`nodes` must be a GeoDataFrame with Point geometries OR a DataFrame "
-            "with 'x' and 'y' columns.")
-    for nid, x, y in zip(nodes.index, nodes['x'], nodes['y']):
+            "with 'x' and 'y' columns."
+        )
+    for nid, x, y in zip(nodes.index, nodes["x"], nodes["y"]):
         out[nid] = (float(x), float(y))
     return out
 
@@ -269,8 +282,11 @@ def _node_to_value_lookup(df: pd.DataFrame, node_column: str, value_column: str)
 # Tiered-OD lookup builders
 # ---------------------------------------------------------------------------
 
+
 def build_cell_to_zone_node_map(
-    cells: pd.DataFrame, zones: pd.DataFrame, node_column: str,
+    cells: pd.DataFrame,
+    zones: pd.DataFrame,
+    node_column: str,
 ) -> dict:
     """Build the `{cell_node -> zone_node}` lookup that tiered helpers use to find
     each origin cell's parent zone (which keys `zones_to_zones`).
@@ -282,7 +298,7 @@ def build_cell_to_zone_node_map(
     cells_valid = cells[cells[node_column].notna()]
     return {
         cell_node: zone_to_node[zone_id]
-        for cell_node, zone_id in zip(cells_valid[node_column], cells_valid['zone_id'])
+        for cell_node, zone_id in zip(cells_valid[node_column], cells_valid["zone_id"])
         if zone_id in zone_to_node
     }
 
@@ -305,11 +321,12 @@ def make_mask(
 
     Tiers that are `None` in `values` stay `None` in the result.
     """
+
     def _apply(tier: dict | None) -> dict | None:
         if tier is None:
             return None
-        return {origin: np.asarray(rule(arr), dtype=bool)
-                for origin, arr in tier.items()}
+        return {origin: np.asarray(rule(arr), dtype=bool) for origin, arr in tier.items()}
+
     # Preserve the input subclass — masks make sense for either key space.
     return type(values)(
         cells_to_cells=_apply(values.cells_to_cells),
@@ -322,12 +339,14 @@ def make_mask(
 # get_pairs
 # ---------------------------------------------------------------------------
 
+
 def _validate_inputs(
     cells: gpd.GeoDataFrame,
     node_column: str,
     zones: gpd.GeoDataFrame | None,
     r_zones: float | None,
 ) -> None:
+    """Check `get_pairs` inputs upfront so failures point at the call site, not deep inside the build."""
     if (zones is None) != (r_zones is None):
         raise ValueError("`zones` and `r_zones` must both be provided or both omitted.")
     if node_column not in cells.columns:
@@ -335,7 +354,7 @@ def _validate_inputs(
     if zones is not None:
         if node_column not in zones.columns:
             raise ValueError(f"`zones` is missing required column {node_column!r}.")
-        if 'zone_id' not in cells.columns:
+        if "zone_id" not in cells.columns:
             raise ValueError("`cells` must have a 'zone_id' column when zones are provided.")
 
 
@@ -361,13 +380,19 @@ def _get_pairs_cells_only(
     to a subset of nodes — see `get_pairs` for the user-level semantics.
     """
     centroids = cells_with_node.geometry.centroid
-    per_node = pd.DataFrame({
-        'node': cells_with_node[node_column].to_numpy(),
-        'x': centroids.x.to_numpy(),
-        'y': centroids.y.to_numpy(),
-    }).groupby('node', sort=False).mean()
+    per_node = (
+        pd.DataFrame(
+            {
+                "node": cells_with_node[node_column].to_numpy(),
+                "x": centroids.x.to_numpy(),
+                "y": centroids.y.to_numpy(),
+            }
+        )
+        .groupby("node", sort=False)
+        .mean()
+    )
     node_ids = per_node.index.to_numpy()
-    xy = per_node[['x', 'y']].to_numpy()
+    xy = per_node[["x", "y"]].to_numpy()
 
     cells_to_cells: defaultdict = defaultdict(set)
     for i in range(len(per_node)):
@@ -402,12 +427,11 @@ def _mask_to_node_set(
         return None
     arr = np.asarray(mask)
     if arr.dtype != bool:
-        raise ValueError(
-            f"`{df_name}` mask must be a boolean array; got dtype {arr.dtype}.")
+        raise ValueError(f"`{df_name}` mask must be a boolean array; got dtype {arr.dtype}.")
     if len(arr) != len(df):
         raise ValueError(
-            f"`{df_name}` mask length {len(arr)} does not match `{df_name}` "
-            f"length {len(df)}.")
+            f"`{df_name}` mask length {len(arr)} does not match `{df_name}` length {len(df)}."
+        )
     sub = df[arr]
     return set(sub[sub[node_column].notna()][node_column].unique().tolist())
 
@@ -494,14 +518,19 @@ def get_pairs(
 
     # Convert masks to node sets (or None = no filter). Length-mismatched or
     # non-boolean masks raise a clear error here, before any heavy work.
-    orig_node_set = _mask_to_node_set(orig_cells, cells, node_column, 'orig_cells')
-    dest_cell_node_set = _mask_to_node_set(dest_cells, cells, node_column, 'dest_cells')
-    dest_zone_node_set = (_mask_to_node_set(dest_zones, zones, node_column, 'dest_zones')
-                          if zones is not None else None)
+    orig_node_set = _mask_to_node_set(orig_cells, cells, node_column, "orig_cells")
+    dest_cell_node_set = _mask_to_node_set(dest_cells, cells, node_column, "dest_cells")
+    dest_zone_node_set = (
+        _mask_to_node_set(dest_zones, zones, node_column, "dest_zones")
+        if zones is not None
+        else None
+    )
 
     if zones is None:
         return _get_pairs_cells_only(
-            cells_with_node, r_cells, node_column,
+            cells_with_node,
+            r_cells,
+            node_column,
             orig_node_set=orig_node_set,
             dest_node_set=dest_cell_node_set,
         )
@@ -515,7 +544,8 @@ def get_pairs(
     if not (r_cells <= r_medium <= r_zones):
         raise ValueError(
             f"`r_medium` must satisfy `r_cells` ({r_cells}) ≤ `r_medium` "
-            f"({r_medium}) ≤ `r_zones` ({r_zones}).")
+            f"({r_medium}) ≤ `r_zones` ({r_zones})."
+        )
 
     # --- Setup ---
     if zones_centroids is None:
@@ -524,7 +554,7 @@ def get_pairs(
     zone_xy = np.column_stack([zones_centroids.x.to_numpy(), zones_centroids.y.to_numpy()])
     zone_nodes: list = zones[node_column].tolist()
     cells_in_zone: dict = (
-        cells_with_node.groupby('zone_id')[node_column]
+        cells_with_node.groupby("zone_id")[node_column]
         # `np.asarray` normalises across pandas dtypes: with the default
         # numpy backend `s.unique()` returns a numpy array, but with
         # nullable string / Int dtypes it returns a `pd.<...>Array`
@@ -532,7 +562,8 @@ def get_pairs(
         # `np.array(..., dtype=...)` downstream can't interpret. Coerce
         # to a plain numpy array here so callers can rely on a numpy
         # dtype on these values.
-        .apply(lambda s: np.asarray(s.unique())).to_dict()
+        .apply(lambda s: np.asarray(s.unique()))
+        .to_dict()
     )
     n_zones = len(zone_ids)
 
@@ -540,8 +571,10 @@ def get_pairs(
     # For each origin zone i, precompute three arrays of dest zone indices —
     # one per tier — mutually exclusive based on Euclidean zone-pair distance.
     # `cell_tier_dests[i]` includes j == i (same-zone always cell-tier).
-    logging.info(f"get_pairs: tiered pass over {n_zones:,} zones "
-                 f"(r_cells={r_cells}, r_medium={r_medium}, r_zones={r_zones})...")
+    logging.info(
+        f"get_pairs: tiered pass over {n_zones:,} zones "
+        f"(r_cells={r_cells}, r_medium={r_medium}, r_zones={r_zones})..."
+    )
     log_every = max(1, n_zones // 10)
     cell_tier_dests: list[np.ndarray] = []
     c2z_tier_dests: list[np.ndarray] = []
@@ -564,11 +597,12 @@ def get_pairs(
     # --- Identify zones that contain at least one origin cell ---
     # When `orig_cells` filter is active, we skip zones that contribute no
     # origin nodes — they have no OD pairs since there's nothing to route FROM.
+    zones_with_origin: set | None
     if orig_node_set is not None:
-        zones_with_origin: set = {
-            zone_ids[i] for i in range(n_zones)
-            if any(n in orig_node_set
-                   for n in cells_in_zone.get(zone_ids[i], np.array([])))
+        zones_with_origin = {
+            zone_ids[i]
+            for i in range(n_zones)
+            if any(n in orig_node_set for n in cells_in_zone.get(zone_ids[i], np.array([])))
         }
     else:
         zones_with_origin = None  # signals "every zone"
@@ -578,7 +612,8 @@ def get_pairs(
     zone_nodes_arr = np.array(zone_nodes, dtype=object)
     if dest_zone_node_set is not None:
         zone_is_dest = np.array(
-            [zone_nodes[i] in dest_zone_node_set for i in range(n_zones)], dtype=bool)
+            [zone_nodes[i] in dest_zone_node_set for i in range(n_zones)], dtype=bool
+        )
     else:
         zone_is_dest = None
 
@@ -592,7 +627,8 @@ def get_pairs(
         origin_nodes = cells_in_zone.get(zone_ids[i], np.array([]))
         if orig_node_set is not None:
             origin_nodes = np.array(
-                [n for n in origin_nodes if n in orig_node_set], dtype=origin_nodes.dtype)
+                [n for n in origin_nodes if n in orig_node_set], dtype=origin_nodes.dtype
+            )
         if len(origin_nodes) == 0:
             continue
         for j in cell_tier_dests[i]:
@@ -621,7 +657,8 @@ def get_pairs(
         origin_nodes = cells_in_zone.get(zone_ids[i], np.array([]))
         if orig_node_set is not None:
             origin_nodes = np.array(
-                [n for n in origin_nodes if n in orig_node_set], dtype=origin_nodes.dtype)
+                [n for n in origin_nodes if n in orig_node_set], dtype=origin_nodes.dtype
+            )
         if len(origin_nodes) == 0:
             continue
         dest_zone_idx = c2z_tier_dests[i]
@@ -631,8 +668,7 @@ def get_pairs(
             continue
         dest_zones_for_origin = zone_nodes_arr[dest_zone_idx]
         valid_dests = {
-            n for n in dest_zones_for_origin.tolist()
-            if not (isinstance(n, float) and np.isnan(n))
+            n for n in dest_zones_for_origin.tolist() if not (isinstance(n, float) and np.isnan(n))
         }
         if not valid_dests:
             continue
@@ -657,22 +693,19 @@ def get_pairs(
         if len(dest_zone_idx) == 0:
             continue
         dest_zones_for_zone = zone_nodes_arr[dest_zone_idx]
-        valid_dests = [
-            n for n in dest_zones_for_zone.tolist()
-            if not (isinstance(n, float) and np.isnan(n))
+        z2z_dests = [
+            n for n in dest_zones_for_zone.tolist() if not (isinstance(n, float) and np.isnan(n))
         ]
-        if valid_dests:
-            zones_to_zones[origin_zone_node].update(valid_dests)
+        if z2z_dests:
+            zones_to_zones[origin_zone_node].update(z2z_dests)
 
     return TieredODNodePairs(
         cells_to_cells={k: np.asarray(list(v)) for k, v in cells_to_cells.items()},
         cells_to_zones=(
-            {k: np.asarray(list(v)) for k, v in cells_to_zones.items()}
-            if cells_to_zones else None
+            {k: np.asarray(list(v)) for k, v in cells_to_zones.items()} if cells_to_zones else None
         ),
         zones_to_zones=(
-            {k: np.asarray(list(v)) for k, v in zones_to_zones.items()}
-            if zones_to_zones else None
+            {k: np.asarray(list(v)) for k, v in zones_to_zones.items()} if zones_to_zones else None
         ),
     )
 
@@ -680,6 +713,7 @@ def get_pairs(
 # ---------------------------------------------------------------------------
 # Value lookups
 # ---------------------------------------------------------------------------
+
 
 def node_values(
     column: str,
@@ -724,44 +758,39 @@ def dest_values(
     """
     if column not in cells.columns:
         raise ValueError(f"`cells` is missing column {column!r}.")
-    needs_zones = (pairs.cells_to_zones is not None
-                   or pairs.zones_to_zones is not None)
+    needs_zones = pairs.cells_to_zones is not None or pairs.zones_to_zones is not None
     if needs_zones:
         if zones is None:
             raise ValueError(
                 "`zones` is required because `pairs.cells_to_zones` or "
-                "`pairs.zones_to_zones` is set.")
+                "`pairs.zones_to_zones` is set."
+            )
         if column not in zones.columns:
             raise ValueError(f"`zones` is missing column {column!r}.")
 
-    def _lookup_for(d: dict, lookup: dict) -> dict:
-        return {origin: np.fromiter(
-                    (lookup.get(dest, np.nan) for dest in dests),
-                    dtype=dtype, count=len(dests))
-                for origin, dests in d.items()}
+    def _lookup_for(d: dict | None, lookup: dict | None) -> dict | None:
+        if d is None or lookup is None:
+            return None
+        return {
+            origin: np.fromiter(
+                (lookup.get(dest, np.nan) for dest in dests), dtype=dtype, count=len(dests)
+            )
+            for origin, dests in d.items()
+        }
 
     cells_lookup = _node_to_value_lookup(cells, node_column, column)
-    zones_lookup = (
-        _node_to_value_lookup(zones, node_column, column) if needs_zones else None
-    )
-    c_to_z_out = (
-        _lookup_for(pairs.cells_to_zones, zones_lookup)
-        if pairs.cells_to_zones is not None else None
-    )
-    z_to_z_out = (
-        _lookup_for(pairs.zones_to_zones, zones_lookup)
-        if pairs.zones_to_zones is not None else None
-    )
+    zones_lookup = _node_to_value_lookup(zones, node_column, column) if needs_zones else None
     return TieredODNodePairs(
         cells_to_cells=_lookup_for(pairs.cells_to_cells, cells_lookup),
-        cells_to_zones=c_to_z_out,
-        zones_to_zones=z_to_z_out,
+        cells_to_zones=_lookup_for(pairs.cells_to_zones, zones_lookup),
+        zones_to_zones=_lookup_for(pairs.zones_to_zones, zones_lookup),
     )
 
 
 # ---------------------------------------------------------------------------
 # Geo-unit reindexing (node-keyed → geo-unit-keyed)
 # ---------------------------------------------------------------------------
+
 
 def _build_node_to_units_map(units: pd.DataFrame, node_column: str) -> dict:
     """Build `{node_id -> list of unit_ids whose `node_column` is that node}`.
@@ -834,7 +863,7 @@ def _reindex_tier(
             continue
         # Canonical sort by dest-unit ID — required for cross-mode alignment.
         dest_arr = np.asarray(out_dest_units)
-        order = np.argsort(dest_arr, kind='stable')
+        order = np.argsort(dest_arr, kind="stable")
         new_pairs[origin_unit] = dest_arr[order]
         if tier_odm is not None:
             assert new_odm is not None
@@ -888,20 +917,22 @@ def reindex_by_geo_unit(
     """
     if cell_node_column not in cells.columns:
         raise ValueError(f"`cells` is missing column {cell_node_column!r}.")
-    needs_zones = (pairs.cells_to_zones is not None
-                   or pairs.zones_to_zones is not None)
+    needs_zones = pairs.cells_to_zones is not None or pairs.zones_to_zones is not None
     if needs_zones:
         if zones is None or zone_node_column is None:
             raise ValueError(
-                "`zones` and `zone_node_column` are required when `pairs` has "
-                "zone-tier entries.")
+                "`zones` and `zone_node_column` are required when `pairs` has zone-tier entries."
+            )
         if zone_node_column not in zones.columns:
             raise ValueError(f"`zones` is missing column {zone_node_column!r}.")
 
     cells_pairs, cells_odm = _reindex_tier(
         pairs.cells_to_cells,
         odm.cells_to_cells if odm is not None else None,
-        cells, cells, cell_node_column, cell_node_column,
+        cells,
+        cells,
+        cell_node_column,
+        cell_node_column,
     )
     c2z_pairs: dict | None = None
     c2z_odm: dict | None = None
@@ -910,7 +941,10 @@ def reindex_by_geo_unit(
         c2z_pairs, c2z_odm = _reindex_tier(
             pairs.cells_to_zones,
             odm.cells_to_zones if odm is not None else None,
-            cells, zones, cell_node_column, zone_node_column,
+            cells,
+            zones,
+            cell_node_column,
+            zone_node_column,
         )
     zones_pairs: dict | None = None
     zones_odm: dict | None = None
@@ -919,7 +953,10 @@ def reindex_by_geo_unit(
         zones_pairs, zones_odm = _reindex_tier(
             pairs.zones_to_zones,
             odm.zones_to_zones if odm is not None else None,
-            zones, zones, zone_node_column, zone_node_column,
+            zones,
+            zones,
+            zone_node_column,
+            zone_node_column,
         )
 
     new_pairs = TieredODGeoPairs(
@@ -974,36 +1011,36 @@ def dest_values_geo(
     """
     if column not in cells.columns:
         raise ValueError(f"`cells` is missing column {column!r}.")
-    needs_zones = (pairs.cells_to_zones is not None
-                   or pairs.zones_to_zones is not None)
+    needs_zones = pairs.cells_to_zones is not None or pairs.zones_to_zones is not None
     if needs_zones:
         if zones is None:
             raise ValueError(
                 "`zones` is required because `pairs.cells_to_zones` or "
-                "`pairs.zones_to_zones` is set.")
+                "`pairs.zones_to_zones` is set."
+            )
         if column not in zones.columns:
             raise ValueError(f"`zones` is missing column {column!r}.")
 
-    def _lookup_for(d: dict, lookup: dict) -> dict:
-        return {origin: np.fromiter(
-                    (lookup.get(dest, np.nan) for dest in dests),
-                    dtype=dtype, count=len(dests))
-                for origin, dests in d.items()}
+    def _lookup_for(d: dict | None, lookup: dict | None) -> dict | None:
+        if d is None or lookup is None:
+            return None
+        return {
+            origin: np.fromiter(
+                (lookup.get(dest, np.nan) for dest in dests), dtype=dtype, count=len(dests)
+            )
+            for origin, dests in d.items()
+        }
 
     cells_lookup = cells[column].to_dict()
-    zones_lookup = zones[column].to_dict() if needs_zones else None
-    c_to_z_out = (
-        _lookup_for(pairs.cells_to_zones, zones_lookup)
-        if pairs.cells_to_zones is not None else None
-    )
-    z_to_z_out = (
-        _lookup_for(pairs.zones_to_zones, zones_lookup)
-        if pairs.zones_to_zones is not None else None
-    )
+    if needs_zones:
+        assert zones is not None  # validated above
+        zones_lookup: dict | None = zones[column].to_dict()
+    else:
+        zones_lookup = None
     return TieredODGeoPairs(
         cells_to_cells=_lookup_for(pairs.cells_to_cells, cells_lookup),
-        cells_to_zones=c_to_z_out,
-        zones_to_zones=z_to_z_out,
+        cells_to_zones=_lookup_for(pairs.cells_to_zones, zones_lookup),
+        zones_to_zones=_lookup_for(pairs.zones_to_zones, zones_lookup),
     )
 
 
@@ -1011,11 +1048,21 @@ def dest_values_geo(
 # Euclidean distances + summary
 # ---------------------------------------------------------------------------
 
+
 def _dists_for_dict(
-    d: dict,
+    d: dict | None,
     nodes_xy: dict,
     dtype: np.dtype | type,
-) -> dict:
+) -> dict | None:
+    """Per-tier Euclidean distances for one tier of a `TieredODPairs` structure.
+
+    For each `origin -> array_of_dests` entry in `d`, returns an array of
+    Euclidean distances from origin to each dest, looked up via `nodes_xy`
+    (a `node_id -> (x, y)` dict). Returns `None` if `d` is `None` so callers
+    can pass per-tier nullables directly.
+    """
+    if d is None:
+        return None
     out: dict = {}
     for origin, dests in d.items():
         if origin not in nodes_xy:
@@ -1031,7 +1078,8 @@ def _dists_for_dict(
             xy = nodes_xy.get(dest)
             if xy is None:
                 raise ValueError(
-                    f"Destination {dest!r} (origin {origin!r}) is not in `nodes`' xy map.")
+                    f"Destination {dest!r} (origin {origin!r}) is not in `nodes`' xy map."
+                )
             dx[i] = xy[0]
             dy[i] = xy[1]
         out[origin] = np.hypot(dx - ox, dy - oy).astype(dtype, copy=False)
@@ -1041,6 +1089,7 @@ def _dists_for_dict(
 # ---------------------------------------------------------------------------
 # Cross-modal aggregation
 # ---------------------------------------------------------------------------
+
 
 def _aggregate_modes_tier(
     tier_arrays: list[np.ndarray],
@@ -1052,11 +1101,11 @@ def _aggregate_modes_tier(
     Stack shape: `(n_modes, n_dests)`. Returns a `(n_dests,)` array.
     """
     stacked = np.stack(tier_arrays, axis=0)
-    if aggregator == 'min':
+    if aggregator == "min":
         # nanmin treats inf as a real value (unreachable mode → still the worst
         # finite value), but skips NaN (no observation for that mode).
         return np.nanmin(stacked, axis=0)
-    if aggregator == 'logsum':
+    if aggregator == "logsum":
         # Log-sum-cost aggregation: -scale * ln Σ_m exp(-cost_m / scale).
         # Interpretation: cost_m is per-mode disutility (positive = bad).
         # Unreachable modes (inf) contribute exp(-inf) = 0; NaN is treated as
@@ -1066,17 +1115,16 @@ def _aggregate_modes_tier(
         sum_exp = exp_terms.sum(axis=0)
         # When all modes are unreachable, sum_exp = 0 → log = -inf → result =
         # +inf, which matches the "all unreachable" semantics from `min`.
-        with np.errstate(divide='ignore'):
+        with np.errstate(divide="ignore"):
             return -scale * np.log(sum_exp)
     if callable(aggregator):
         return aggregator(stacked)
-    raise ValueError(
-        f"Unknown aggregator {aggregator!r}; expected 'min', 'logsum', or a callable.")
+    raise ValueError(f"Unknown aggregator {aggregator!r}; expected 'min', 'logsum', or a callable.")
 
 
 def aggregate_across_modes(
     odms: dict[str, tuple[TieredODGeoPairs, TieredODGeoPairs]],
-    aggregator: str | Callable = 'min',
+    aggregator: str | Callable = "min",
     *,
     scale: float = 1.0,
 ) -> tuple[TieredODGeoPairs, TieredODGeoPairs]:
@@ -1090,14 +1138,17 @@ def aggregate_across_modes(
     `reindex_by_geo_unit` to lift per-mode node-keyed ODMs first.
 
     Each mode contributes `(pairs, costs)`:
+
       - `pairs`: geo-keyed `TieredODGeoPairs` of dest unit IDs.
       - `costs`: geo-keyed `TieredODGeoPairs` of cost values aligned to `pairs`.
 
     For each (origin, dest_unit) pair in the UNION across modes:
+
       - If a mode has the pair, use its cost.
       - If a mode is missing it (origin not in the mode, or dest not in the
         mode's per-origin dest array), fill with `+inf` ("unreachable by this
         mode").
+
     Then apply the aggregator across modes to produce a single combined cost.
 
     Three aggregator semantics:
@@ -1146,11 +1197,12 @@ def aggregate_across_modes(
             raise TypeError(
                 f"Mode {m!r}: `pairs` must be a TieredODGeoPairs (got "
                 f"{type(pairs_m).__name__}). Use `reindex_by_geo_unit` to lift "
-                f"a node-keyed ODM into geo-unit space first.")
+                f"a node-keyed ODM into geo-unit space first."
+            )
         if not isinstance(costs_m, TieredODGeoPairs):
             raise TypeError(
-                f"Mode {m!r}: `costs` must be a TieredODGeoPairs (got "
-                f"{type(costs_m).__name__}).")
+                f"Mode {m!r}: `costs` must be a TieredODGeoPairs (got {type(costs_m).__name__})."
+            )
 
     def _aggregate_tier(tier_name: str) -> tuple[dict | None, dict | None]:
         per_mode_pairs = [getattr(odms[m][0], tier_name) for m in mode_names]
@@ -1159,7 +1211,8 @@ def aggregate_across_modes(
             if not all(p is None for p in per_mode_pairs):
                 raise ValueError(
                     f"Tier {tier_name!r}: some modes populate it, others don't. "
-                    f"Cross-modal aggregation requires consistent tier structure.")
+                    f"Cross-modal aggregation requires consistent tier structure."
+                )
             return None, None
         # Inherit dtype from any populated per-mode cost array (FP32 by
         # default after the costs/weights dtype convention; FP64 if the
@@ -1198,16 +1251,20 @@ def aggregate_across_modes(
                 mode_dests = p[origin]
                 mode_costs = np.asarray(c[origin], dtype=dt)
                 lookup = dict(zip(mode_dests.tolist(), mode_costs.tolist()))
-                aligned.append(np.fromiter(
-                    (lookup.get(d, np.inf) for d in dest_sorted),
-                    dtype=dt, count=len(dest_sorted)))
+                aligned.append(
+                    np.fromiter(
+                        (lookup.get(d, np.inf) for d in dest_sorted),
+                        dtype=dt,
+                        count=len(dest_sorted),
+                    )
+                )
             out_pairs[origin] = dest_sorted
             out_costs[origin] = _aggregate_modes_tier(aligned, aggregator, scale)
         return out_pairs, out_costs
 
-    c_pairs, c_costs = _aggregate_tier('cells_to_cells')
-    cz_pairs, cz_costs = _aggregate_tier('cells_to_zones')
-    z_pairs, z_costs = _aggregate_tier('zones_to_zones')
+    c_pairs, c_costs = _aggregate_tier("cells_to_cells")
+    cz_pairs, cz_costs = _aggregate_tier("cells_to_zones")
+    z_pairs, z_costs = _aggregate_tier("zones_to_zones")
 
     union_pairs = TieredODGeoPairs(
         cells_to_cells=c_pairs if c_pairs is not None else {},
@@ -1235,14 +1292,8 @@ def get_euclidian_dists(
     nodes_xy = _build_node_xy_map(nodes)
     return TieredODNodePairs(
         cells_to_cells=_dists_for_dict(pairs.cells_to_cells, nodes_xy, dtype),
-        cells_to_zones=(
-            _dists_for_dict(pairs.cells_to_zones, nodes_xy, dtype)
-            if pairs.cells_to_zones is not None else None
-        ),
-        zones_to_zones=(
-            _dists_for_dict(pairs.zones_to_zones, nodes_xy, dtype)
-            if pairs.zones_to_zones is not None else None
-        ),
+        cells_to_zones=_dists_for_dict(pairs.cells_to_zones, nodes_xy, dtype),
+        zones_to_zones=_dists_for_dict(pairs.zones_to_zones, nodes_xy, dtype),
     )
 
 
@@ -1253,7 +1304,7 @@ def max_cost(costs: TieredODPairs) -> float:
     routing helpers (`routing.tiered_path_costs`, `traffic_flows.get`,
     `network_processing.get_nested_edge_betweenness`, etc.) when the
     routing targets are guaranteed to live inside this `costs` ODM — e.g.
-    the canonical traffic-flows workflow:
+    the canonical traffic-flows workflow::
 
         costs  = routing.tiered_path_costs(pairs, g, weight)
         sample = traffic_flows.nested_node_sample(pairs, weights, costs, ...)
@@ -1282,5 +1333,3 @@ def max_cost(costs: TieredODPairs) -> float:
             if finite.size:
                 finite_max = max(finite_max, float(finite.max()))
     return finite_max if finite_max > -np.inf else 0.0
-
-

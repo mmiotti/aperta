@@ -4,11 +4,13 @@ aperta — accessibility analysis on multimodal transport networks.
 The library is organized around a six-phase workflow:
 
   1. Load and prepare data  — networks (per mode), land use, topography.
-  2. Map data to units      — `cells → zones → regions` aggregation hierarchy
+  2. Map data to units      — `cells → zones` aggregation hierarchy
                               (`geo_mapping`, `network_processing.snap_to_network_nodes`,
                               `network_processing.assign_to_eligible_centroid`).
-  3. Build sparse OD pairs  — `od_pairs.get_pairs` returns a `TieredODNodePairs`.
-                              Lift to `TieredODGeoPairs` via
+  3. Build sparse OD pairs  — `od_pairs.get_pairs` returns a `TieredODNodePairs`
+                              (three distance tiers: cells_to_cells,
+                              cells_to_zones, zones_to_zones). Lift to
+                              `TieredODGeoPairs` via
                               `od_pairs.reindex_by_geo_unit` for cross-modal
                               alignment / geo-unit-keyed overheads.
   4. Estimate traffic flows — `traffic_flows.nested_node_sample` +
@@ -33,25 +35,20 @@ The library is organized around a six-phase workflow:
 
 All algorithm modules (`od_pairs`, `routing`, `overhead`, `accessibility`,
 `utility`, `traffic_flows`, `geo_processing`, `geo_mapping`,
-`network_processing`, `table_processing`, `visualization`, `osm_helpers`,
-`calibration`, `topography`) operate on plain numpy / pandas / networkx
-inputs — no filesystem assumptions, no opinionated project structure.
+`network_processing`, `visualization`, `osm_helpers`, `calibration`,
+`topography`) operate on plain numpy / pandas / networkx inputs — no
+filesystem assumptions, no opinionated project structure.
 See `tests/test_workflow.py` for the ~150-line end-to-end toy-world
 example, `examples/minimal/accessibility.ipynb` for a ~40-line OSM
 quickstart, `examples/walkthrough/accessibility.ipynb` for the full
 guided tour, and `examples/extended/` for a multi-notebook showcase
 with published-paper calibration (Bern + 25 km).
 
-For an opinionated project scaffolding layer on top of aperta —
-filesystem layout, typed I/O, per-scenario coefficient tables,
-scenario-keyed output paths, optional dependency tracking — see the
-sibling `aperta-lab` repo (`aperta_lab` package).
-
 Key types:
   - `od_pairs.TieredODNodePairs` — three-tier OD dict-of-arrays keyed by network
                                    node IDs. Output of routing.
   - `od_pairs.TieredODGeoPairs`  — three-tier OD dict-of-arrays keyed by
-                                   geo-unit IDs (cells / zones / regions).
+                                   geo-unit IDs (cells / zones).
                                    Mode-agnostic; required for cross-modal
                                    accessibility and geo-unit-keyed overhead.
   - `od_pairs.TieredODPairs`     — abstract base of the two above; use as a

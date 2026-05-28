@@ -10,9 +10,7 @@ The name is Latin/Italian for *open*.
 
 **Pre-1.0, alpha.** Published alongside a toolkit paper (in submission). APIs may change without notice until v1.0.
 
-aperta the library lives here. The sibling [`aperta-lab`](https://github.com/mmiotti/aperta-lab) repo holds (a) an opinionated project-scaffolding package (`aperta_lab` — filesystem layout, typed I/O, per-scenario coefficient tables, optional dependency tracking) and (b) the concrete projects built on it, most prominently the Swiss "Urban Mobility Atlas".
-
-The boundary rule for what belongs in aperta: *if the code could run 1:1 on a different country's data, it goes here. If it knows the name of a specific input file or schema, it belongs in an application repo built on top.*
+The boundary rule for what belongs in aperta: *if the code could run 1:1 on a different country's data, it goes here. Filesystem layout, project conventions, and specific input schemas belong in an application repo built on top.*
 
 ## Install
 
@@ -71,35 +69,51 @@ The toy-world end-to-end test in [tests/test_workflow.py](tests/test_workflow.py
 
 ## Quick example
 
-A walking-accessibility map in ~40 lines using only OSM. One aperta call per phase:
+A walking-accessibility map in ~30 lines using only OSM. One aperta call per phase:
 
 ```python
+import geopandas as gpd
 import osmnx as ox
 from aperta import (accessibility, geo_mapping, geo_processing,
-                    network_processing, od_pairs, routing, visualization)
+                    network_processing, od_pairs, routing)
+
+PLACE = 'Cambridge, Massachusetts, USA'
 
 # 1. AOI + walking network
-boundary = ox.geocode_to_gdf('Cambridge, Massachusetts, USA')
+boundary = ox.geocode_to_gdf(PLACE)
 crs = boundary.estimate_utm_crs()
-graph = ox.project_graph(ox.graph_from_place('Cambridge, MA', 'walk'), to_crs=crs)
+graph = ox.project_graph(
+    ox.graph_from_place(PLACE, network_type='walk'), to_crs=crs,
+).to_undirected()
+for _u, _v, _k, data in graph.edges(keys=True, data=True):
+    data['walk_time_s'] = data['length'] / 1.4  # 1.4 m/s walking
 
 # 2. H3 cells (origins) + supermarkets (destinations)
 cells = geo_processing.build_h3_grid(boundary.geometry.iloc[0], 10,
-                                      polygon_crs='EPSG:4326', target_crs=crs)
+                                     polygon_crs='EPSG:4326', target_crs=crs)
+centroids = gpd.GeoDataFrame(geometry=cells.geometry.centroid, index=cells.index, crs=crs)
 cells['node_id'], _ = network_processing.snap_to_network_nodes(centroids, graph)
-cells['supermarkets'] = ...   # OSM POIs counted per cell
+
+sm = ox.features_from_place(PLACE, tags={'shop': 'supermarket'}).to_crs(crs)
+supermarkets = gpd.GeoDataFrame(geometry=sm.geometry.centroid.values, crs=crs)
+supermarkets['cell_id'], _ = geo_mapping.map_points_to_polygons(
+    supermarkets, cells, allow_nearest=True)
+cells['supermarkets'] = (supermarkets.groupby('cell_id').size()
+                         .reindex(cells.index, fill_value=0).astype(float))
 
 # 3. Tiered OD pairs + routing
 pairs = od_pairs.get_pairs(cells, r_cells=2000.0, node_column='node_id')
 times = routing.tiered_path_costs(pairs, graph, weight='walk_time_s')
 
-# 4. Accessibility
+# 4. Accessibility — supermarkets reachable within 15 min walk per origin cell.
 sm_weights = od_pairs.dest_values('supermarkets', pairs, cells, node_column='node_id')
-acc = accessibility.count_in_bins(times, {'supermarkets': sm_weights}, {},
-                                   [accessibility.Bin('15min', 0, 15 * 60)])
+acc = accessibility.count_in_bins(
+    times, {'supermarkets': sm_weights}, {},
+    [accessibility.Bin('15min', 0, 15 * 60)],
+)
 ```
 
-Runnable end-to-end version: [examples/minimal/accessibility.ipynb](examples/minimal/accessibility.ipynb).
+Runnable end-to-end version (with plotting): [examples/minimal/accessibility.ipynb](examples/minimal/accessibility.ipynb).
 
 ## Modules
 
@@ -113,21 +127,19 @@ Runnable end-to-end version: [examples/minimal/accessibility.ipynb](examples/min
 | `traffic_flows` | Traffic-volume estimation via cost-weighted nested-node sampling (`nested_node_sample`). |
 | `calibration` | OLS calibration of per-edge weights (`calibrate_edge_weights`) against observed point-to-point travel times; bearing-aware traffic-counter snapping (`snap_counters_to_edges`) + counter-fit evaluation (`evaluate_against_counters`) for traffic-flow calibration. |
 | `network_processing` | Network helpers — `consolidate_intersections` (OSMnx-output cleanup with obstacle re-attachment), `get_nested_edge_betweenness` (sampled edge-usage counts from a `nested_node_sample`), `snap_to_network_nodes`, `assign_to_eligible_centroid`, `aggregate_edges_to_nodes`, `lanes_per_direction`. |
-| `geo_processing` | Geometry helpers — hectare and H3 grids, bearings, `sum_within_radius` (same-set neighbourhood sum) and `cross_sum_within_radius` (cross-set buffer aggregation), both via scipy KDTree. |
+| `geo_processing` | Geometry helpers — H3 grids, line bearings, `sum_within_radius` (same-set neighbourhood sum) and `cross_sum_within_radius` (cross-set buffer aggregation) via scipy KDTree, raster sampling. |
 | `geo_mapping` | Spatial-join wrappers — `map_points_to_polygons`, `map_polygons_to_points`, `map_points_to_points`, `map_points_to_filtered_lines`. |
-| `geo_units` | Registry of the 4 canonical aperta units (`cells`, `zones`, `nodes`, `edges`) and their `id_col` conventions. |
 | `osm_helpers` | OSM data fetching + per-edge categorisation via `osmnx` (`fetch_network`, `fetch_pois`, `categorize_edges`). Requires `aperta[osm]`. |
 | `topography` | Copernicus GLO-30 DEM download + raster sampling (`fetch_copernicus_dem`). Requires `aperta[topo]`. |
 | `visualization` | Plot helpers — `plot_cell_values` (single-panel choropleth), `plot_cell_values_comparison` (multi-panel with shared scale), `plot_tiered_destinations` (origin-cell tier viz), `plot_edge_values` (LineCollection-based with sort/z-order control), `add_styled_colorbar`. |
-| `table_processing` | DataFrame helpers — column-aware aggregation, upcasting, integer-column restoration, metric discovery. |
-| `utils` | `timeit` decorator, weighted-aggregation helpers, statsmodels result formatting. |
-| `errors` | `DataError`, `ProcessingError`. |
+| `utils` | `timeit` decorator. |
+| `errors` | Aperta-specific exception types (`ContextError`, `DataError`, `ProcessingError`). |
 
 ## Design
 
 aperta is intentionally lightweight and **agnostic about how you organise your data and pipeline**:
 
-- **No filesystem assumptions.** Algorithm functions take plain `networkx` graphs, `pandas` / `geopandas` frames, and `numpy` arrays. They don't read or write files. The opinionated I/O + project scaffolding layer lives in the sibling [`aperta-lab`](https://github.com/mmiotti/aperta-lab) repo (`aperta_lab` package).
+- **No filesystem assumptions.** Algorithm functions take plain `networkx` graphs, `pandas` / `geopandas` frames, and `numpy` arrays. They don't read or write files.
 - **No DAG engine.** No caching, no dependency graph, no orchestration. For full DAG features layer [DVC](https://dvc.org/) or [Snakemake](https://snakemake.readthedocs.io/) on top.
 - **Routing profiles are plain Python functions, not config files.** Other routing tools define modes (car, bike, pedestrian) via custom formats — Lua profiles in OSRM, JSON costing-options in Valhalla, YAML in GraphHopper. aperta skips that layer: a profile is a Python callable that returns an edge cost. Trade-off: no shared library of pre-built profiles to pick from, but full Python expressivity (call numpy, look up calibrated coefficients, branch on anything).
 - **No global state** — every function takes its inputs explicitly.

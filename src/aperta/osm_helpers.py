@@ -22,7 +22,7 @@ cached, a different provider, etc.) is also exposed as `categorize_pois`.
 `osmnx` is an optional dependency (`aperta[osm]` or `aperta[examples]`);
 calls to `fetch_*` import it lazily and raise a helpful error if missing.
 
-Example category map:
+Example category map::
 
     POI_CATEGORIES = {
         'groceries': [
@@ -42,13 +42,12 @@ Example category map:
     # plus per-category columns: groceries, groceries_weight,
     # education_school, education_school_weight, transit_rail, transit_rail_weight.
 """
+
 from __future__ import annotations
 
 import geopandas as gpd
 import networkx as nx
-import pandas as pd
 import shapely.geometry.base
-
 
 # A category map: `{user_category -> [(osm_tag_pair, weight), ...]}`
 # where `osm_tag_pair` is a `'key:value'` string like `'shop:supermarket'`.
@@ -59,7 +58,8 @@ CategoryMap = dict[str, list[tuple[str, float]]]
 # Pure logic — no network access
 # ---------------------------------------------------------------------------
 
-def osm_tag_query_for_categories(category_map: CategoryMap) -> dict[str, list[str]]:
+
+def osm_tag_query_for_categories(category_map: CategoryMap) -> dict[str, bool | str | list[str]]:
     """Build the osmnx `tags=` argument from a category map.
 
     Unions every `key:value` pair across all categories and groups by key.
@@ -78,11 +78,11 @@ def osm_tag_query_for_categories(category_map: CategoryMap) -> dict[str, list[st
     out: dict[str, set[str]] = {}
     for tags in category_map.values():
         for tag_pair, _weight in tags:
-            if ':' not in tag_pair:
+            if ":" not in tag_pair:
                 raise ValueError(
-                    f"Tag pair {tag_pair!r} must be 'key:value' "
-                    f"(e.g. 'shop:supermarket').")
-            key, value = tag_pair.split(':', 1)
+                    f"Tag pair {tag_pair!r} must be 'key:value' (e.g. 'shop:supermarket')."
+                )
+            key, value = tag_pair.split(":", 1)
             out.setdefault(key, set()).add(value)
     return {k: sorted(v) for k, v in out.items()}
 
@@ -91,7 +91,7 @@ def categorize_pois(
     pois: gpd.GeoDataFrame,
     category_map: CategoryMap,
     *,
-    weight_suffix: str = '_weight',
+    weight_suffix: str = "_weight",
     drop_unmatched: bool = True,
 ) -> gpd.GeoDataFrame:
     """Add per-category count + weighted-count columns to a POI GeoDataFrame.
@@ -128,16 +128,17 @@ def categorize_pois(
     pois = pois.copy()
     count_cols: list[str] = []
     for category, tags in category_map.items():
-        weight_col = f'{category}{weight_suffix}'
+        weight_col = f"{category}{weight_suffix}"
         if category in pois.columns or weight_col in pois.columns:
             raise ValueError(
                 f"Category {category!r} would overwrite an existing column "
                 f"(have {category!r} / {weight_col!r}). Rename the category "
-                f"or use a different `weight_suffix`.")
+                f"or use a different `weight_suffix`."
+            )
         pois[category] = 0
         pois[weight_col] = 0.0
         for tag_pair, weight in tags:
-            key, value = tag_pair.split(':', 1)
+            key, value = tag_pair.split(":", 1)
             if key not in pois.columns:
                 continue
             match = pois[key] == value
@@ -154,6 +155,7 @@ def categorize_pois(
 # End-to-end fetchers — require osmnx
 # ---------------------------------------------------------------------------
 
+
 def fetch_pois(
     polygon: shapely.geometry.base.BaseGeometry,
     polygon_crs: str,
@@ -161,7 +163,7 @@ def fetch_pois(
     *,
     target_crs: str | None = None,
     use_centroid: bool = True,
-    weight_suffix: str = '_weight',
+    weight_suffix: str = "_weight",
     drop_unmatched: bool = True,
 ) -> gpd.GeoDataFrame:
     """Fetch OSM POIs within `polygon` and tag them with category columns.
@@ -192,19 +194,20 @@ def fetch_pois(
     """
     import osmnx as ox
 
-    polygon_4326 = gpd.GeoSeries([polygon], crs=polygon_crs).to_crs('EPSG:4326').iloc[0]
+    polygon_4326 = gpd.GeoSeries([polygon], crs=polygon_crs).to_crs("EPSG:4326").iloc[0]
     tags_query = osm_tag_query_for_categories(category_map)
     raw = ox.features_from_polygon(polygon_4326, tags=tags_query)
-    raw = raw[raw.geometry.type.isin(['Point', 'Polygon', 'MultiPolygon'])]
+    raw = raw[raw.geometry.type.isin(["Point", "Polygon", "MultiPolygon"])]
     if target_crs is not None:
         raw = raw.to_crs(target_crs)
     if use_centroid:
         # Now (after the optional reprojection) centroid is computed in
         # target_crs (typically metric) — geometrically meaningful.
         raw = raw.copy()
-        raw['geometry'] = raw.geometry.centroid
+        raw["geometry"] = raw.geometry.centroid
     return categorize_pois(
-        raw, category_map,
+        raw,
+        category_map,
         weight_suffix=weight_suffix,
         drop_unmatched=drop_unmatched,
     )
@@ -240,9 +243,11 @@ def fetch_network(
     """
     import osmnx as ox
 
-    polygon_4326 = gpd.GeoSeries([polygon], crs=polygon_crs).to_crs('EPSG:4326').iloc[0]
+    polygon_4326 = gpd.GeoSeries([polygon], crs=polygon_crs).to_crs("EPSG:4326").iloc[0]
     graph = ox.graph_from_polygon(
-        polygon_4326, network_type=network_type, simplify=simplify,
+        polygon_4326,
+        network_type=network_type,
+        simplify=simplify,
     )
     if target_crs is not None:
         graph = ox.project_graph(graph, to_crs=target_crs)

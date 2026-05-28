@@ -1,29 +1,42 @@
-"""
-To approaches to estimate daily traffic volumes (AADT) using betweenness centrality:
-- A one-shot approach using native betweenness centrality in a limited radius
-- A more detailed approach using distance-weighted node sampling; essentially implementing a quick
-  and dirty 3-step travel demand model (trip generation, trip distribution, iterative
-  route assignment until equilibrium is reached). The mode is fixed.
+"""Distance-weighted traffic-flow estimation via sampled betweenness centrality.
+
+Estimates daily per-edge traffic volumes (AADT) by simulating a quick-and-dirty
+3-step travel demand model: trip generation (origin sampling weighted by
+population), trip distribution (per-origin destination sampling weighted by a
+cost-decay function and per-destination attractiveness), and route assignment
+(shortest-path routing on the current edge weights, accumulating per-edge
+counts). Iterating the loop with congestion-aware edge-weight updates moves
+the system toward equilibrium.
+
+This module supplies the sampling primitives (`nested_node_sample`) and the
+normalization step (`get`) that turns raw sampled-betweenness counts into a
+per-edge volume calibrated against an expected total vehicle-kilometres figure.
+The routing + per-edge accumulation itself lives in
+`network_processing.get_nested_edge_betweenness`. A simpler alternative for
+small study areas — radius-limited Brandes betweenness without explicit OD
+sampling — also lives in `network_processing`.
 """
 
 from collections import defaultdict
 from typing import Callable
 
+import networkx as nx
 import numpy as np
 import pandas as pd
-import networkx as nx
 from numba import njit
 
 from aperta import network_processing, utils
 from aperta.od_pairs import TieredODPairs
 
 
-def get(g: nx.MultiGraph,
-        routing_edge_weight: str,
-        expected_km_driven: int | float,
-        nested_node_sample: dict,
-        *,
-        cutoff: float | None = None) -> pd.Series:
+def get(
+    g: nx.MultiGraph,
+    routing_edge_weight: str,
+    expected_km_driven: int | float,
+    nested_node_sample: dict,
+    *,
+    cutoff: float | None = None,
+) -> pd.Series:
     """Traffic-flow estimation from a nested OD sample, normalised to
     `expected_km_driven` total vehicle-kilometres.
 
@@ -39,8 +52,9 @@ def get(g: nx.MultiGraph,
     country-scale graphs. Default `None` = no cutoff.
     """
     bc = network_processing.get_nested_edge_betweenness(
-        g, nested_node_sample, routing_edge_weight, cutoff=cutoff)
-    lengths = nx.get_edge_attributes(g, 'length')
+        g, nested_node_sample, routing_edge_weight, cutoff=cutoff
+    )
+    lengths = nx.get_edge_attributes(g, "length")
     factor = expected_km_driven / sum(v * lengths[k] for k, v in bc.items())
     return bc * factor
 
@@ -158,7 +172,14 @@ def nested_node_sample(
 
     Returns: `{origin_cell_node -> np.ndarray[dest_node]}` of length `n_dest`.
     """
-    origins = np.asarray(list(pairs.cells_to_cells.keys()))
+    if pairs.cells_to_cells is None:
+        raise ValueError("`pairs.cells_to_cells` is None; cell-tier is required.")
+    if costs.cells_to_cells is None or weights.cells_to_cells is None:
+        raise ValueError("`costs` and `weights` must both have a populated cell-tier.")
+    cell_pairs = pairs.cells_to_cells
+    cell_costs_dict = costs.cells_to_cells
+    cell_weights_dict = weights.cells_to_cells
+    origins = np.asarray(list(cell_pairs.keys()))
     p = np.asarray(orig_weights, dtype=float)
     p = p / p.sum()
     chosen = random_state.choice(origins, n_orig, True, p)
@@ -190,13 +211,14 @@ def nested_node_sample(
     out: dict = {}
     for zone_node, cells_here in chosen_by_zone.items():
         zone_dests, zone_score = z_combo.get(
-            zone_node, (empty_dest, empty_score),
+            zone_node,
+            (empty_dest, empty_score),
         )
         for c in cells_here:
             # Cell tier (cells_to_cells): per-cell origin + per-cell dest.
-            cell_dests = pairs.cells_to_cells[c]
-            cell_costs = costs.cells_to_cells[c]
-            cell_weights = weights.cells_to_cells[c]
+            cell_dests = cell_pairs[c]
+            cell_costs = cell_costs_dict[c]
+            cell_weights = cell_weights_dict[c]
             if c in cell_mask_dict:
                 m = cell_mask_dict[c]
                 cell_dests, cell_costs, cell_weights = cell_dests[m], cell_costs[m], cell_weights[m]

@@ -9,25 +9,21 @@ elevation-aware edge weights.
 Heavy optional dependencies (`rasterio`, `requests`) are imported lazily —
 the rest of `aperta` works without them.
 """
+
 from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
 
-
-COPERNICUS_DEM_URL_TEMPLATE = (
-    'https://copernicus-dem-30m.s3.amazonaws.com/{name}/{name}.tif'
-)
-COPERNICUS_DEM_TILE_NAME_TEMPLATE = (
-    'Copernicus_DSM_COG_10_N{lat:02d}_00_E{lng:03d}_00_DEM'
-)
+COPERNICUS_DEM_URL_TEMPLATE = "https://copernicus-dem-30m.s3.amazonaws.com/{name}/{name}.tif"
+COPERNICUS_DEM_TILE_NAME_TEMPLATE = "Copernicus_DSM_COG_10_N{lat:02d}_00_E{lng:03d}_00_DEM"
 
 
 def fetch_copernicus_dem(
     polygon,
     out_path,
     *,
-    polygon_crs: str = 'EPSG:4326',
+    polygon_crs: str = "EPSG:4326",
     target_crs: str | None = None,
     cache_tile_dir=None,
     cleanup_tiles: bool = True,
@@ -74,6 +70,7 @@ def fetch_copernicus_dem(
     """
     try:
         import rasterio
+        import requests
         from rasterio.io import MemoryFile
         from rasterio.mask import mask as raster_mask
         from rasterio.merge import merge as raster_merge
@@ -82,12 +79,11 @@ def fetch_copernicus_dem(
             calculate_default_transform,
             reproject,
         )
-        import requests
     except ImportError as e:
         raise ImportError(
             "fetch_copernicus_dem needs the `topo` extras "
-            "(`pip install 'aperta[topo]'`) — missing: "
-            + str(e)) from None
+            "(`pip install 'aperta[topo]'`) — missing: " + str(e)
+        ) from None
 
     out_path = Path(out_path)
     if out_path.exists():
@@ -97,26 +93,26 @@ def fetch_copernicus_dem(
     cache_tile_dir.mkdir(parents=True, exist_ok=True)
 
     # 1°-tile bounding box in EPSG:4326.
-    if polygon_crs != 'EPSG:4326':
-        polygon_4326 = (gpd.GeoSeries([polygon], crs=polygon_crs)
-                        .to_crs('EPSG:4326').iloc[0])
+    if polygon_crs != "EPSG:4326":
+        polygon_4326 = gpd.GeoSeries([polygon], crs=polygon_crs).to_crs("EPSG:4326").iloc[0]
     else:
         polygon_4326 = polygon
     minx, miny, maxx, maxy = polygon_4326.bounds
     lats = range(int(np.floor(miny)), int(np.ceil(maxy)))
     lngs = range(int(np.floor(minx)), int(np.ceil(maxx)))
-    tile_names = [COPERNICUS_DEM_TILE_NAME_TEMPLATE.format(lat=lat, lng=lng)
-                  for lat in lats for lng in lngs]
+    tile_names = [
+        COPERNICUS_DEM_TILE_NAME_TEMPLATE.format(lat=lat, lng=lng) for lat in lats for lng in lngs
+    ]
     if verbose:
         print(f"Downloading {len(tile_names)} Copernicus DEM tile(s)...")
 
     raw_tiles: list[Path] = []
     for tname in tile_names:
-        local = cache_tile_dir / f'{tname}.tif'
+        local = cache_tile_dir / f"{tname}.tif"
         if not local.exists():
             url = COPERNICUS_DEM_URL_TEMPLATE.format(name=tname)
             if verbose:
-                print(f"  {tname} ...", end='', flush=True)
+                print(f"  {tname} ...", end="", flush=True)
             r = requests.get(url, timeout=120)
             r.raise_for_status()
             local.write_bytes(r.content)
@@ -128,10 +124,14 @@ def fetch_copernicus_dem(
     srcs = [rasterio.open(p) for p in raw_tiles]
     mosaic, mosaic_transform = raster_merge(srcs)
     mosaic_meta = srcs[0].meta.copy()
-    mosaic_meta.update({
-        'height': mosaic.shape[1], 'width': mosaic.shape[2],
-        'transform': mosaic_transform, 'compress': 'lzw',
-    })
+    mosaic_meta.update(
+        {
+            "height": mosaic.shape[1],
+            "width": mosaic.shape[2],
+            "transform": mosaic_transform,
+            "compress": "lzw",
+        }
+    )
 
     # Clip (in EPSG:4326).
     with MemoryFile() as memfile:
@@ -139,43 +139,58 @@ def fetch_copernicus_dem(
             tmp.write(mosaic)
         with memfile.open() as tmp:
             clipped, clipped_transform = raster_mask(
-                tmp, [polygon_4326.__geo_interface__], crop=True)
+                tmp, [polygon_4326.__geo_interface__], crop=True
+            )
             clipped_meta = tmp.meta.copy()
-    clipped_meta.update({
-        'height': clipped.shape[1], 'width': clipped.shape[2],
-        'transform': clipped_transform, 'compress': 'lzw',
-    })
+    clipped_meta.update(
+        {
+            "height": clipped.shape[1],
+            "width": clipped.shape[2],
+            "transform": clipped_transform,
+            "compress": "lzw",
+        }
+    )
 
     for s in srcs:
         s.close()
 
     # Optionally reproject.
-    if target_crs is None or target_crs == clipped_meta['crs']:
+    if target_crs is None or target_crs == clipped_meta["crs"]:
         final_arr = clipped
         final_meta = clipped_meta
     else:
-        src_crs = clipped_meta['crs']
+        src_crs = clipped_meta["crs"]
         dst_transform, dst_width, dst_height = calculate_default_transform(
-            src_crs, target_crs,
-            clipped_meta['width'], clipped_meta['height'],
+            src_crs,
+            target_crs,
+            clipped_meta["width"],
+            clipped_meta["height"],
             *rasterio.transform.array_bounds(
-                clipped_meta['height'], clipped_meta['width'],
-                clipped_meta['transform']),
+                clipped_meta["height"], clipped_meta["width"], clipped_meta["transform"]
+            ),
         )
         final_arr = np.empty((1, dst_height, dst_width), dtype=clipped.dtype)
         reproject(
-            source=clipped[0], destination=final_arr[0],
-            src_transform=clipped_meta['transform'], src_crs=src_crs,
-            dst_transform=dst_transform, dst_crs=target_crs,
+            source=clipped[0],
+            destination=final_arr[0],
+            src_transform=clipped_meta["transform"],
+            src_crs=src_crs,
+            dst_transform=dst_transform,
+            dst_crs=target_crs,
             resampling=Resampling.bilinear,
         )
         final_meta = clipped_meta.copy()
-        final_meta.update({
-            'crs': target_crs, 'transform': dst_transform,
-            'width': dst_width, 'height': dst_height, 'compress': 'lzw',
-        })
+        final_meta.update(
+            {
+                "crs": target_crs,
+                "transform": dst_transform,
+                "width": dst_width,
+                "height": dst_height,
+                "compress": "lzw",
+            }
+        )
 
-    with rasterio.open(out_path, 'w', **final_meta) as dst:
+    with rasterio.open(out_path, "w", **final_meta) as dst:
         dst.write(final_arr)
 
     if cleanup_tiles:
@@ -184,10 +199,12 @@ def fetch_copernicus_dem(
 
     if verbose:
         h, w = final_arr.shape[1], final_arr.shape[2]
-        valid = final_arr[final_arr != final_meta.get('nodata', None)]
+        valid = final_arr[final_arr != final_meta.get("nodata", None)]
         if valid.size:
-            print(f"DEM saved to {out_path}: {h} × {w} pixels; "
-                  f"elevation range {valid.min():.0f}–{valid.max():.0f} m.")
+            print(
+                f"DEM saved to {out_path}: {h} × {w} pixels; "
+                f"elevation range {valid.min():.0f}–{valid.max():.0f} m."
+            )
         else:
             print(f"DEM saved to {out_path}: {h} × {w} pixels.")
 

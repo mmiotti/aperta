@@ -8,13 +8,12 @@ The library exposes two concerns separately:
 1. **Edge weighting** — `apply_edge_weights` runs a user-supplied callable on each
    edge of a graph and writes the result to a named edge attribute. Mode-specific
    behavior (car vs. bike vs. walking, peak vs. off-peak, density-adjusted speeds,
-   intersection penalties, etc.) lives in these callables, not in this module. See
-   `aperta.network_processing.edge_duration_lumos` for the reference pattern.
-
+   intersection penalties, etc.) lives in these callables, not in this module.
    `combine_edge_weights` sums multiple per-edge components into a single routing
    weight (e.g. edge travel time + intersection penalty -> total cost).
 
 2. **Routing primitives** — covering the common query shapes:
+
    - `shortest_distances_from`: single source → all reachable nodes (with optional
      cutoff). Used for accessibility / isochrone calculations.
    - `shortest_distances_pairwise`: full distance matrix between two node lists.
@@ -37,28 +36,28 @@ graph into one object; for now, callers compose the pieces themselves.
 """
 
 import logging
+from collections.abc import Sequence
+from typing import Callable, NamedTuple
 
+import networkx as nx
 import numpy as np
 import pandas as pd
-import networkx as nx
-
-from typing import Callable, NamedTuple
 
 from aperta.errors import DataError
 from aperta.od_pairs import TieredODNodePairs, TieredODPairs
 from aperta.utils import timeit
 
-
 # ---------------------------------------------------------------------------
 # Edge weighting
 # ---------------------------------------------------------------------------
 
+
 def apply_edge_weights(g: nx.Graph, weight_fn: Callable, weight_name: str, **fn_kwargs) -> None:
     """Apply `weight_fn` to each edge of `g` (mutates `g` in place).
 
-    `weight_fn` receives the edge data dict plus any **fn_kwargs. The dict
-    supports `row['key']` access just like a pandas Series, so callables written
-    against the lumos GeoDataFrame pattern work without modification.
+    `weight_fn` receives the edge data dict plus any extra `fn_kwargs`. The
+    dict supports `row['key']` access just like a pandas Series, so callables
+    written against a GeoDataFrame edge-row pattern work without modification.
     """
     if isinstance(g, (nx.MultiGraph, nx.MultiDiGraph)):
         for _u, _v, _k, data in g.edges(keys=True, data=True):
@@ -100,8 +99,7 @@ def combine_edge_weights(g: nx.Graph, source_names: list[str], target_name: str)
 # ---------------------------------------------------------------------------
 
 
-def _graph_to_csr(graph: nx.Graph, weight: str,
-                  return_parallel_keys: bool = False):
+def _graph_to_csr(graph: nx.Graph, weight: str, return_parallel_keys: bool = False):
     """Build a scipy CSR matrix from `graph` using `weight` as edge cost.
 
     For MultiGraph / MultiDiGraph parallels, keeps the minimum-weight edge
@@ -131,6 +129,7 @@ def _graph_to_csr(graph: nx.Graph, weight: str,
         `return_parallel_keys=True`.
     """
     import scipy.sparse
+
     node_ids = list(graph.nodes())
     nx_to_seq = {n: i for i, n in enumerate(node_ids)}
     seq_to_nx = np.array(node_ids, dtype=object)
@@ -163,25 +162,25 @@ def _graph_to_csr(graph: nx.Graph, weight: str,
                 _update((vi, ui), w)
     n = len(node_ids)
     if min_weight:
-        rows = np.fromiter((u for u, _v in min_weight.keys()),
-                           dtype=np.int64, count=len(min_weight))
-        cols = np.fromiter((v for _u, v in min_weight.keys()),
-                           dtype=np.int64, count=len(min_weight))
-        data = np.fromiter(min_weight.values(), dtype=float,
-                           count=len(min_weight))
+        rows = np.fromiter(
+            (u for u, _v in min_weight.keys()), dtype=np.int64, count=len(min_weight)
+        )
+        cols = np.fromiter(
+            (v for _u, v in min_weight.keys()), dtype=np.int64, count=len(min_weight)
+        )
+        data = np.fromiter(min_weight.values(), dtype=float, count=len(min_weight))
     else:
         rows = cols = np.empty(0, dtype=np.int64)
         data = np.empty(0, dtype=float)
-    csr = scipy.sparse.csr_matrix((data, (rows, cols)), shape=(n, n),
-                                   dtype=float)
+    csr = scipy.sparse.csr_matrix((data, (rows, cols)), shape=(n, n), dtype=float)
     if return_parallel_keys:
         return csr, nx_to_seq, seq_to_nx, parallel_keys
     return csr, nx_to_seq, seq_to_nx
 
 
-def _walk_predecessors_to_path(predecessors_row: np.ndarray,
-                                origin_seq: int, target_seq: int,
-                                seq_to_nx: np.ndarray) -> list:
+def _walk_predecessors_to_path(
+    predecessors_row: np.ndarray, origin_seq: int, target_seq: int, seq_to_nx: np.ndarray
+) -> list:
     """Reconstruct path (as list of nx node IDs) from scipy's predecessor row.
 
     Returns `[]` if `target_seq` is unreachable (predecessor chain hits -9999
@@ -205,6 +204,7 @@ def _walk_predecessors_to_path(predecessors_row: np.ndarray,
 # converts to a scipy CSR matrix internally via `_graph_to_csr`.
 # ---------------------------------------------------------------------------
 
+
 def shortest_distances_from(
     graph: nx.Graph,
     origin,
@@ -217,12 +217,13 @@ def shortest_distances_from(
     within that weight threshold are returned. Unreachable nodes are omitted.
     """
     import scipy.sparse.csgraph as csg
+
     csr, nx_to_seq, seq_to_nx = _graph_to_csr(graph, weight)
     limit = cutoff if cutoff is not None else np.inf
-    dist_row = csg.dijkstra(csr, indices=[nx_to_seq[origin]],
-                            limit=limit, return_predecessors=False)[0]
-    return {seq_to_nx[i]: float(d) for i, d in enumerate(dist_row)
-            if np.isfinite(d)}
+    dist_row = csg.dijkstra(
+        csr, indices=[nx_to_seq[origin]], limit=limit, return_predecessors=False
+    )[0]
+    return {seq_to_nx[i]: float(d) for i, d in enumerate(dist_row) if np.isfinite(d)}
 
 
 def shortest_distances_pairwise(
@@ -238,13 +239,14 @@ def shortest_distances_pairwise(
     destinations are `np.inf`.
     """
     import scipy.sparse.csgraph as csg
+
     csr, nx_to_seq, _ = _graph_to_csr(graph, weight)
     limit = cutoff if cutoff is not None else np.inf
     origin_seqs = [nx_to_seq[o] for o in origins]
-    dest_seqs = np.fromiter((nx_to_seq[d] for d in destinations),
-                            dtype=np.int64, count=len(destinations))
-    dist = csg.dijkstra(csr, indices=origin_seqs, limit=limit,
-                        return_predecessors=False)
+    dest_seqs = np.fromiter(
+        (nx_to_seq[d] for d in destinations), dtype=np.int64, count=len(destinations)
+    )
+    dist = csg.dijkstra(csr, indices=origin_seqs, limit=limit, return_predecessors=False)
     return dist[:, dest_seqs]
 
 
@@ -254,7 +256,7 @@ def shortest_path_metrics_one_to_one(
     origins: list | pd.Series | np.ndarray,
     destinations: list | pd.Series | np.ndarray,
     weight: str,
-    length_attr: str = 'length',
+    length_attr: str = "length",
     edge_features: dict[str, str] | None = None,
     *,
     cutoff: float | None = None,
@@ -285,11 +287,12 @@ def shortest_path_metrics_one_to_one(
     if not (len(trip_ids) == len(origins) == len(destinations)):
         raise DataError("trip_ids, origins, and destinations must have equal lengths.")
     edge_features = edge_features or {}
-    reserved = {'distance', 'cost'} & set(edge_features)
+    reserved = {"distance", "cost"} & set(edge_features)
     if reserved:
         raise DataError(f"edge_features may not include reserved column names: {sorted(reserved)}")
 
     import scipy.sparse.csgraph as csg
+
     csr, nx_to_seq, seq_to_nx = _graph_to_csr(graph, weight)
     is_multi = isinstance(graph, (nx.MultiGraph, nx.MultiDiGraph))
     limit = cutoff if cutoff is not None else np.inf
@@ -304,30 +307,29 @@ def shortest_path_metrics_one_to_one(
     rows = {}
     for origin, trips in by_origin.items():
         origin_seq = nx_to_seq[origin]
-        dist, pred = csg.dijkstra(csr, indices=[origin_seq], limit=limit,
-                                  return_predecessors=True)
+        dist, pred = csg.dijkstra(csr, indices=[origin_seq], limit=limit, return_predecessors=True)
         for trip_id, dest in trips:
             target_seq = nx_to_seq[dest]
             if not np.isfinite(dist[0, target_seq]):
                 continue
-            npath = _walk_predecessors_to_path(pred[0], origin_seq, target_seq,
-                                               seq_to_nx)
+            npath = _walk_predecessors_to_path(pred[0], origin_seq, target_seq, seq_to_nx)
             if not npath:
                 continue
-            edge_data = [_pick_min_weight_edge(graph, u, v, weight, is_multi)
-                         for u, v in zip(npath[:-1], npath[1:])]
+            edge_data = [
+                _pick_min_weight_edge(graph, u, v, weight, is_multi)
+                for u, v in zip(npath[:-1], npath[1:])
+            ]
             lengths = np.array([ed.get(length_attr, 0.0) for ed in edge_data])
             costs = np.array([ed[weight] for ed in edge_data])
-            row = {'distance': float(lengths.sum()), 'cost': float(costs.sum())}
+            row = {"distance": float(lengths.sum()), "cost": float(costs.sum())}
             for feature, agg in edge_features.items():
                 values = np.array([ed.get(feature, 0.0) for ed in edge_data])
                 row[feature] = _aggregate(values, lengths, agg, feature)
             rows[trip_id] = row
-    return pd.DataFrame.from_dict(rows, orient='index')
+    return pd.DataFrame.from_dict(rows, orient="index")
 
 
-def _pick_min_weight_edge(graph: nx.Graph, u, v, weight: str,
-                          is_multi: bool) -> dict:
+def _pick_min_weight_edge(graph: nx.Graph, u, v, weight: str, is_multi: bool) -> dict:
     """For a (multi)graph, return the edge data dict for the cheapest parallel edge."""
     data = graph.get_edge_data(u, v)
     if data is None:
@@ -338,11 +340,18 @@ def _pick_min_weight_edge(graph: nx.Graph, u, v, weight: str,
 
 
 def _aggregate(values: np.ndarray, weights: np.ndarray, agg: str, feature: str) -> float:
-    if agg == 'sum':
+    """Aggregate per-edge `values` along one realised path.
+
+    Supported aggregations: `'sum'` (plain sum) and `'length_weighted'`
+    (weighted average using `weights`, typically per-edge length). Raises
+    `DataError` for unknown `agg`, naming `feature` so the error points at
+    the offending route-feature specification.
+    """
+    if agg == "sum":
         return float(values.sum())
-    if agg == 'length_weighted':
+    if agg == "length_weighted":
         if weights.sum() == 0:
-            return float('nan')
+            return float("nan")
         return float(np.average(values, weights=weights))
     raise DataError(f"Unknown aggregation `{agg}` for feature `{feature}`.")
 
@@ -350,6 +359,7 @@ def _aggregate(values: np.ndarray, weights: np.ndarray, agg: str, feature: str) 
 # ---------------------------------------------------------------------------
 # Tiered OD routing
 # ---------------------------------------------------------------------------
+
 
 @timeit
 def tiered_path_costs(
@@ -409,16 +419,19 @@ def tiered_path_costs(
         `np.inf`.
     """
     import scipy.sparse.csgraph as csg
+
     csr, nx_to_seq, _seq_to_nx = _graph_to_csr(graph, weight)
-    zero_edge = (csr.nnz == 0)
+    zero_edge = csr.nnz == 0
     limit = cutoff if cutoff is not None else np.inf
 
     def _route_subset(orig, sub_dests):
         origin_seq = nx_to_seq[orig]
-        dist_row = csg.dijkstra(csr, indices=[origin_seq], limit=limit,
-                                 return_predecessors=False)[0]
-        seq_dests = np.fromiter((nx_to_seq[d] for d in sub_dests),
-                                 dtype=np.int64, count=len(sub_dests))
+        dist_row = csg.dijkstra(csr, indices=[origin_seq], limit=limit, return_predecessors=False)[
+            0
+        ]
+        seq_dests = np.fromiter(
+            (nx_to_seq[d] for d in sub_dests), dtype=np.int64, count=len(sub_dests)
+        )
         return dist_row[seq_dests]
 
     def _per_origin(orig, dests, dest_mask):
@@ -426,8 +439,7 @@ def tiered_path_costs(
         if n == 0:
             return np.empty(0, dtype=dtype)
         if zero_edge:
-            return np.array([0.0 if d == orig else np.inf for d in dests],
-                            dtype=dtype)
+            return np.array([0.0 if d == orig else np.inf for d in dests], dtype=dtype)
         if dest_mask is None:
             return _route_subset(orig, dests).astype(dtype, copy=False)
         true_idx = np.where(dest_mask)[0]
@@ -438,16 +450,16 @@ def tiered_path_costs(
 
     logging.info(
         f"tiered_path_costs: routing single-process "
-        f"(scipy, cutoff={'none' if cutoff is None else cutoff})...")
+        f"(scipy, cutoff={'none' if cutoff is None else cutoff})..."
+    )
 
-    def _process(tier_name: str, tier: dict | None,
-                 mask_tier: dict | None) -> dict | None:
+    def _process(tier_name: str, tier: dict | None, mask_tier: dict | None) -> dict | None:
         if tier is None:
             return None
         n = len(tier)
-        # Per-tier counter and progress step: long-distance tiers (zones,
-        # regions) typically take much longer per origin than cell-tier ones,
-        # so tracking a single global counter would compress the early-tier
+        # Per-tier counter and progress step: long-distance tiers (zone-to-zone)
+        # typically take much longer per origin than cell-tier ones, so
+        # tracking a single global counter would compress the early-tier
         # progress into one big jump and stretch the later tiers' updates.
         log_every = max(1, n // 10)
         out: dict = {}
@@ -462,9 +474,9 @@ def tiered_path_costs(
     c2z_mask = mask.cells_to_zones if mask is not None else None
     zones_mask = mask.zones_to_zones if mask is not None else None
     return TieredODNodePairs(
-        cells_to_cells=_process('cells_to_cells', pairs.cells_to_cells, cells_mask),
-        cells_to_zones=_process('cells_to_zones', pairs.cells_to_zones, c2z_mask),
-        zones_to_zones=_process('zones_to_zones', pairs.zones_to_zones, zones_mask),
+        cells_to_cells=_process("cells_to_cells", pairs.cells_to_cells, cells_mask),
+        cells_to_zones=_process("cells_to_zones", pairs.cells_to_zones, c2z_mask),
+        zones_to_zones=_process("zones_to_zones", pairs.zones_to_zones, zones_mask),
     )
 
 
@@ -487,9 +499,10 @@ class PathAggregation(NamedTuple):
         - `Callable[(np.ndarray) -> float]`: arbitrary callable on the
           per-edge value array.
     """
+
     name: str
     attribute: str | Callable
-    aggregator: str | Callable = 'sum'
+    aggregator: str | Callable = "sum"
 
 
 class NodeAggregation(NamedTuple):
@@ -517,9 +530,10 @@ class NodeAggregation(NamedTuple):
           empty-path semantics apply (`'sum'` → 0; `'mean'/'min'/'max'`
           → NaN).
     """
+
     name: str
     attribute: str | Callable
-    aggregator: str | Callable = 'sum'
+    aggregator: str | Callable = "sum"
     include_endpoints: bool = True
 
 
@@ -529,8 +543,7 @@ def _resolve_attribute(attr: str | Callable) -> Callable:
         return lambda u, v, data: data[attr]
     if callable(attr):
         return attr
-    raise ValueError(
-        f"`attribute` must be a string or callable, got {type(attr).__name__}.")
+    raise ValueError(f"`attribute` must be a string or callable, got {type(attr).__name__}.")
 
 
 def _resolve_node_attribute(attr: str | Callable) -> Callable:
@@ -539,8 +552,7 @@ def _resolve_node_attribute(attr: str | Callable) -> Callable:
         return lambda node, data: data[attr]
     if callable(attr):
         return attr
-    raise ValueError(
-        f"`attribute` must be a string or callable, got {type(attr).__name__}.")
+    raise ValueError(f"`attribute` must be a string or callable, got {type(attr).__name__}.")
 
 
 def _resolve_aggregator(agg: str | Callable) -> Callable:
@@ -549,19 +561,19 @@ def _resolve_aggregator(agg: str | Callable) -> Callable:
     Empty-path semantics: `'sum'` returns 0.0 (the additive identity);
     `'mean'` / `'min'` / `'max'` return NaN.
     """
-    if agg == 'sum':
+    if agg == "sum":
         return lambda arr: float(arr.sum()) if arr.size else 0.0
-    if agg == 'mean':
+    if agg == "mean":
         return lambda arr: float(arr.mean()) if arr.size else np.nan
-    if agg == 'min':
+    if agg == "min":
         return lambda arr: float(arr.min()) if arr.size else np.nan
-    if agg == 'max':
+    if agg == "max":
         return lambda arr: float(arr.max()) if arr.size else np.nan
     if callable(agg):
         return agg
     raise ValueError(
-        f"Unknown aggregator {agg!r}; expected 'sum', 'mean', 'min', 'max', "
-        f"or a callable.")
+        f"Unknown aggregator {agg!r}; expected 'sum', 'mean', 'min', 'max', or a callable."
+    )
 
 
 def aggregate_along_paths(
@@ -569,13 +581,13 @@ def aggregate_along_paths(
     graph: nx.Graph,
     weight: str,
     *,
-    edge_aggregations: list[PathAggregation] = (),
-    node_aggregations: list[NodeAggregation] = (),
+    edge_aggregations: Sequence[PathAggregation] = (),
+    node_aggregations: Sequence[NodeAggregation] = (),
     dtype: np.dtype | type = np.float32,
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     """Walk realised paths and aggregate per-edge / per-node features along each.
 
-    Pure path walker — no routing, no igraph dependency. Use this directly
+    Pure path walker — no routing involved. Use this directly
     when you already have a list of paths (Strava traces, prebuilt routes,
     calibration targets, etc.). `tiered_path_aggregate` is the wrapper that
     routes shortest paths on a `TieredODPairs` and scatters results back
@@ -617,13 +629,13 @@ def aggregate_along_paths(
     if not edge_aggregations and not node_aggregations:
         raise ValueError(
             "At least one of `edge_aggregations` / `node_aggregations` must be "
-            "non-empty. For cost-only routing, use `tiered_path_costs` instead.")
+            "non-empty. For cost-only routing, use `tiered_path_costs` instead."
+        )
     edge_aggregations = list(edge_aggregations)
     node_aggregations = list(node_aggregations)
     names = [a.name for a in edge_aggregations] + [a.name for a in node_aggregations]
     if len(set(names)) != len(names):
-        raise ValueError(
-            f"Aggregation names must be unique across edge + node specs; got {names}.")
+        raise ValueError(f"Aggregation names must be unique across edge + node specs; got {names}.")
 
     edge_attr_fns = [_resolve_attribute(a.attribute) for a in edge_aggregations]
     edge_agg_fns = [_resolve_aggregator(a.aggregator) for a in edge_aggregations]
@@ -635,8 +647,7 @@ def aggregate_along_paths(
     def _get_edge(u, v):
         """Min-`weight` edge between `u` and `v` (collapses MultiGraph parallels)."""
         if is_multi:
-            return min(graph[u][v].values(),
-                       key=lambda d: d.get(weight, np.inf))
+            return min(graph[u][v].values(), key=lambda d: d.get(weight, np.inf))
         return graph[u][v]
 
     n = len(paths)
@@ -675,16 +686,18 @@ def aggregate_along_paths(
             if nodes:
                 node_vals = np.fromiter(
                     (float(attr_fn(node, graph.nodes[node])) for node in nodes),
-                    dtype=dtype, count=len(nodes))
+                    dtype=dtype,
+                    count=len(nodes),
+                )
             else:
                 node_vals = np.empty(0, dtype=dtype)
             node_out[j][i] = float(node_agg_fns[j](node_vals))
 
     aggs: dict[str, np.ndarray] = {}
-    for spec, arr in zip(edge_aggregations, edge_out):
-        aggs[spec.name] = arr
-    for spec, arr in zip(node_aggregations, node_out):
-        aggs[spec.name] = arr
+    for edge_spec, arr in zip(edge_aggregations, edge_out):
+        aggs[edge_spec.name] = arr
+    for node_spec, arr in zip(node_aggregations, node_out):
+        aggs[node_spec.name] = arr
     return costs, aggs
 
 
@@ -694,12 +707,12 @@ def tiered_path_aggregate(
     graph: nx.Graph,
     weight: str,
     *,
-    edge_aggregations: list[PathAggregation] = (),
-    node_aggregations: list[NodeAggregation] = (),
+    edge_aggregations: Sequence[PathAggregation] = (),
+    node_aggregations: Sequence[NodeAggregation] = (),
     mask: TieredODPairs | None = None,
     cutoff: float | None = None,
     dtype: np.dtype | type = np.float32,
-) -> tuple[TieredODPairs, dict[str, TieredODPairs]]:
+) -> tuple[TieredODNodePairs, dict[str, TieredODNodePairs]]:
     """Route shortest paths and aggregate per-edge / per-node features along each.
 
     Wraps `aggregate_along_paths` with routing on every tier of `pairs`.
@@ -744,36 +757,34 @@ def tiered_path_aggregate(
     if not edge_aggregations and not node_aggregations:
         raise ValueError(
             "At least one of `edge_aggregations` / `node_aggregations` must be "
-            "non-empty. For cost-only routing, use `tiered_path_costs` instead.")
+            "non-empty. For cost-only routing, use `tiered_path_costs` instead."
+        )
     edge_aggregations = list(edge_aggregations)
     node_aggregations = list(node_aggregations)
     names = [a.name for a in edge_aggregations] + [a.name for a in node_aggregations]
     if len(set(names)) != len(names):
-        raise ValueError(
-            f"Aggregation names must be unique across edge + node specs; got {names}.")
+        raise ValueError(f"Aggregation names must be unique across edge + node specs; got {names}.")
 
     # Per-origin path retrieval via scipy dijkstra. Path reconstruction
     # walks the predecessor chain from each target back to the origin.
     import scipy.sparse.csgraph as csg
+
     csr, nx_to_seq, seq_to_nx = _graph_to_csr(graph, weight)
-    zero_edge = (csr.nnz == 0)
+    zero_edge = csr.nnz == 0
     limit = cutoff if cutoff is not None else np.inf
 
     def _paths(orig, sub_dests):
         if zero_edge:
             return [[orig] if d == orig else [] for d in sub_dests]
         origin_seq = nx_to_seq[orig]
-        dist, pred = csg.dijkstra(csr, indices=[origin_seq],
-                                   limit=limit,
-                                   return_predecessors=True)
+        dist, pred = csg.dijkstra(csr, indices=[origin_seq], limit=limit, return_predecessors=True)
         paths = []
         for d in sub_dests:
             target_seq = nx_to_seq[d]
             if not np.isfinite(dist[0, target_seq]):
                 paths.append([])  # unreachable or beyond cutoff
             else:
-                paths.append(_walk_predecessors_to_path(
-                    pred[0], origin_seq, target_seq, seq_to_nx))
+                paths.append(_walk_predecessors_to_path(pred[0], origin_seq, target_seq, seq_to_nx))
         return paths
 
     def _per_origin(orig, dests, dest_mask):
@@ -793,7 +804,9 @@ def tiered_path_aggregate(
 
         paths = _paths(orig, active_dests)
         sub_costs, sub_aggs = aggregate_along_paths(
-            paths, graph, weight,
+            paths,
+            graph,
+            weight,
             edge_aggregations=edge_aggregations,
             node_aggregations=node_aggregations,
             dtype=dtype,
@@ -804,11 +817,12 @@ def tiered_path_aggregate(
         return cost_arr, agg_arrs
 
     logging.info(
-        f"tiered_path_aggregate: routing "
-        f"(scipy, cutoff={'none' if cutoff is None else cutoff})...")
+        f"tiered_path_aggregate: routing (scipy, cutoff={'none' if cutoff is None else cutoff})..."
+    )
 
-    def _process(tier_name: str, tier: dict | None,
-                 mask_tier: dict | None) -> tuple[dict, dict[str, dict]] | None:
+    def _process(
+        tier_name: str, tier: dict | None, mask_tier: dict | None
+    ) -> tuple[dict, dict[str, dict]] | None:
         if tier is None:
             return None
         n = len(tier)
@@ -829,9 +843,9 @@ def tiered_path_aggregate(
     c2z_mask = mask.cells_to_zones if mask is not None else None
     zones_mask = mask.zones_to_zones if mask is not None else None
 
-    cells_res = _process('cells_to_cells', pairs.cells_to_cells, cells_mask)
-    c2z_res = _process('cells_to_zones', pairs.cells_to_zones, c2z_mask)
-    zones_res = _process('zones_to_zones', pairs.zones_to_zones, zones_mask)
+    cells_res = _process("cells_to_cells", pairs.cells_to_cells, cells_mask)
+    c2z_res = _process("cells_to_zones", pairs.cells_to_zones, c2z_mask)
+    zones_res = _process("zones_to_zones", pairs.zones_to_zones, zones_mask)
 
     costs = TieredODNodePairs(
         cells_to_cells=cells_res[0] if cells_res is not None else {},
@@ -923,9 +937,9 @@ def add_trip_overhead(
 
     # (tier_attr) -> (origin_info_df, dest_info_df) lookup.
     tier_infos: dict[str, tuple[pd.DataFrame | None, pd.DataFrame | None]] = {
-        'cells_to_cells':   (cell_info, cell_info),
-        'cells_to_zones':   (cell_info, zone_info),
-        'zones_to_zones':   (zone_info, zone_info),
+        "cells_to_cells": (cell_info, cell_info),
+        "cells_to_zones": (cell_info, zone_info),
+        "zones_to_zones": (zone_info, zone_info),
     }
 
     def _process(tier_attr: str) -> dict | None:
@@ -936,44 +950,52 @@ def add_trip_overhead(
         if pair_tier is None:
             raise DataError(
                 f"`pairs.{tier_attr}` is None but `costs.{tier_attr}` is set — "
-                f"can't look up destination IDs to apply overhead.")
+                f"can't look up destination IDs to apply overhead."
+            )
         info_o, info_d = tier_infos[tier_attr]
         if origin_overhead is not None and info_o is None:
             raise ValueError(
                 f"tier `{tier_attr}` has origin overhead requested but the "
-                f"matching info DataFrame is None.")
+                f"matching info DataFrame is None."
+            )
         if dest_overhead is not None and info_d is None:
             raise ValueError(
                 f"tier `{tier_attr}` has dest overhead requested but the "
-                f"matching info DataFrame is None.")
+                f"matching info DataFrame is None."
+            )
 
         out: dict = {}
         for orig, cost_arr in cost_tier.items():
             new_c = np.asarray(cost_arr).copy()
             if origin_overhead is not None:
+                # Validated non-None above when origin_overhead is set.
+                assert info_o is not None
                 # Single origin -> Series. Callback returns scalar.
                 oh_o = float(origin_overhead(info_o.loc[orig]))
                 if verify_finite and not np.isfinite(oh_o):
                     raise ValueError(f"Origin overhead {orig} is not finite.")
                 new_c = new_c + oh_o
             if dest_overhead is not None:
+                assert info_d is not None
                 dests = pair_tier[orig]
                 if len(dests) > 0:
                     # Many dests -> DataFrame. Callback returns Series/array.
-                    oh_d = np.asarray(dest_overhead(info_d.loc[dests]), dtype=float)
+                    oh_d = np.asarray(dest_overhead(info_d.loc[dests]), dtype=np.float64)
                     if verify_finite:
                         not_finite = (~np.isfinite(oh_d)).sum()
                         if not_finite > 0:
-                            raise ValueError(f"Destination overhead for origin {orig} contains "
-                                             f"{not_finite:,} non-finite numbers.")
+                            raise ValueError(
+                                f"Destination overhead for origin {orig} contains "
+                                f"{not_finite:,} non-finite numbers."
+                            )
                     new_c = new_c + oh_d
             out[orig] = new_c
         return out
 
     return type(costs)(
-        cells_to_cells=_process('cells_to_cells'),
-        cells_to_zones=_process('cells_to_zones'),
-        zones_to_zones=_process('zones_to_zones'),
+        cells_to_cells=_process("cells_to_cells"),
+        cells_to_zones=_process("cells_to_zones"),
+        zones_to_zones=_process("zones_to_zones"),
     )
 
 
@@ -1011,11 +1033,11 @@ def set_min_intrazonal_cost(
 
     Args:
         costs: TieredODPairs of cost arrays.
-        min_cost: floor value.
-            - `float`: same floor for every origin.
-            - `dict[origin_node -> float]`: per-origin floor; origins absent
-              from the dict get no floor (their costs pass through unchanged).
-            - `pd.Series` indexed by origin_node: same as `dict`.
+        min_cost: floor value. Either a scalar `float` (same floor for every
+            origin), a `dict[origin_node -> float]` (per-origin floor;
+            origins absent from the dict get no floor and their costs pass
+            through unchanged), or a `pd.Series` indexed by origin_node
+            (same semantics as the dict form).
 
     Returns:
         New `TieredODPairs` with `cell_tier_cost = max(cell_tier_cost,
@@ -1033,6 +1055,10 @@ def set_min_intrazonal_cost(
         scalar_floor = float(min_cost)
 
     new_cells_to_cells: dict = {}
+    if costs.cells_to_cells is None:
+        raise ValueError(
+            "`costs.cells_to_cells` is None; cell-tier is required for this transform."
+        )
     for origin, cost_arr in costs.cells_to_cells.items():
         # Preserve input dtype (typically FP32).
         new_arr = np.asarray(cost_arr).copy()

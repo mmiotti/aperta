@@ -1,4 +1,27 @@
-import logging
+"""Graph-construction and -manipulation helpers for transport networks.
+
+Aperta operates on `networkx.Graph` (and its multi/directed variants) as its
+canonical graph type. This module supplies the operations on those graphs
+that don't fit under `routing` (shortest-path queries) or `osm_helpers`
+(OSM-specific download / parsing):
+
+- **Intersection consolidation**: `consolidate_intersections` wraps
+  `osmnx.consolidate_intersections` but preserves intersection-attribute
+  nodes (traffic signals, stop signs, roundabouts) that the OSMnx default
+  drops, which matters for any route-level analysis that counts those
+  features (Section §3.3 of the toolkit paper).
+- **Node snapping**: `snap_to_network_nodes` and `assign_to_eligible_centroid`
+  map non-graph points (cell centroids, addresses) onto the nearest graph
+  node, with optional filtering to a subset of eligible nodes.
+- **Edge / node attribute helpers**: aggregate node attributes onto edges
+  (`aggregate_nodes_to_edges`), aggregate edge attributes onto nodes
+  (`aggregate_edges_to_nodes`), and write attribute values through to a
+  graph in a tolerant way (`set_nx_edge_attributes_filled`).
+- **Edge betweenness sampling**: `get_nested_edge_betweenness` runs the
+  per-origin Dijkstra + path-walking accumulator used by the traffic-flow
+  estimation pipeline in `traffic_flows.py`.
+"""
+
 from collections import defaultdict
 from typing import Callable, Literal, cast
 
@@ -10,24 +33,35 @@ import pandas as pd
 from aperta import utils
 from aperta.errors import DataError
 
-
 # OSM highway-type ranking used by `collapse_highway_lists_by_rank` and
 # `flag_node_intersections` (for max/min per-node highway rank). Higher
 # value = more major road. Anything not listed (or `None`) is treated
 # as rank -1 ("not a real motor-vehicle road").
 HIGHWAY_RANKS: dict[str, int] = {
-    'motorway': 7,       'motorway_link': 7,
-    'trunk': 6,          'trunk_link': 6,
-    'primary': 5,        'primary_link': 5,
-    'secondary': 4,      'secondary_link': 4,
-    'tertiary': 3,       'tertiary_link': 3,
-    'residential': 2,    'road': 2,
-    'living_street': 1,  'pedestrian': 1,
-    'unclassified': -1,  'service': -1,
-    'busway': -1,        'cycleway': -1,
-    'footway': -1,       'path': -1,
-    'track': -1,         'steps': -1,
-    'crossing': -1,      'disused': -1,
+    "motorway": 7,
+    "motorway_link": 7,
+    "trunk": 6,
+    "trunk_link": 6,
+    "primary": 5,
+    "primary_link": 5,
+    "secondary": 4,
+    "secondary_link": 4,
+    "tertiary": 3,
+    "tertiary_link": 3,
+    "residential": 2,
+    "road": 2,
+    "living_street": 1,
+    "pedestrian": 1,
+    "unclassified": -1,
+    "service": -1,
+    "busway": -1,
+    "cycleway": -1,
+    "footway": -1,
+    "path": -1,
+    "track": -1,
+    "steps": -1,
+    "crossing": -1,
+    "disused": -1,
 }
 
 
@@ -49,8 +83,7 @@ def collapse_highway_lists_by_rank(graph: nx.Graph) -> None:
     a single string and silently picks the first element (e.g.
     `osmnx.add_edge_speeds` does this internally), which is not principled
     when the merged edges differ in road class. This helper picks the most
-    *major* value instead (motorway > trunk > primary > … > unclassified),
-    matching the convention from the legacy `consolidate_highway_type_by_rank`.
+    *major* value instead (motorway > trunk > primary > … > unclassified).
 
     Unknown highway names map to rank `-1`; when a list contains only unknowns
     the resulting collapsed value is the unknown with the highest dict-order.
@@ -64,18 +97,34 @@ def collapse_highway_lists_by_rank(graph: nx.Graph) -> None:
     else:
         edges_data = (d for _, _, d in graph.edges(data=True))
     for d in edges_data:
-        hw = d.get('highway')
+        hw = d.get("highway")
         if not isinstance(hw, list):
             continue
         ranks = [HIGHWAY_RANKS.get(v_, -1) for v_ in hw]
-        d['highway'] = hw[ranks.index(max(ranks))]
+        d["highway"] = hw[ranks.index(max(ranks))]
 
 
-def set_nx_edge_attributes_filled(g: nx.MultiGraph,
-                                  attr: dict | pd.Series,
-                                  attr_name: str,
-                                  fill_value = 0,
-                                  strict: bool = False):
+def set_nx_edge_attributes_filled(
+    g: nx.MultiGraph, attr: dict | pd.Series, attr_name: str, fill_value=0, strict: bool = False
+):
+    """Set per-edge attribute `attr_name` on `g`, filling missing edges with `fill_value`.
+
+    `nx.set_edge_attributes` silently leaves edges absent from the input mapping
+    without the attribute, which is a footgun for downstream code that expects
+    the attribute to be present on every edge. This wrapper writes `fill_value`
+    instead.
+
+    Args:
+        g: a MultiGraph (uses `(u, v, k)` edge keys).
+        attr: edge → value mapping, keyed by `(u, v, k)` tuples.
+        attr_name: edge attribute name to write.
+        fill_value: value to assign to edges missing from `attr`. Default 0.
+        strict: if True, raise `DataError` when `attr` is missing any of the
+            graph's edges. Default False (silently fill).
+
+    Returns:
+        `g`, mutated in place.
+    """
     if strict:
         _idx = pd.Series(index=list(g.edges(keys=True)))
         n = len(_idx.index.difference(pd.Series(attr).index))
@@ -132,11 +181,13 @@ def get_nested_edge_betweenness(
     """
     # Local import to keep scipy.sparse out of the module load path.
     import scipy.sparse.csgraph as csg
+
     from aperta.routing import _graph_to_csr
 
+    if weights is None:
+        raise ValueError("`weights` is required: traffic-flow sampling needs a real edge cost.")
     is_multi = g.is_multigraph()
-    csr, nx_to_seq, seq_to_nx, parallel_keys = _graph_to_csr(
-        g, weights, return_parallel_keys=True)
+    csr, nx_to_seq, seq_to_nx, parallel_keys = _graph_to_csr(g, weights, return_parallel_keys=True)
     limit = cutoff if cutoff is not None else np.inf
 
     out: dict = defaultdict(float)
@@ -144,8 +195,7 @@ def get_nested_edge_betweenness(
         if orig_nx not in nx_to_seq:
             continue
         orig_seq = nx_to_seq[orig_nx]
-        _, pred = csg.dijkstra(csr, indices=[orig_seq], limit=limit,
-                               return_predecessors=True)
+        _, pred = csg.dijkstra(csr, indices=[orig_seq], limit=limit, return_predecessors=True)
         pred_row = pred[0]
         for dest_nx in dest_nodes:
             v_seq = nx_to_seq.get(dest_nx)
@@ -156,6 +206,7 @@ def get_nested_edge_betweenness(
                 u_seq = pred_row[v_seq]
                 if u_seq < 0:
                     break  # unreachable / beyond cutoff
+                edge_key: tuple
                 if is_multi:
                     k = parallel_keys.get((int(u_seq), int(v_seq)))
                     edge_key = (seq_to_nx[int(u_seq)], seq_to_nx[int(v_seq)], k)
@@ -169,11 +220,11 @@ def get_nested_edge_betweenness(
 def _add_to_edge_info(node_row, collected_edge_information, cols, node_edge_relations):
     """Fan a node's feature values out onto each edge it touches."""
     if isinstance(node_edge_relations, str):
-        edge_ids = node_row[node_edge_relations].split(',')
+        edge_ids = node_row[node_edge_relations].split(",")
     elif isinstance(node_edge_relations, nx.Graph):
         edge_ids = list(node_edge_relations.edges(node_row.name, keys=True))
     else:
-        raise TypeError('node_edge_relations must be a str or nx.Graph.')
+        raise TypeError("node_edge_relations must be a str or nx.Graph.")
     for edge_id in edge_ids:
         if edge_id not in collected_edge_information:
             collected_edge_information[edge_id] = {col: [] for col in cols}
@@ -182,38 +233,37 @@ def _add_to_edge_info(node_row, collected_edge_information, cols, node_edge_rela
     return collected_edge_information
 
 
-def add_node_features_to_edges(df_nodes: pd.DataFrame,
-                               cols: list[str],
-                               node_edge_relations: str | nx.Graph,
-                               agg_func: str) -> pd.DataFrame:
+def add_node_features_to_edges(
+    df_nodes: pd.DataFrame, cols: list[str], node_edge_relations: str | nx.Graph, agg_func: str
+) -> pd.DataFrame:
     """Aggregate node-level features onto the edges they touch (sum or mean).
-    
+
     Args:
         df_nodes: list of nodes, supplied as a DataFrame.
         cols: list of columns in df_nodes to be mapped to edges.
-        node_edge_relations: if str, must list the edges belonging to each node in column 
+        node_edge_relations: if str, must list the edges belonging to each node in column
             'node_edge_relations' in df_nodes, separated by a comma (,). Otherwise, supply an
             nx.Graph where the ID of each node corresponds to the index in df_nodes.
         agg_func: how to aggregate values from different nodes onto a single edge. 'sum' or 'mean',
             or 'median'.
     """
 
-    collected_edge_information = {}
-    df_nodes.apply(lambda row: _add_to_edge_info(row,
-                                                 collected_edge_information,
-                                                 cols,
-                                                 node_edge_relations), axis=1)
+    collected_edge_information: dict = {}
+    df_nodes.apply(
+        lambda row: _add_to_edge_info(row, collected_edge_information, cols, node_edge_relations),
+        axis=1,
+    )
     for k, d in collected_edge_information.items():
         for col, values in d.items():
-            if agg_func == 'sum':
+            if agg_func == "sum":
                 collected_edge_information[k][col] = sum(values)
-            elif agg_func == 'mean':
+            elif agg_func == "mean":
                 collected_edge_information[k][col] = float(np.average(values))
-            elif agg_func == 'median':
+            elif agg_func == "median":
                 collected_edge_information[k][col] = float(np.median(values))
             else:
                 raise NotImplementedError(f"agg_func `{agg_func}` is not implemented.")
-    return pd.DataFrame.from_dict(collected_edge_information, orient='index')
+    return pd.DataFrame.from_dict(collected_edge_information, orient="index")
 
 
 def _mean_numeric(values: list):
@@ -246,8 +296,8 @@ def _mean_numeric(values: list):
 # *smaller* than that sum (parallel paths collapse to one). We recompute
 # `length` from `geometry.length` post-consolidation in metric units.
 DEFAULT_EDGE_ATTR_AGGS = {
-    'lanes': _mean_numeric,
-    'maxspeed': _mean_numeric,
+    "lanes": _mean_numeric,
+    "maxspeed": _mean_numeric,
 }
 
 
@@ -283,19 +333,20 @@ def lanes_per_direction(edge_data: dict) -> float:
     this for every consolidated edge and stores the result as
     `lanes_per_direction`.
     """
-    lanes = _parse_lanes(edge_data.get('lanes'))
-    oneway = bool(edge_data.get('oneway', False))
+    lanes = _parse_lanes(edge_data.get("lanes"))
+    oneway = bool(edge_data.get("oneway", False))
     if lanes is None:
         return 1.0
     if oneway or lanes <= 1:
         return max(1.0, lanes)
     return lanes / 2.0
 
+
 # Edge attributes dropped post-consolidation by `consolidate_intersections`
 # (callers can override). `name` is the main offender: it lists across
 # merged edges, costs disk space in `.graphml`, and isn't used anywhere
 # in aperta.
-DEFAULT_DROP_EDGE_ATTRS = ['name']
+DEFAULT_DROP_EDGE_ATTRS = ["name"]
 
 
 def _int_via_float(value) -> int:
@@ -319,17 +370,17 @@ def _int_via_float(value) -> int:
 # works as written. Pass to `ox.load_graphml` via the `node_dtypes`
 # kwarg, or use `load_consolidated_graphml` below.
 CONSOLIDATED_NODE_DTYPES: dict[str, Callable] = {
-    'is_degree_3':      _int_via_float,
-    'is_degree_4':      _int_via_float,
-    'max_highway_rank': _int_via_float,
-    'min_highway_rank': _int_via_float,
+    "is_degree_3": _int_via_float,
+    "is_degree_4": _int_via_float,
+    "max_highway_rank": _int_via_float,
+    "min_highway_rank": _int_via_float,
     # Per-obstacle `is_<name>` flags are dynamic; the default set used by
     # `consolidate_intersections` is included below. Callers that pass
     # custom `obstacle_node_tags` should extend this dict accordingly.
-    'is_traffic_signal': _int_via_float,
-    'is_stop':           _int_via_float,
-    'is_yield':          _int_via_float,
-    'is_roundabout':     _int_via_float,
+    "is_traffic_signal": _int_via_float,
+    "is_stop": _int_via_float,
+    "is_yield": _int_via_float,
+    "is_roundabout": _int_via_float,
 }
 
 # Per-edge attribute dtypes that `consolidate_intersections` writes that
@@ -337,14 +388,13 @@ CONSOLIDATED_NODE_DTYPES: dict[str, Callable] = {
 # `lanes_per_direction` round-trips as a string and arithmetic breaks
 # downstream.
 CONSOLIDATED_EDGE_DTYPES: dict[str, Callable] = {
-    'lanes_per_direction': float,
+    "lanes_per_direction": float,
 }
 
 
-def load_consolidated_graphml(filepath, *,
-                              node_dtypes: dict | None = None,
-                              edge_dtypes: dict | None = None,
-                              **kwargs):
+def load_consolidated_graphml(
+    filepath, *, node_dtypes: dict | None = None, edge_dtypes: dict | None = None, **kwargs
+):
     """Load a graphml saved by `consolidate_intersections`, casting our
     custom `is_*` / `*_highway_rank` attrs back to float.
 
@@ -368,10 +418,10 @@ def load_consolidated_graphml(filepath, *,
         `nx.MultiDiGraph`.
     """
     import osmnx as ox
+
     merged_node = {**CONSOLIDATED_NODE_DTYPES, **(node_dtypes or {})}
     merged_edge = {**CONSOLIDATED_EDGE_DTYPES, **(edge_dtypes or {})}
-    return ox.load_graphml(filepath, node_dtypes=merged_node,
-                           edge_dtypes=merged_edge, **kwargs)
+    return ox.load_graphml(filepath, node_dtypes=merged_node, edge_dtypes=merged_edge, **kwargs)
 
 
 def extract_obstacle_locations(
@@ -404,27 +454,25 @@ def extract_obstacle_locations(
     """
     if obstacle_node_tags is None:
         obstacle_node_tags = {
-            'traffic_signal': ('highway', 'traffic_signals'),
-            'stop':           ('highway', 'stop'),
-            'yield':          ('highway', 'give_way'),
+            "traffic_signal": ("highway", "traffic_signals"),
+            "stop": ("highway", "stop"),
+            "yield": ("highway", "give_way"),
         }
-    obstacle_xy: dict[str, list[tuple[float, float]]] = {
-        name: [] for name in obstacle_node_tags
-    }
+    obstacle_xy: dict[str, list[tuple[float, float]]] = {name: [] for name in obstacle_node_tags}
     for _, ndata in graph.nodes(data=True):
         for obstacle_name, (key, value) in obstacle_node_tags.items():
             tag_value = ndata.get(key)
             if tag_value == value or (isinstance(tag_value, list) and value in tag_value):
-                obstacle_xy[obstacle_name].append((ndata['x'], ndata['y']))
+                obstacle_xy[obstacle_name].append((ndata["x"], ndata["y"]))
     roundabout_xy: list[tuple[float, float]] = []
     if detect_roundabouts:
         for u, v, _, edata in graph.edges(keys=True, data=True):
-            j = edata.get('junction')
-            if j == 'roundabout' or (isinstance(j, list) and 'roundabout' in j):
+            j = edata.get("junction")
+            if j == "roundabout" or (isinstance(j, list) and "roundabout" in j):
                 u_attr, v_attr = graph.nodes[u], graph.nodes[v]
                 roundabout_xy.append(
-                    ((u_attr['x'] + v_attr['x']) / 2,
-                     (u_attr['y'] + v_attr['y']) / 2))
+                    ((u_attr["x"] + v_attr["x"]) / 2, (u_attr["y"] + v_attr["y"]) / 2)
+                )
     return obstacle_xy, roundabout_xy
 
 
@@ -496,13 +544,26 @@ def consolidate_intersections(
             `{'traffic_signal': ('highway', 'traffic_signals')}`. Add
             `'stop': ('highway', 'stop')`, `'give_way': ('highway',
             'give_way')`, etc., as needed.
+        obstacle_locations: pre-supplied `{flag_name -> [(x, y), ...]}` map.
+            When given, the obstacle extraction from `obstacle_node_tags` is
+            skipped — useful when obstacles come from a non-OSM source or
+            were captured upstream.
         detect_roundabouts: if True (default), edges with
             `junction=roundabout` are detected before consolidation and
             their midpoints get re-attached as `is_roundabout`.
-        node_attr_aggs: passed through to `ox.consolidate_intersections`
-            Any per-node attribute
-            not listed here that varies across the nodes being merged
-            will be carried through as a **list** of values.
+        roundabout_locations: pre-supplied list of roundabout midpoints
+            `[(x, y), ...]`. When given, skips the edge-based roundabout
+            detection from `detect_roundabouts`.
+        node_attr_aggs: passed through to `ox.consolidate_intersections`.
+            Any per-node attribute not listed here that varies across the
+            nodes being merged will be carried through as a **list** of
+            values.
+        edge_attr_aggs: passed through to `ox.consolidate_intersections`
+            to control how per-edge attributes are aggregated when parallel
+            edges between the same `(u, v)` are collapsed.
+        drop_edge_attrs: edge attributes to drop after consolidation. Use
+            for attributes that osmnx's aggregation leaves in a confusing
+            list-of-values form. Defaults to `DEFAULT_DROP_EDGE_ATTRS`.
 
     Returns:
         Consolidated `nx.MultiDiGraph` with new integer node IDs.
@@ -520,7 +581,8 @@ def consolidate_intersections(
     #    extract from `graph` itself via `extract_obstacle_locations`.
     if obstacle_locations is None or (detect_roundabouts and roundabout_locations is None):
         auto_obstacle_xy, auto_roundabout_xy = extract_obstacle_locations(
-            graph, obstacle_node_tags=obstacle_node_tags,
+            graph,
+            obstacle_node_tags=obstacle_node_tags,
             detect_roundabouts=detect_roundabouts,
         )
         if obstacle_locations is None:
@@ -534,10 +596,16 @@ def consolidate_intersections(
     # `rebuild_graph=True` guarantees the return is a MultiDiGraph (the
     # GeoSeries return is only when `rebuild_graph=False`), but OSMnx's
     # signature is a union — cast for the type checker.
-    consolidated = cast(nx.MultiDiGraph, ox.consolidate_intersections(
-        graph, tolerance=tolerance, rebuild_graph=True, reconnect_edges=True,
-        node_attr_aggs=node_attr_aggs,
-    ))
+    consolidated = cast(
+        nx.MultiDiGraph,
+        ox.consolidate_intersections(
+            graph,
+            tolerance=tolerance,
+            rebuild_graph=True,
+            reconnect_edges=True,
+            node_attr_aggs=node_attr_aggs,
+        ),
+    )
 
     # 3. Post-consolidation edge cleanup:
     #    - drop unwanted attrs (saves disk space + avoids round-trip
@@ -549,23 +617,21 @@ def consolidate_intersections(
     #      parallel-path merges — the merged edge's actual geometry is
     #      shorter than that sum. `geometry.length` gives metres in our
     #      metric-CRS graphs.
-    drop_attrs = (DEFAULT_DROP_EDGE_ATTRS if drop_edge_attrs is None
-                  else drop_edge_attrs)
-    eff_edge_aggs = (DEFAULT_EDGE_ATTR_AGGS if edge_attr_aggs is None
-                     else edge_attr_aggs)
+    drop_attrs = DEFAULT_DROP_EDGE_ATTRS if drop_edge_attrs is None else drop_edge_attrs
+    eff_edge_aggs = DEFAULT_EDGE_ATTR_AGGS if edge_attr_aggs is None else edge_attr_aggs
     for _, _, _, d in consolidated.edges(keys=True, data=True):
         for attr in drop_attrs:
             d.pop(attr, None)
         for attr, aggregator in eff_edge_aggs.items():
             if isinstance(d.get(attr), list):
                 d[attr] = aggregator(d[attr])
-        geom = d.get('geometry')
+        geom = d.get("geometry")
         if geom is not None:
-            d['length'] = float(geom.length)
+            d["length"] = float(geom.length)
         # Derived per-direction lane count — see `lanes_per_direction()`
         # for rationale. Runs after the lanes aggregator so list-valued
         # OSM tags are already collapsed.
-        d['lanes_per_direction'] = lanes_per_direction(d)
+        d["lanes_per_direction"] = lanes_per_direction(d)
 
     # 4. Collapse list-valued highway to a single string, then per-node
     #    intersection + highway-rank flags.
@@ -577,26 +643,24 @@ def consolidate_intersections(
     node_ids = list(consolidated.nodes)
     if not node_ids:
         return consolidated
-    node_xy = np.array([(consolidated.nodes[n]['x'],
-                         consolidated.nodes[n]['y']) for n in node_ids])
+    node_xy = np.array([(consolidated.nodes[n]["x"], consolidated.nodes[n]["y"]) for n in node_ids])
     tree = KDTree(node_xy)
 
     def _allocate(locations: list[tuple[float, float]], flag_name: str) -> None:
         for nid in consolidated.nodes():
-            consolidated.nodes[nid][f'is_{flag_name}'] = 0
+            consolidated.nodes[nid][f"is_{flag_name}"] = 0
         if not locations:
             return
-        dists, idxs = tree.query(
-            np.asarray(locations), distance_upper_bound=obstacle_buffer)
+        dists, idxs = tree.query(np.asarray(locations), distance_upper_bound=obstacle_buffer)
         # query returns idx == len(node_xy) for misses with distance_upper_bound.
         valid = (idxs < len(node_ids)) & np.isfinite(dists)
         for i in np.where(valid)[0]:
-            consolidated.nodes[node_ids[int(idxs[i])]][f'is_{flag_name}'] = 1
+            consolidated.nodes[node_ids[int(idxs[i])]][f"is_{flag_name}"] = 1
 
     for name, locs in obstacle_locations.items():
         _allocate(locs, name)
     if detect_roundabouts and roundabout_locations is not None:
-        _allocate(roundabout_locations, 'roundabout')
+        _allocate(roundabout_locations, "roundabout")
 
     return consolidated
 
@@ -627,11 +691,11 @@ def flag_node_intersections(graph: nx.Graph) -> None:
     is_multi = graph.is_multigraph()
 
     # Per-node max / min highway rank from incident edges.
-    node_max = {n: float('-inf') for n in graph.nodes}
-    node_min = {n: float('inf') for n in graph.nodes}
+    node_max = {n: float("-inf") for n in graph.nodes}
+    node_min = {n: float("inf") for n in graph.nodes}
     if is_multi:
         for u, v, _, d in graph.edges(keys=True, data=True):
-            rank = _highway_rank(d.get('highway'))
+            rank = _highway_rank(d.get("highway"))
             for endpoint in (u, v):
                 if rank > node_max[endpoint]:
                     node_max[endpoint] = rank
@@ -639,7 +703,7 @@ def flag_node_intersections(graph: nx.Graph) -> None:
                     node_min[endpoint] = rank
     else:
         for u, v, d in graph.edges(data=True):
-            rank = _highway_rank(d.get('highway'))
+            rank = _highway_rank(d.get("highway"))
             for endpoint in (u, v):
                 if rank > node_max[endpoint]:
                     node_max[endpoint] = rank
@@ -652,12 +716,12 @@ def flag_node_intersections(graph: nx.Graph) -> None:
         else:
             neighbours = set(graph.neighbors(nid))
         degree = len(neighbours)
-        graph.nodes[nid]['is_degree_3'] = int(degree == 3)
-        graph.nodes[nid]['is_degree_4'] = int(degree >= 4)
+        graph.nodes[nid]["is_degree_3"] = int(degree == 3)
+        graph.nodes[nid]["is_degree_4"] = int(degree >= 4)
         mx = node_max[nid]
         mn = node_min[nid]
-        graph.nodes[nid]['max_highway_rank'] = int(mx) if mx != float('-inf') else -1
-        graph.nodes[nid]['min_highway_rank'] = int(mn) if mn != float('inf') else -1
+        graph.nodes[nid]["max_highway_rank"] = int(mx) if mx != float("-inf") else -1
+        graph.nodes[nid]["min_highway_rank"] = int(mn) if mn != float("inf") else -1
 
 
 def snap_to_network_nodes(
@@ -697,6 +761,7 @@ def snap_to_network_nodes(
               `points.index`.
     """
     from aperta import geo_mapping  # local import to avoid module-load cycle
+
     if eligible_node_ids is None:
         node_ids = list(graph.nodes)
     else:
@@ -705,24 +770,23 @@ def snap_to_network_nodes(
         if not node_ids:
             raise ValueError(
                 "`eligible_node_ids` filter excluded every node in the graph. "
-                "Cannot snap to an empty set of targets.")
-    node_x = [graph.nodes[n]['x'] for n in node_ids]
-    node_y = [graph.nodes[n]['y'] for n in node_ids]
+                "Cannot snap to an empty set of targets."
+            )
+    node_x = [graph.nodes[n]["x"] for n in node_ids]
+    node_y = [graph.nodes[n]["y"] for n in node_ids]
     nodes_gdf = gpd.GeoDataFrame(
         geometry=gpd.points_from_xy(node_x, node_y),
-        index=pd.Index(node_ids, name='node_id'),
+        index=pd.Index(node_ids, name="node_id"),
         crs=points.crs,
     )
-    return geo_mapping.map_points_to_points(
-        points, nodes_gdf, max_distance=max_distance
-    )
+    return geo_mapping.map_points_to_points(points, nodes_gdf, max_distance=max_distance)
 
 
 def aggregate_edges_to_nodes(
     graph: nx.Graph,
     edge_attribute: str | Callable,
     *,
-    aggregator: str | Callable = 'max',
+    aggregator: str | Callable = "max",
 ) -> pd.Series:
     """For each node in `graph`, aggregate `edge_attribute` across its connected edges.
 
@@ -753,29 +817,32 @@ def aggregate_edges_to_nodes(
     """
     if isinstance(edge_attribute, str):
         attr_name = edge_attribute
+
         def _attr(u, v, data):
             return data.get(attr_name, np.nan)
     elif callable(edge_attribute):
         _attr = edge_attribute  # signature (u, v, data) -> value
     else:
         raise ValueError(
-            f"`edge_attribute` must be a string or callable, "
-            f"got {type(edge_attribute).__name__}.")
+            f"`edge_attribute` must be a string or callable, got {type(edge_attribute).__name__}."
+        )
 
-    if aggregator == 'max':
+    _agg: Callable
+    if aggregator == "max":
         _agg = np.nanmax
-    elif aggregator == 'min':
+    elif aggregator == "min":
         _agg = np.nanmin
-    elif aggregator == 'mean':
+    elif aggregator == "mean":
         _agg = np.nanmean
-    elif aggregator == 'sum':
+    elif aggregator == "sum":
         _agg = np.nansum
     elif callable(aggregator):
         _agg = aggregator
     else:
         raise ValueError(
             f"Unknown aggregator {aggregator!r}; expected "
-            f"'max', 'min', 'mean', 'sum', or a callable.")
+            f"'max', 'min', 'mean', 'sum', or a callable."
+        )
 
     per_node: defaultdict = defaultdict(list)
     is_multi = isinstance(graph, (nx.MultiGraph, nx.MultiDiGraph))
@@ -792,17 +859,20 @@ def aggregate_edges_to_nodes(
 
     # Aggregate with nan-safe semantics; suppress the "all-NaN slice"
     # warning since we return NaN in that case (and the user can filter).
-    with np.errstate(all='ignore'):
+    with np.errstate(all="ignore"):
         out = {}
         for n, vals in per_node.items():
             arr = np.asarray(vals, dtype=float)
-            finite = arr[np.isfinite(arr)] if _agg in (np.nanmax, np.nanmin,
-                                                       np.nanmean, np.nansum) else arr
+            finite = (
+                arr[np.isfinite(arr)]
+                if _agg in (np.nanmax, np.nanmin, np.nanmean, np.nansum)
+                else arr
+            )
             if _agg in (np.nanmax, np.nanmin, np.nanmean) and finite.size == 0:
                 out[n] = np.nan
             else:
                 out[n] = float(_agg(arr))
-    return pd.Series(out, name='node_value')
+    return pd.Series(out, name="node_value")
 
 
 def assign_to_eligible_centroid(
@@ -810,7 +880,7 @@ def assign_to_eligible_centroid(
     graph: nx.Graph,
     eligible_node_ids: set | list | pd.Index,
     *,
-    centroid_method: Literal['median', 'mean'] = 'median',
+    centroid_method: Literal["median", "mean"] = "median",
     fallback_to_geometric_centroid: bool = True,
     max_distance: float | None = None,
 ) -> tuple[pd.Series, pd.Series]:
@@ -818,7 +888,7 @@ def assign_to_eligible_centroid(
     transport-weighted centroid built from the *eligible* network nodes
     inside the polygon.
 
-    Designed for snapping zones / regions (especially uniformly-tiled units
+    Designed for snapping zones (especially uniformly-tiled units
     like H3 hexes) whose geometric centroid often lands on an arbitrary
     minor node — a service road, a dead-end, or worse. Using the
     median / mean coordinates of the eligible nodes within the polygon
@@ -863,26 +933,26 @@ def assign_to_eligible_centroid(
     if not elig_ids:
         raise ValueError(
             "No eligible nodes present in the graph "
-            "(every id in `eligible_node_ids` is missing from `graph.nodes`).")
-    elig_x = [graph.nodes[n]['x'] for n in elig_ids]
-    elig_y = [graph.nodes[n]['y'] for n in elig_ids]
+            "(every id in `eligible_node_ids` is missing from `graph.nodes`)."
+        )
+    elig_x = [graph.nodes[n]["x"] for n in elig_ids]
+    elig_y = [graph.nodes[n]["y"] for n in elig_ids]
     eligible_gdf = gpd.GeoDataFrame(
         geometry=gpd.points_from_xy(elig_x, elig_y),
-        index=pd.Index(elig_ids, name='node_id'),
+        index=pd.Index(elig_ids, name="node_id"),
         crs=polygons.crs,
     )
 
     # Spatial join: which eligible nodes fall in which polygon.
-    poly_index_name = polygons.index.name or 'index_right'
     joined = gpd.sjoin(
-        eligible_gdf[['geometry']], polygons[['geometry']],
-        how='inner', predicate='within',
+        eligible_gdf[["geometry"]],
+        polygons[["geometry"]],
+        how="inner",
+        predicate="within",
     )
     # Group by the polygon-side index column (named after polygons.index.name,
     # or 'index_right' if anonymous).
-    poly_id_col = (polygons.index.name
-                   if polygons.index.name is not None
-                   else 'index_right')
+    poly_id_col = polygons.index.name if polygons.index.name is not None else "index_right"
 
     # Per-polygon transport centroid: median or mean of constituent node coords.
     transport_xy: dict = {}
@@ -890,20 +960,20 @@ def assign_to_eligible_centroid(
         for poly_id, sub in joined.groupby(poly_id_col):
             x = sub.geometry.x.to_numpy()
             y = sub.geometry.y.to_numpy()
-            if centroid_method == 'median':
+            if centroid_method == "median":
                 transport_xy[poly_id] = (float(np.median(x)), float(np.median(y)))
-            elif centroid_method == 'mean':
+            elif centroid_method == "mean":
                 transport_xy[poly_id] = (float(np.mean(x)), float(np.mean(y)))
             else:
                 raise ValueError(
-                    f"`centroid_method` must be 'median' or 'mean', "
-                    f"got {centroid_method!r}.")
+                    f"`centroid_method` must be 'median' or 'mean', got {centroid_method!r}."
+                )
 
     # Fallback for polygons with no eligible node inside.
     missing_ids = polygons.index.difference(pd.Index(list(transport_xy.keys())))
     if len(missing_ids) > 0 and fallback_to_geometric_centroid:
         for poly_id in missing_ids:
-            centroid = polygons.loc[poly_id, 'geometry'].centroid
+            centroid = polygons.loc[poly_id, "geometry"].centroid
             transport_xy[poly_id] = (float(centroid.x), float(centroid.y))
 
     # Build a points GeoDataFrame of transport centroids (in polygon order).
@@ -919,10 +989,11 @@ def assign_to_eligible_centroid(
 
     # Snap each transport centroid to the nearest eligible node.
     snapped_ids, snapped_dists = snap_to_network_nodes(
-        centroids_gdf, graph, max_distance=max_distance,
+        centroids_gdf,
+        graph,
+        max_distance=max_distance,
         eligible_node_ids=eligible_set,
     )
 
     # Reindex to the full polygons.index (NaN for any that fell through).
-    return (snapped_ids.reindex(polygons.index),
-            snapped_dists.reindex(polygons.index))
+    return (snapped_ids.reindex(polygons.index), snapped_dists.reindex(polygons.index))

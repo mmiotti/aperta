@@ -15,7 +15,7 @@ tiers is done once, then reused across every (parameter × property) combination
 — so adding more bins, decays, or k values is essentially free relative to a
 single-parameter call.
 
-## Key space — node-keyed vs geo-keyed
+**Key space — node-keyed vs geo-keyed.**
 
 Two valid input shapes, distinguished by the costs/weights subclass:
 
@@ -57,6 +57,7 @@ Provides:
       for one or more k values. Lower is better; canonical "mean travel time
       to the nearest k opportunities" formulation.
 """
+
 from typing import Callable, NamedTuple
 
 import numpy as np
@@ -66,12 +67,24 @@ from aperta.od_pairs import TieredODGeoPairs, TieredODPairs
 from aperta.utils import timeit
 
 
+def _require_cell_tier(costs: TieredODPairs) -> dict:
+    """Narrow `costs.cells_to_cells` to a concrete `dict`, raising if None.
+
+    Accessibility metrics require the cell-tier to be populated (origins are
+    the cell-tier dict keys); raise a clear error if it isn't.
+    """
+    if costs.cells_to_cells is None:
+        raise ValueError("`costs.cells_to_cells` is None; cell-tier is required.")
+    return costs.cells_to_cells
+
+
 class Bin(NamedTuple):
     """Half-open cost bin: `lo <= cost < hi`. `name` labels the output column.
 
     Bins should be mutually exclusive (the function does *not* check); a
     destination falling in multiple bins would be counted multiple times.
     """
+
     name: str
     lo: float
     hi: float
@@ -87,6 +100,7 @@ class Decay(NamedTuple):
     Multiple `Decay` specs can be passed to a single `gravity` call; the per-OD
     stitching is then amortised across all of them.
     """
+
     name: str
     fn: Callable[[np.ndarray], np.ndarray]
 
@@ -104,9 +118,9 @@ def power_decay(name: str, beta: float) -> Decay:
     return Decay(name, lambda c: np.power(c, -beta))
 
 
-def _stitched_for(origin: int | str,
-                  costs: TieredODPairs,
-                  cell_to_zone_node: dict) -> tuple[np.ndarray, slice, slice, slice]:
+def _stitched_for(
+    origin: int | str, costs: TieredODPairs, cell_to_zone_node: dict
+) -> tuple[np.ndarray, slice, slice, slice]:
     """Per-origin stitched cost array + per-tier slices into it.
 
     The slices let callers stitch *other* per-tier arrays (e.g. each property's
@@ -117,12 +131,10 @@ def _stitched_for(origin: int | str,
     (cell-keyed, direct), zones_to_zones (zone-keyed, needs origin's parent
     zone). The returned slices have the same order.
     """
-    cell_arr = costs.cells_to_cells[origin]
-    c2z_arr = (costs.cells_to_zones.get(origin)
-               if costs.cells_to_zones is not None else None)
+    cell_arr = _require_cell_tier(costs)[origin]
+    c2z_arr = costs.cells_to_zones.get(origin) if costs.cells_to_zones is not None else None
     zone_node = cell_to_zone_node.get(origin)
-    zone_arr = (costs.zones_to_zones.get(zone_node)
-                if costs.zones_to_zones is not None else None)
+    zone_arr = costs.zones_to_zones.get(zone_node) if costs.zones_to_zones is not None else None
     parts = [cell_arr]
     if c2z_arr is not None:
         parts.append(c2z_arr)
@@ -140,13 +152,15 @@ def _stitched_for(origin: int | str,
     )
 
 
-def _stitched_weights(origin: int | str,
-                      zone_node: int | str | None,
-                      weights: TieredODPairs,
-                      n_cell: int,
-                      n_c2z: int,
-                      n_zone: int,
-                      dtype: np.dtype | type = np.float32) -> np.ndarray:
+def _stitched_weights(
+    origin: int | str,
+    zone_node: int | str | None,
+    weights: TieredODPairs,
+    n_cell: int,
+    n_c2z: int,
+    n_zone: int,
+    dtype: np.dtype | type = np.float32,
+) -> np.ndarray:
     """Stitch a single property's three-tier value arrays for one origin.
 
     Tiers that are `None` (or where the origin / zone has no entry) contribute
@@ -155,23 +169,23 @@ def _stitched_weights(origin: int | str,
     """
     total = n_cell + n_c2z + n_zone
     out = np.zeros(total, dtype=dtype)
-    cell_w = weights.cells_to_cells.get(origin)
+    cell_w = weights.cells_to_cells.get(origin) if weights.cells_to_cells is not None else None
     if cell_w is not None and n_cell:
         out[:n_cell] = cell_w
     if n_c2z and weights.cells_to_zones is not None:
         c2z_w = weights.cells_to_zones.get(origin)
         if c2z_w is not None:
-            out[n_cell:n_cell + n_c2z] = c2z_w
+            out[n_cell : n_cell + n_c2z] = c2z_w
     if n_zone and weights.zones_to_zones is not None:
         zw = weights.zones_to_zones.get(zone_node)
         if zw is not None:
-            out[n_cell + n_c2z:] = zw
+            out[n_cell + n_c2z :] = zw
     return out
 
 
 def _origin_index_name(costs: TieredODPairs) -> str:
     """Output-DataFrame index name based on the input ODM's key space."""
-    return 'cell' if isinstance(costs, TieredODGeoPairs) else 'node'
+    return "cell" if isinstance(costs, TieredODGeoPairs) else "node"
 
 
 def _sniff_dtype(costs: TieredODPairs) -> np.dtype:
@@ -181,8 +195,7 @@ def _sniff_dtype(costs: TieredODPairs) -> np.dtype:
     (FP32 by default, FP64 if the caller opted in upstream) without an
     explicit kwarg on every accessibility function.
     """
-    for tier in (costs.cells_to_cells, costs.cells_to_zones,
-                 costs.zones_to_zones):
+    for tier in (costs.cells_to_cells, costs.cells_to_zones, costs.zones_to_zones):
         if tier is None:
             continue
         for arr in tier.values():
@@ -226,15 +239,15 @@ def count_in_bins(
     overhead into the cost ODM upfront via `overhead.add_origin_cell_overhead`.
     """
     prop_names = list(weights.keys())
-    origins = list(costs.cells_to_cells.keys())
-    columns = pd.MultiIndex.from_product([[b.name for b in bins], prop_names],
-                                         names=['bin', 'property'])
+    origins = list(_require_cell_tier(costs).keys())
+    columns = pd.MultiIndex.from_product(
+        [[b.name for b in bins], prop_names], names=["bin", "property"]
+    )
     dtype = _sniff_dtype(costs)
     out = np.zeros((len(origins), len(bins) * len(prop_names)), dtype=dtype)
 
     for i, origin in enumerate(origins):
-        stitched_cost, cell_sl, c2z_sl, zone_sl = _stitched_for(
-            origin, costs, cell_to_zone)
+        stitched_cost, cell_sl, c2z_sl, zone_sl = _stitched_for(origin, costs, cell_to_zone)
         n_cell = cell_sl.stop - cell_sl.start
         n_c2z = c2z_sl.stop - c2z_sl.start
         n_zone = zone_sl.stop - zone_sl.start
@@ -242,15 +255,17 @@ def count_in_bins(
 
         prop_weights = np.empty((len(prop_names), len(stitched_cost)), dtype=dtype)
         for p, name in enumerate(prop_names):
-            prop_weights[p] = _stitched_weights(origin, zone_key, weights[name],
-                                                n_cell, n_c2z, n_zone, dtype=dtype)
+            prop_weights[p] = _stitched_weights(
+                origin, zone_key, weights[name], n_cell, n_c2z, n_zone, dtype=dtype
+            )
 
         for b, bin_ in enumerate(bins):
             mask = (stitched_cost >= bin_.lo) & (stitched_cost < bin_.hi)
             if not mask.any():
                 continue
-            out[i, b * len(prop_names):(b + 1) * len(prop_names)] = (
-                prop_weights[:, mask].sum(axis=1))
+            out[i, b * len(prop_names) : (b + 1) * len(prop_names)] = prop_weights[:, mask].sum(
+                axis=1
+            )
 
     return pd.DataFrame(
         out,
@@ -299,16 +314,14 @@ def gravity(
 
     prop_names = list(weights.keys())
     decay_names = [d.name for d in decays]
-    origins = list(costs.cells_to_cells.keys())
-    columns = pd.MultiIndex.from_product([decay_names, prop_names],
-                                         names=['decay', 'property'])
+    origins = list(_require_cell_tier(costs).keys())
+    columns = pd.MultiIndex.from_product([decay_names, prop_names], names=["decay", "property"])
     n_props = len(prop_names)
     dtype = _sniff_dtype(costs)
     out = np.zeros((len(origins), len(decays) * n_props), dtype=dtype)
 
     for i, origin in enumerate(origins):
-        stitched_cost, cell_sl, c2z_sl, zone_sl = _stitched_for(
-            origin, costs, cell_to_zone)
+        stitched_cost, cell_sl, c2z_sl, zone_sl = _stitched_for(origin, costs, cell_to_zone)
         n_cell = cell_sl.stop - cell_sl.start
         n_c2z = c2z_sl.stop - c2z_sl.start
         n_zone = zone_sl.stop - zone_sl.start
@@ -316,8 +329,9 @@ def gravity(
 
         prop_weights = np.empty((n_props, len(stitched_cost)), dtype=dtype)
         for p, name in enumerate(prop_names):
-            prop_weights[p] = _stitched_weights(origin, zone_key, weights[name],
-                                                n_cell, n_c2z, n_zone, dtype=dtype)
+            prop_weights[p] = _stitched_weights(
+                origin, zone_key, weights[name], n_cell, n_c2z, n_zone, dtype=dtype
+            )
 
         finite_mask = np.isfinite(stitched_cost)
         if not finite_mask.any():
@@ -335,7 +349,7 @@ def gravity(
                 w_used = w_finite[:, decay_finite]
             else:
                 w_used = w_finite
-            out[i, d * n_props:(d + 1) * n_props] = (w_used * decayed).sum(axis=1)
+            out[i, d * n_props : (d + 1) * n_props] = (w_used * decayed).sum(axis=1)
 
     return pd.DataFrame(
         out,
@@ -351,7 +365,7 @@ def nearest_k(
     cell_to_zone: dict,
     ks: int | float | list[int | float],
     *,
-    aggregator: str = 'cost_mean',
+    aggregator: str = "cost_mean",
 ) -> pd.DataFrame:
     """Nearest-`k` accessibility: cost (mean, or at-`k`) over the `k` nearest
     weight-units.
@@ -391,9 +405,8 @@ def nearest_k(
         caller opted in upstream). NaN where the `k`-th opportunity is
         unreachable.
     """
-    if aggregator not in ('cost_mean', 'cost_at_k'):
-        raise ValueError(
-            f"Unknown aggregator {aggregator!r}; expected 'cost_mean' or 'cost_at_k'.")
+    if aggregator not in ("cost_mean", "cost_at_k"):
+        raise ValueError(f"Unknown aggregator {aggregator!r}; expected 'cost_mean' or 'cost_at_k'.")
     if isinstance(ks, (int, float)):
         ks = [ks]
     if not ks:
@@ -402,16 +415,15 @@ def nearest_k(
         raise ValueError(f"All `k` values must be > 0; got {ks!r}.")
 
     prop_names = list(weights.keys())
-    origins = list(costs.cells_to_cells.keys())
-    columns = pd.MultiIndex.from_product([ks, prop_names], names=['k', 'property'])
+    origins = list(_require_cell_tier(costs).keys())
+    columns = pd.MultiIndex.from_product([ks, prop_names], names=["k", "property"])
     n_props = len(prop_names)
     dtype = _sniff_dtype(costs)
     out = np.full((len(origins), len(ks) * n_props), np.nan, dtype=dtype)
     ks_arr = np.asarray(ks, dtype=dtype)
 
     for i, origin in enumerate(origins):
-        stitched_cost, cell_sl, c2z_sl, zone_sl = _stitched_for(
-            origin, costs, cell_to_zone)
+        stitched_cost, cell_sl, c2z_sl, zone_sl = _stitched_for(origin, costs, cell_to_zone)
         n_cell = cell_sl.stop - cell_sl.start
         n_c2z = c2z_sl.stop - c2z_sl.start
         n_zone = zone_sl.stop - zone_sl.start
@@ -419,8 +431,9 @@ def nearest_k(
 
         prop_weights = np.empty((n_props, len(stitched_cost)), dtype=dtype)
         for p, name in enumerate(prop_names):
-            prop_weights[p] = _stitched_weights(origin, zone_key, weights[name],
-                                                n_cell, n_c2z, n_zone, dtype=dtype)
+            prop_weights[p] = _stitched_weights(
+                origin, zone_key, weights[name], n_cell, n_c2z, n_zone, dtype=dtype
+            )
 
         finite_mask = np.isfinite(stitched_cost)
         if not finite_mask.any():
@@ -435,15 +448,16 @@ def nearest_k(
             cum_w = np.cumsum(w)
             if cum_w.size == 0 or cum_w[-1] == 0.0:
                 continue
-            cum_cw = np.cumsum(sorted_costs * w) if aggregator == 'cost_mean' else None
+            cum_cw = np.cumsum(sorted_costs * w) if aggregator == "cost_mean" else None
             total = cum_w[-1]
             for ki, k in enumerate(ks_arr):
                 if total < k:
                     continue
-                idx = int(np.searchsorted(cum_w, k, side='left'))
-                if aggregator == 'cost_at_k':
+                idx = int(np.searchsorted(cum_w, k, side="left"))
+                if aggregator == "cost_at_k":
                     out[i, ki * n_props + p] = sorted_costs[idx]
                 else:  # cost_mean
+                    assert cum_cw is not None  # guaranteed by aggregator branch above
                     if idx == 0:
                         out[i, ki * n_props + p] = sorted_costs[0]
                     else:
@@ -459,5 +473,12 @@ def nearest_k(
 
 
 def flatten_index(df: pd.DataFrame) -> pd.DataFrame:
-    df.columns = ['__'.join(col).strip() for col in df.columns.values]
+    """Collapse a 2-level column MultiIndex into single strings joined by `__`.
+
+    Convenience for the accessibility outputs (which carry `(bin, property)`
+    or `(decay, property)` MultiIndex columns) when downstream code prefers
+    flat single-string column names (e.g. for CSV export). Mutates in place
+    and also returns `df`.
+    """
+    df.columns = ["__".join(col).strip() for col in df.columns.values]
     return df

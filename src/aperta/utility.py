@@ -1,7 +1,7 @@
 """
 Utility-based travel costs and accessibility.
 
-Aperta supports linear utility specifications of the form:
+Aperta supports linear utility specifications of the form::
 
     U_ij = constant
          + cost_coefficient * cost_ij
@@ -9,7 +9,8 @@ Aperta supports linear utility specifications of the form:
          + Σ_o origin_features[o] * feature_o(i)
          + Σ_d destination_features[d] * feature_d(j)
 
-where:
+where::
+
     cost_ij                       shortest-path cost on a chosen routing weight
     aggregated_route_feature(i,j) per-edge feature aggregated along the realised
                                   shortest path (sum / mean / etc.)
@@ -44,9 +45,9 @@ For **logsum** (cross-modal) accessibility, combine per-mode utility ODMs with
 then run gravity (with β = 1) or other downstream metrics on the combined
 ODM. See the walkthrough notebook for a worked demonstration.
 
-## Known limitations
+**Known limitations.**
 
-**Self-pair utility under positive route-feature contributions.** For a
+*Self-pair utility under positive route-feature contributions.* For a
 cell-to-itself OD pair, the realised shortest path has zero edges. The
 route-feature contribution to utility is then 0 (see the handling inside
 `route_utility` — this avoids a NaN-propagation bug where mean/min/max
@@ -68,12 +69,13 @@ self-pairs (e.g. infer the typical route-feature value from neighbouring
 cells, or apply the per-mode-defaults from the user's input). Not
 currently implemented; flagged for future work.
 """
+
 from dataclasses import dataclass, field
 from typing import Callable, NamedTuple
 
+import networkx as nx
 import numpy as np
 import pandas as pd
-import networkx as nx
 
 from aperta import od_pairs
 from aperta.od_pairs import TieredODNodePairs, TieredODPairs
@@ -96,10 +98,11 @@ class RouteFeature(NamedTuple):
     `attribute`, `aggregator`: as in `routing.PathAggregation`. `coefficient`
     is the utility weight (β); typically negative for costs / penalties.
     """
+
     name: str
     attribute: str | Callable
     coefficient: float
-    aggregator: str | Callable = 'sum'
+    aggregator: str | Callable = "sum"
 
 
 @dataclass
@@ -121,6 +124,7 @@ class Utility:
     part of this spec — they are added by the downstream accessibility
     function via `cell_overhead_column`. See module docstring.
     """
+
     constant: float = 0.0
     cost_coefficient: float = 0.0
     route_features: list[RouteFeature] = field(default_factory=list)
@@ -176,14 +180,21 @@ def route_utility(
             for rf in utility.route_features
         ]
         costs, aggs = tiered_path_aggregate(
-            pairs, graph, cost_weight,
+            pairs,
+            graph,
+            cost_weight,
             edge_aggregations=path_aggs,
-            mask=mask, dtype=dtype,
+            mask=mask,
+            dtype=dtype,
         )
     else:
         # No route features → skip path retrieval, faster.
         costs = tiered_path_costs(
-            pairs, graph, cost_weight, mask=mask, dtype=dtype,
+            pairs,
+            graph,
+            cost_weight,
+            mask=mask,
+            dtype=dtype,
         )
         aggs = {}
 
@@ -218,14 +229,16 @@ def route_utility(
         return out
 
     return TieredODNodePairs(
-        cells_to_cells=_combine_per_tier('cells_to_cells'),
-        cells_to_zones=_combine_per_tier('cells_to_zones'),
-        zones_to_zones=_combine_per_tier('zones_to_zones'),
+        cells_to_cells=_combine_per_tier("cells_to_cells"),
+        cells_to_zones=_combine_per_tier("cells_to_zones"),
+        zones_to_zones=_combine_per_tier("zones_to_zones"),
     )
 
 
 def _origin_lookup(
-    df: pd.DataFrame | None, column: str, node_column: str,
+    df: pd.DataFrame | None,
+    column: str,
+    node_column: str,
 ) -> dict | None:
     """Build a `{node_id -> value}` lookup for an origin feature.
 
@@ -235,8 +248,7 @@ def _origin_lookup(
     """
     if df is None or column not in df.columns:
         return None
-    return (df.set_index(node_column)[column]
-              .groupby(level=0).mean().to_dict())
+    return df.set_index(node_column)[column].groupby(level=0).mean().to_dict()
 
 
 @timeit
@@ -247,7 +259,7 @@ def add_endpoint_utility(
     *,
     cells: pd.DataFrame | None = None,
     zones: pd.DataFrame | None = None,
-    node_column: str = 'node_id',
+    node_column: str = "node_id",
 ) -> TieredODPairs:
     """Add constant, origin, and destination components to route utility.
 
@@ -300,9 +312,13 @@ def add_endpoint_utility(
         if cells is None or feature_col not in cells.columns:
             raise ValueError(
                 f"Destination feature {feature_col!r} not in cells.columns "
-                f"(needed for cell-tier destination lookups).")
+                f"(needed for cell-tier destination lookups)."
+            )
         d = od_pairs.dest_values(
-            feature_col, pairs, cells, node_column,
+            feature_col,
+            pairs,
+            cells,
+            node_column,
             zones=zones if zones is not None and feature_col in zones.columns else None,
         )
         dest_value_odms[feature_col] = (d, beta)
@@ -315,14 +331,16 @@ def add_endpoint_utility(
         if cell_lu is None:
             raise ValueError(
                 f"Origin feature {feature_col!r} not in cells.columns "
-                f"(needed for cell-tier origin lookups).")
+                f"(needed for cell-tier origin lookups)."
+            )
         origin_cell_lookups[feature_col] = (cell_lu, beta)
         zone_lu = _origin_lookup(zones, feature_col, node_column)
         if zone_lu is not None:
             origin_zone_lookups[feature_col] = (zone_lu, beta)
 
-    def _combine_per_tier(tier_attr: str,
-                          origin_lookups: dict[str, tuple[dict, float]]) -> dict | None:
+    def _combine_per_tier(
+        tier_attr: str, origin_lookups: dict[str, tuple[dict, float]]
+    ) -> dict | None:
         route_tier = getattr(route_utility, tier_attr)
         if route_tier is None:
             return None
@@ -344,7 +362,7 @@ def add_endpoint_utility(
         return out
 
     return TieredODNodePairs(
-        cells_to_cells=_combine_per_tier('cells_to_cells', origin_cell_lookups),
-        cells_to_zones=_combine_per_tier('cells_to_zones', origin_cell_lookups),
-        zones_to_zones=_combine_per_tier('zones_to_zones', origin_zone_lookups),
+        cells_to_cells=_combine_per_tier("cells_to_cells", origin_cell_lookups),
+        cells_to_zones=_combine_per_tier("cells_to_zones", origin_cell_lookups),
+        zones_to_zones=_combine_per_tier("zones_to_zones", origin_zone_lookups),
     )

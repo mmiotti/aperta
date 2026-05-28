@@ -1,13 +1,26 @@
+"""Map geographic features from one GeoDataFrame onto another.
+
+Four primitives, distinguished by the shape of the source/target geometries:
+
+- `map_points_to_polygons`: for each point, find the containing polygon
+  (with optional nearest-polygon fallback for points just outside any
+  polygon).
+- `map_polygons_to_points`: for each polygon, find points falling inside.
+- `map_points_to_points`: nearest-neighbor matching between two point sets.
+- `map_points_to_filtered_lines`: snap points to the nearest line within
+  a candidate-line subset selected by a per-point callback (used for
+  bearing-aware traffic-counter snapping in `calibration`).
+
+Distinct from `geo_processing`, which handles geometry construction and
+raster sampling rather than mapping data between layers.
 """
-Everything that has to do with mapping/assigning geospatial units or geospatially encoded
-information from one dataset to another
-"""
+
 import logging
 from typing import Callable
 
+import geopandas as gpd
 import numpy as np
 import pandas as pd
-import geopandas as gpd
 
 from aperta import geo_processing
 from aperta.errors import DataError
@@ -32,9 +45,8 @@ def _sjoin_with_nearest_fallback(
     `right_label` are used only for the informational log lines.
     """
     index_name = right_df.index.name
-    dist_col = index_name + '_distance'
-    res = gpd.sjoin(left_df[['geometry']], right_df[['geometry']],
-                    how='left', predicate=predicate)
+    dist_col = index_name + "_distance"
+    res = gpd.sjoin(left_df[["geometry"]], right_df[["geometry"]], how="left", predicate=predicate)
     res = geo_processing.remove_duplicate_indices(res)
     # sjoin doesn't create a distance column; initialise to NaN so we have
     # a uniform shape (and so the within-matches get NaN distances).
@@ -42,34 +54,41 @@ def _sjoin_with_nearest_fallback(
     matched = pd.notnull(res[index_name])
     logging.info(
         f"{matched.sum():,} of {len(left_df):,} {left_label} "
-        f"({matched.sum()/len(left_df)*100:.1f}%) allocated to containing "
-        f"{right_label}.")
+        f"({matched.sum() / len(left_df) * 100:.1f}%) allocated to containing "
+        f"{right_label}."
+    )
     if allow_nearest:
         res_nearest = gpd.sjoin_nearest(
-            left_df[~matched][['geometry']], right_df[['geometry']],
-            how='left', max_distance=max_distance, distance_col=dist_col,
+            left_df[~matched][["geometry"]],
+            right_df[["geometry"]],
+            how="left",
+            max_distance=max_distance,
+            distance_col=dist_col,
         )
         res_nearest = geo_processing.remove_duplicate_indices(res_nearest)
         nearest_matched = pd.notnull(res_nearest[index_name])
         denom = max((~matched).sum(), 1)
         logging.info(
             f"{nearest_matched.sum():,} of {(~matched).sum():,} remaining "
-            f"{left_label} ({nearest_matched.sum()/denom*100:.1f}%) allocated "
-            f"to nearest {right_label}.")
+            f"{left_label} ({nearest_matched.sum() / denom * 100:.1f}%) allocated "
+            f"to nearest {right_label}."
+        )
         res.loc[~matched, index_name] = res_nearest[index_name]
         res.loc[~matched, dist_col] = res_nearest[dist_col]
     unmatched = pd.isnull(res[index_name])
     denom = max((~matched).sum(), 1)
-    logging.info(f"{unmatched.sum():,} {left_label} "
-                 f"({unmatched.sum()/denom*100:.1f}%) not allocated.")
+    logging.info(
+        f"{unmatched.sum():,} {left_label} ({unmatched.sum() / denom * 100:.1f}%) not allocated."
+    )
     if not res.index.equals(left_df.index):
         raise DataError(
-            f"Index of spatial mapping result does not match original "
-            f"{left_label} index.")
+            f"Index of spatial mapping result does not match original {left_label} index."
+        )
     count_unique = len(res[index_name].unique())
     logging.info(
-        f"{count_unique:,} ({count_unique/len(right_df)*100:.1f}%) of "
-        f"{right_label} indices present among matched {left_label}.")
+        f"{count_unique:,} ({count_unique / len(right_df) * 100:.1f}%) of "
+        f"{right_label} indices present among matched {left_label}."
+    )
     res[index_name] = res[index_name].astype(right_df.index.dtype)
     return res[index_name], res[dist_col]
 
@@ -111,10 +130,13 @@ def map_points_to_polygons(
     Points that match multiple polygons (overlapping) take the first match.
     """
     return _sjoin_with_nearest_fallback(
-        left_df=points, right_df=polygons,
-        predicate='within',
-        allow_nearest=allow_nearest, max_distance=max_distance,
-        left_label='points', right_label='polygon',
+        left_df=points,
+        right_df=polygons,
+        predicate="within",
+        allow_nearest=allow_nearest,
+        max_distance=max_distance,
+        left_label="points",
+        right_label="polygon",
     )
 
 
@@ -154,10 +176,13 @@ def map_polygons_to_points(
               polygons. Only finite for polygons assigned via nearest-fallback.
     """
     return _sjoin_with_nearest_fallback(
-        left_df=polygons, right_df=points,
-        predicate='contains',
-        allow_nearest=allow_nearest, max_distance=max_distance,
-        left_label='polygons', right_label='point',
+        left_df=polygons,
+        right_df=points,
+        predicate="contains",
+        allow_nearest=allow_nearest,
+        max_distance=max_distance,
+        left_label="polygons",
+        right_label="point",
     )
 
 
@@ -189,19 +214,25 @@ def map_points_to_points(
             - `distances`: distance to the matched point (CRS units). NaN if no match.
     """
     index_name = right_points.index.name
-    dist_col = index_name + '_distance'
-    res = gpd.sjoin_nearest(left_points[['geometry']],
-                            right_points[['geometry']],
-                            how='left',
-                            max_distance=max_distance,
-                            distance_col=dist_col)
+    dist_col = index_name + "_distance"
+    res = gpd.sjoin_nearest(
+        left_points[["geometry"]],
+        right_points[["geometry"]],
+        how="left",
+        max_distance=max_distance,
+        distance_col=dist_col,
+    )
     res = geo_processing.remove_duplicate_indices(res)
     f = pd.notnull(res[index_name])
-    logging.info(f"{f.sum():,} of {len(left_points):,} points in `left_points` found a match "
-                 f"in `right_points`.")
+    logging.info(
+        f"{f.sum():,} of {len(left_points):,} points in `left_points` found a match "
+        f"in `right_points`."
+    )
     count_unique = len(res[index_name].unique())
-    logging.info(f"{count_unique:,} ({count_unique/len(right_points)*100:.1f}%) of points in "
-                 f"`right_points` are present in `left_points`.")
+    logging.info(
+        f"{count_unique:,} ({count_unique / len(right_points) * 100:.1f}%) of points in "
+        f"`right_points` are present in `left_points`."
+    )
     return res[index_name], res[dist_col]
 
 
@@ -253,8 +284,7 @@ def map_points_to_filtered_lines(
         if not radii.index.equals(points.index):
             raise DataError("`search_radius` Series must share index with `points`.")
     if points.crs != lines.crs:
-        raise DataError(
-            f"`points` CRS {points.crs} does not match `lines` CRS {lines.crs}.")
+        raise DataError(f"`points` CRS {points.crs} does not match `lines` CRS {lines.crs}.")
 
     sindex = lines.sindex
     pt_indices, line_ids, dists, alongs = [], [], [], []
@@ -263,7 +293,7 @@ def map_points_to_filtered_lines(
         pt_geom = pt_row.geometry
         r = radii.loc[pt_idx]
         # All lines within `r` of the point (cartesian).
-        pos = sindex.query(pt_geom, predicate='dwithin', distance=r)
+        pos = sindex.query(pt_geom, predicate="dwithin", distance=r)
         matched_id, matched_dist, matched_along = pd.NA, np.nan, np.nan
         if len(pos):
             candidates = lines.iloc[pos]
@@ -271,7 +301,7 @@ def map_points_to_filtered_lines(
                 candidates = eligible_lines(pt_row, candidates)
             if len(candidates):
                 cand_dists = candidates.geometry.distance(pt_geom).values
-                order = np.argsort(cand_dists, kind='stable')
+                order = np.argsort(cand_dists, kind="stable")
                 for k in order:
                     d = float(cand_dists[k])
                     line_row = candidates.iloc[k]
@@ -279,9 +309,9 @@ def map_points_to_filtered_lines(
                     dist_along = float(line_geom.project(pt_geom))
                     if accept is not None:
                         ctx = {
-                            'distance': d,
-                            'dist_along': dist_along,
-                            'nearest_point': line_geom.interpolate(dist_along),
+                            "distance": d,
+                            "dist_along": dist_along,
+                            "nearest_point": line_geom.interpolate(dist_along),
                         }
                         if not accept(pt_row, line_row, ctx):
                             continue
@@ -295,10 +325,12 @@ def map_points_to_filtered_lines(
         alongs.append(matched_along)
 
     out = pd.DataFrame(
-        {'line_id': line_ids, 'distance': dists, 'dist_along': alongs},
+        {"line_id": line_ids, "distance": dists, "dist_along": alongs},
         index=pd.Index(pt_indices, name=points.index.name),
     )
-    n_matched = out['line_id'].notna().sum()
-    logging.info(f"Matched {n_matched:,} of {len(points):,} points "
-                 f"({n_matched / max(len(points), 1) * 100:.1f}%).")
+    n_matched = out["line_id"].notna().sum()
+    logging.info(
+        f"Matched {n_matched:,} of {len(points):,} points "
+        f"({n_matched / max(len(points), 1) * 100:.1f}%)."
+    )
     return out

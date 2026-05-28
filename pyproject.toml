@@ -24,7 +24,10 @@ keywords = [
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -38,10 +41,8 @@ dependencies = [
     "networkx>=3.0",        # input graph type; routing converts to scipy CSR
     "scipy>=1.10",          # routing (csgraph.dijkstra), KDTree, sparse matrices
     "statsmodels>=0.14",    # calibration.calibrate_edge_weights (OLS)
-    "numba>=0.60",
-    "python-dotenv>=1.0",
-    "pyyaml>=6.0",
-    "matplotlib>=3.8",
+    "numba>=0.60",          # @njit hot loops in od_pairs + traffic_flows
+    "matplotlib>=3.8",      # visualization module
 ]
 
 # Optional feature extras. Core routing / accessibility / OD-pairs work
@@ -75,6 +76,12 @@ examples = [
     "jupytext>=1.16",
     "contextily>=1.4",
 ]
+# Building the Sphinx docs site (read by .readthedocs.yaml).
+docs = [
+    "sphinx>=8.0",
+    "furo>=2024.0",
+    "myst-parser>=4.0",
+]
 
 # Src layout: package code lives under `src/aperta/`. Prevents accidental
 # imports of the local source (Python won't find `aperta` unless it's
@@ -82,3 +89,50 @@ examples = [
 # breaks when installed" bugs early.
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# mypy: static type checker. Loose initial config (non-strict mode) +
+# escape hatches for libraries without type stubs. Tighten over time.
+[tool.mypy]
+python_version = "3.11"
+files = ["src/aperta"]
+# Common libraries without complete type stubs in this stack. Silences
+# "no type stubs for X" errors without disabling type checking of our
+# own code that uses them.
+[[tool.mypy.overrides]]
+module = [
+    "pandas.*",
+    "geopandas.*",
+    "shapely.*",
+    "networkx.*",
+    "scipy.*",
+    "rasterio.*",
+    "osmnx.*",
+    "h3.*",
+    "contextily.*",
+    "matplotlib.*",
+    "mpl_toolkits.*",
+    "statsmodels.*",
+    "numba.*",
+    "pyaxis.*",
+    "requests.*",
+]
+ignore_missing_imports = true
+
+# Ruff: linter + formatter. Lenient initial config; extend rule sets
+# (B, UP, SIM, ...) as the project matures.
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["examples/", "build/", "dist/"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes (unused imports, undefined names, etc.)
+    "W",   # pycodestyle warnings
+    "I",   # isort (import ordering)
+]
+# E501 (line too long) is handled by the formatter; allowing it here
+# means the linter doesn't complain about strings/comments that the
+# formatter chose not to break.
+ignore = ["E501"]
