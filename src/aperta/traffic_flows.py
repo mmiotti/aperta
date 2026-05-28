@@ -1,20 +1,33 @@
-"""Distance-weighted traffic-flow estimation via sampled betweenness centrality.
+"""Lightweight one-shot traffic-flow estimation via sampled betweenness centrality.
 
-Estimates daily per-edge traffic volumes (AADT) by simulating a quick-and-dirty
-3-step travel demand model: trip generation (origin sampling weighted by
-population), trip distribution (per-origin destination sampling weighted by a
-cost-decay function and per-destination attractiveness), and route assignment
-(shortest-path routing on the current edge weights, accumulating per-edge
-counts). Iterating the loop with congestion-aware edge-weight updates moves
-the system toward equilibrium.
+Estimates daily per-edge traffic volumes (interpretable as AADT once
+calibrated) by simulating a quick three-step travel demand model:
+trip generation (origin sampling weighted by population), trip distribution
+(per-origin destination sampling weighted by a cost-decay function and
+per-destination attractiveness), and route assignment (shortest-path routing
+on the current edge weights, accumulating per-edge counts). Outputs can be
+calibrated against ground-truth counter data via the helpers in
+`aperta.calibration`.
+
+**Scope and limitations.** This is a one-shot estimation pass: the routing
+step uses the input edge weights without iterating toward congestion
+equilibrium. It is intended for users who (1) want a per-edge traffic-flow
+estimate to feed into travel-time calibration or as an accessibility feature,
+and (2) do not already have detailed outputs from a full traffic-assignment
+model (which would be a more rigorous alternative and could be plugged in
+directly). The library reuses aperta's existing infrastructure — tiered OD
+matrices, edge-weight calibration, scipy routing backend — to keep the
+estimation cheap and consistent with the rest of the pipeline; it does not
+aim to replace a dedicated traffic-assignment tool. An iterative
+congestion-aware variant is theoretically possible as a future extension.
 
 This module supplies the sampling primitives (`nested_node_sample`) and the
-normalization step (`get`) that turns raw sampled-betweenness counts into a
-per-edge volume calibrated against an expected total vehicle-kilometres figure.
-The routing + per-edge accumulation itself lives in
-`network_processing.get_nested_edge_betweenness`. A simpler alternative for
-small study areas — radius-limited Brandes betweenness without explicit OD
-sampling — also lives in `network_processing`.
+normalisation step (`estimate_edge_flows`) that turns raw sampled-betweenness
+counts into a per-edge volume calibrated against an expected total
+vehicle-kilometres figure. The routing + per-edge accumulation itself lives
+in `network_processing.get_nested_edge_betweenness`. A simpler alternative
+for small study areas — radius-limited Brandes betweenness without explicit
+OD sampling — also lives in `network_processing`.
 """
 
 from collections import defaultdict
@@ -29,9 +42,9 @@ from aperta import network_processing
 from aperta.od_pairs import TieredODPairs
 
 
-def get(
-    g: nx.MultiGraph,
-    routing_edge_weight: str,
+def estimate_edge_flows(
+    graph: nx.MultiGraph,
+    weight: str,
     expected_km_driven: int | float,
     nested_node_sample: dict,
     *,
@@ -44,7 +57,7 @@ def get(
     per-edge usage counts (see `network_processing.get_nested_edge_betweenness`),
     then scales so that `sum(flow_e × length_e)` matches `expected_km_driven`.
 
-    `cutoff` (optional): network-distance limit in `routing_edge_weight`
+    `cutoff` (optional): network-distance limit in `weight`
     units passed through to the per-origin Dijkstra. Set this to the
     upstream sampling radius (e.g. `r_zones` from `od_pairs.get_pairs`) —
     sampled destinations are guaranteed reachable within that radius, so
@@ -52,9 +65,9 @@ def get(
     country-scale graphs. Default `None` = no cutoff.
     """
     bc = network_processing.get_nested_edge_betweenness(
-        g, nested_node_sample, routing_edge_weight, cutoff=cutoff
+        graph, nested_node_sample, weight, cutoff=cutoff
     )
-    lengths = nx.get_edge_attributes(g, "length")
+    lengths = nx.get_edge_attributes(graph, "length")
     factor = expected_km_driven / sum(v * lengths[k] for k, v in bc.items())
     return bc * factor
 
@@ -153,7 +166,7 @@ def nested_node_sample(
         weights: destination weights per tier (e.g. populations), same shape as
             `pairs`. Typically the output of `od_pairs.dest_values`.
         costs: per-pair costs (e.g. line distances), same shape as `pairs`.
-            Typically the output of `od_pairs.get_euclidian_dists`.
+            Typically the output of `od_pairs.get_euclidean_dists`.
         cell_to_zone_node: `{cell_node -> zone_node}` mapping; build via
             `od_pairs.build_cell_to_zone_node_map`.
         orig_weights: per-origin sampling weights, aligned position-wise with

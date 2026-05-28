@@ -489,7 +489,7 @@ bins = [
     accessibility.Bin('5_to_15min',  5 * 60,     15 * 60),
     accessibility.Bin('15_to_30min', 15 * 60,    30 * 60),
 ]
-acc_cum = accessibility.count_in_bins(
+acc_cum = accessibility.cumulative_opportunities(
     times_geo, {'supermarkets': sm_weights}, cell_to_zone, bins,
 )
 
@@ -507,13 +507,13 @@ acc_within.head()
 # %% [markdown]
 # ### Gravity: exponential decay, three β values in one call
 #
-# The cost ODM is floored at 30 s via `set_min_intrazonal_cost` before passing
+# The cost ODM is floored at 30 s via `floor_intrazonal_costs` before passing
 # to gravity. Without that floor, the intrazonal self-pair would route at
 # cost 0, sending `exp(-β · 0) = 1` to maximum decay weight (giving a cell's
 # own supermarkets infinite advantage over neighbours).
 
 # %%
-times_geo_floored = routing.set_min_intrazonal_cost(times_geo, min_cost=30.0)
+times_geo_floored = routing.floor_intrazonal_costs(times_geo, min_cost=30.0)
 
 decays = [
     accessibility.exp_decay('beta_005', 0.005),  # half-decay ~140 s ≈ 2 min
@@ -951,7 +951,7 @@ bike_utility = utility.Utility(
 
 # %%
 bike_route_u = utility.route_utility(
-    bike_pairs, bike_graph, cost_weight='bike_time_s', utility=bike_utility,
+    bike_pairs, bike_graph, weight='bike_time_s', utility=bike_utility,
 )
 
 # %% [markdown]
@@ -998,7 +998,7 @@ walking_utility = utility.Utility(
     cost_coefficient=-1.0 / 60.0,
 )
 route_u = utility.route_utility(
-    pairs, graph, cost_weight='walk_time_s', utility=walking_utility,
+    pairs, graph, weight='walk_time_s', utility=walking_utility,
 )
 full_u = utility.add_endpoint_utility(route_u, pairs, walking_utility, cells=cells)
 _, full_u_geo = od_pairs.reindex_by_geo_unit(

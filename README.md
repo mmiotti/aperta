@@ -47,7 +47,7 @@ aperta is organised around a six-phase workflow. Every module slots into one of 
 3. **Build sparse OD pairs** — `od_pairs.get_pairs` returns a `TieredODNodePairs` with three tiers (`cells_to_cells` / `cells_to_zones` / `zones_to_zones`, node-keyed) — the middle tier preserves per-cell origin precision at zone-aggregated dest cost. Lift to `TieredODGeoPairs` (cell/zone-keyed) via `od_pairs.reindex_by_geo_unit` for cross-modal alignment.
 4. **Estimate traffic flows** — `traffic_flows.nested_node_sample` + betweenness via `network_processing.get_*_betweenness*`. Optional calibration against observed counters via `calibration.snap_counters_to_edges` + `calibration.evaluate_against_counters`.
 5. **Estimate travel costs** — `routing.tiered_path_costs` / `routing.tiered_path_aggregate` (Dijkstra on any networkx graph) + `overhead.add_node_overheads` / `add_geo_overheads` / `add_origin_cell_overhead`. Optional calibration of per-edge weights against observed travel times via `calibration.calibrate_edge_weights`. Plus `utility.route_utility` / `add_endpoint_utility` for utility-based costs.
-6. **Calculate accessibilities** — `accessibility.count_in_bins`, `accessibility.gravity`, `accessibility.nearest_k`. Cross-modal: `od_pairs.aggregate_across_modes` on per-mode `TieredODGeoPairs`, then any accessibility primitive on the combined ODM.
+6. **Calculate accessibilities** — `accessibility.cumulative_opportunities`, `accessibility.gravity`, `accessibility.nearest_k`. Cross-modal: `od_pairs.aggregate_across_modes` on per-mode `TieredODGeoPairs`, then any accessibility primitive on the combined ODM.
 
 ### Where to see each phase in the examples
 
@@ -57,8 +57,8 @@ The extended example splits its prep across five notebooks and its analysis acro
 |---|---|
 | 1. Load and prepare data | [prep/1_download.ipynb](examples/extended/prepare/1_download.ipynb), [prep/2_dasymetric_employment.ipynb](examples/extended/prepare/2_dasymetric_employment.ipynb) |
 | 2. Map data to units + features | [prep/3_unit_mapping.ipynb](examples/extended/prepare/3_unit_mapping.ipynb), [prep/4_topography.ipynb](examples/extended/prepare/4_topography.ipynb), [prep/5_density.ipynb](examples/extended/prepare/5_density.ipynb) |
-| 3. Build sparse OD pairs | first cells of [accessibility.ipynb](examples/extended/accessibility.ipynb) and [road_stress.ipynb](examples/extended/road_stress.ipynb) — each builds for its own use |
-| 4. Estimate traffic flows | [road_stress.ipynb](examples/extended/road_stress.ipynb) |
+| 3. Build sparse OD pairs | first cells of [accessibility.ipynb](examples/extended/accessibility.ipynb) and [traffic_flows.ipynb](examples/extended/traffic_flows.ipynb) — each builds for its own use |
+| 4. Estimate traffic flows | [traffic_flows.ipynb](examples/extended/traffic_flows.ipynb) |
 | 5. Estimate travel costs | [calibrate_edge_weights.ipynb](examples/extended/calibrate_edge_weights.ipynb) (calibrates the model); each analysis notebook applies edge times inline |
 | 6. Calculate accessibilities | [accessibility.ipynb](examples/extended/accessibility.ipynb) |
 
@@ -110,7 +110,7 @@ times = routing.tiered_path_costs(pairs, graph, weight='walk_time_s')
 
 # 4. Accessibility — supermarkets reachable within 15 min walk per origin cell.
 sm_weights = od_pairs.dest_values('supermarkets', pairs, cells, node_column='node_id')
-acc = accessibility.count_in_bins(
+acc = accessibility.cumulative_opportunities(
     times, {'supermarkets': sm_weights}, {},
     [accessibility.Bin('15min', 0, 15 * 60)],
 )
@@ -124,7 +124,7 @@ Runnable end-to-end version (with plotting): [examples/minimal/accessibility.ipy
 |---|---|
 | `od_pairs` | Tiered OD pair structures (`TieredODNodePairs`, `TieredODGeoPairs`) + builders (`get_pairs`, `dest_values`, `reindex_by_geo_unit`, `make_mask`, `aggregate_across_modes` for cross-modal alignment). |
 | `routing` | Shortest paths on `networkx` graphs via `scipy.sparse.csgraph.dijkstra`. Edge-weighting helpers, single-source / one-to-one primitives, tiered OD routing (`tiered_path_costs`, `tiered_path_aggregate` with per-edge `PathAggregation` and per-node `NodeAggregation` feature aggregation along realised paths), pure path-walker primitive `aggregate_along_paths` (for prebuilt path lists), intrazonal-cost flooring. |
-| `accessibility` | `count_in_bins` (cumulative), `gravity` (decay-based), `nearest_k` (cost to nearest k). Outputs per-node or per-cell depending on input ODM class. |
+| `accessibility` | `cumulative_opportunities` (cumulative), `gravity` (decay-based), `nearest_k` (cost to nearest k). Outputs per-node or per-cell depending on input ODM class. |
 | `utility` | Linear utility specs (`Utility`, `RouteFeature`) and pipeline (`route_utility`, `add_endpoint_utility`) for utility-based costs; consumed by `accessibility.gravity` with an exp decay for logsum accessibility. |
 | `overhead` | First/last-mile overheads on cost ODMs. `add_node_overheads` (node-keyed); `add_geo_overheads` / `add_origin_cell_overhead` (geo-keyed); `aggregate_dest_overhead_per_*` helpers for zone-tier last-mile. |
 | `traffic_flows` | Traffic-volume estimation via cost-weighted nested-node sampling (`nested_node_sample`). |
@@ -139,12 +139,16 @@ Runnable end-to-end version (with plotting): [examples/minimal/accessibility.ipy
 
 ## Design
 
-aperta is intentionally lightweight and **agnostic about how you organise your data and pipeline**:
+What aperta is:
+
+- **Path-first.** Every routing call returns the realised route alongside the OD travel cost as a single primitive. Per-edge features (gradient, perceived safety, surface type) can be aggregated along the realised route in the same pass — the architectural prerequisite for utility-based accessibility, logsum, and route-aware exposure analyses.
+- **Multi-scale by construction.** The tiered cells / zones / three-distance-tier OD structure bounds per-origin computation independently of the network's geographic extent. Country-scale reach without country-scale destination counts; intermediate cost matrices stay small enough to persist to disk and share.
+- **Live-graph routing.** Shortest paths run on the graph directly via `scipy.sparse.csgraph.dijkstra` — no precomputed routing index. Per-query routing is slower than contraction-hierarchy-based tools (OSRM, Pandana), but edge-weight changes are immediate, which is what makes iterative calibration, traffic-flow estimation, and scenario comparison practical. Edge weights are written by plain Python callables; no Lua / YAML / JSON profile format to learn.
+
+What aperta is not:
 
 - **No filesystem assumptions.** Algorithm functions take plain `networkx` graphs, `pandas` / `geopandas` frames, and `numpy` arrays. They don't read or write files.
-- **No DAG engine.** No caching, no dependency graph, no orchestration. For full DAG features layer [DVC](https://dvc.org/) or [Snakemake](https://snakemake.readthedocs.io/) on top.
-- **Routing profiles are plain Python functions, not config files.** Other routing tools define modes (car, bike, pedestrian) via custom formats — Lua profiles in OSRM, JSON costing-options in Valhalla, YAML in GraphHopper. aperta skips that layer: a profile is a Python callable that returns an edge cost. Trade-off: no shared library of pre-built profiles to pick from, but full Python expressivity (call numpy, look up calibrated coefficients, branch on anything).
-- **No global state** — every function takes its inputs explicitly.
+- **No DAG engine, no global state.** No caching, no dependency tracking, no orchestration. Every function takes its inputs explicitly. For DAG features, layer [DVC](https://dvc.org/) or [Snakemake](https://snakemake.readthedocs.io/) on top.
 
 ## Contributing
 

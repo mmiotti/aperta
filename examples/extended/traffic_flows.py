@@ -14,7 +14,7 @@
 # ---
 
 # %% [markdown]
-# # `road_stress` — calibration + production estimate
+# # `flow_estimate` — calibration + production estimate
 #
 # Estimates per-edge AADT for the car network via cost-decay-weighted
 # nested-betweenness sampling, calibrated against observed traffic
@@ -34,7 +34,7 @@
 # ## Two design choices worth flagging upfront
 #
 # **Zones, not cells, as the granular unit.** Unlike `accessibility.ipynb`
-# (which uses H3-res-10 cells, ~95k in the Bern dest polygon), road_stress
+# (which uses H3-res-10 cells, ~95k in the Bern dest polygon), flows
 # uses H3-res-8 **zones** (~5500). Two reasons:
 #
 # - Flow estimation is bulk-attributing — thousands of OD pairs accumulate
@@ -68,15 +68,15 @@
 # 6. 1D scan over lognormal shape, pick best.
 # 7. Derive `TRIPS_PER_PERSON_PER_DAY` from the slope.
 # 8. **Production run** — re-simulate with calibrated params + save
-#    `data/prepared/road_stress.csv`.
+#    `data/prepared/flow_estimate.csv`.
 # 9. Visualise the per-edge stress map.
 #
 # Sections 5-7 use the library helpers `snap_counters_to_edges` and
 # `evaluate_against_counters` from `aperta.calibration`; the scan
 # loop + parameter selection are project-specific and live here.
 #
-# `data/prepared/road_stress.csv` is consumed by
-# `calibrate_edge_weights.ipynb` as the `road_stress` feature for the
+# `data/prepared/flow_estimate.csv` is consumed by
+# `calibrate_edge_weights.ipynb` as the `flow_estimate` feature for the
 # BPR-style edge-weight calibration.
 
 # %%
@@ -258,8 +258,8 @@ costs = routing.tiered_path_costs(
 
 zones['_dest_weight'] = zones['employment_total']
 orig_weights = od_pairs.node_values(
-    'pop_plus_emp', list(pairs.cells_to_cells.keys()),
-    zones, 'node_id')
+    'pop_plus_emp', zones, 'node_id',
+    list(pairs.cells_to_cells.keys()))
 dest_weights = od_pairs.dest_values(
     '_dest_weight', pairs, zones, 'node_id')
 
@@ -291,7 +291,7 @@ def simulate_flows(shape: float, scale: float,
                    trips_per_person_per_day: float = 1.5,
                    n_orig: int = N_ORIG, n_dest: int = N_DEST,
                    seed: int = RNG_SEED) -> pd.Series:
-    """Run the full road_stress estimation for one parameter set."""
+    """Run the full flows estimation for one parameter set."""
     def _cost_to_weight(c):
         return scipy.stats.lognorm.pdf(c, shape, 0.0, scale)
     rng = np.random.RandomState(seed)
@@ -351,7 +351,7 @@ ax.plot([1, lim], [1, lim], color='black', linewidth=0.5, label='1:1')
 ax.set_xscale('log'); ax.set_yscale('log')
 ax.set_xlim(50, lim); ax.set_ylim(50, lim)
 ax.set_xlabel('Observed AADT (counter, veh/day)')
-ax.set_ylabel('Modeled AADT (road_stress, veh/day)')
+ax.set_ylabel('Modeled AADT (flows, veh/day)')
 ax.set_title(f'Baseline fit — all: R²={eval_init["r2"]:.3f}, '
              f'slope={eval_init["slope"]:.2f}   |   '
              f'highway: R²={eval_hw["r2"]:.3f}, '
@@ -428,43 +428,43 @@ print(f"Slope at trips={TRIPS_PER_PERSON_PER_DAY_INIT} is {eval_at_best['slope']
 
 
 # %% [markdown]
-# ## 8. Production run + save `road_stress.csv`
+# ## 8. Production run + save `flow_estimate.csv`
 #
 # Re-runs `simulate_flows` with the calibrated `(shape, trips)` to
-# produce the final per-edge AADT. Attaches as `road_stress` edge
-# attribute (for the map below) and writes `data/prepared/road_stress.csv`
+# produce the final per-edge AADT. Attaches as `flow_estimate` edge
+# attribute (for the map below) and writes `data/prepared/flow_estimate.csv`
 # for downstream consumers.
 
 # %%
-road_stress = simulate_flows(shape_best, scale_best, trips_final)
+flows = simulate_flows(shape_best, scale_best, trips_final)
 network_processing.set_nx_edge_attributes_filled(
-    car_graph, road_stress.to_dict(), 'road_stress', fill_value=0.0)
-print(f"road_stress (veh/day): "
-      f"median {road_stress.median():.0f}, "
-      f"P95 {road_stress.quantile(0.95):.0f}, "
-      f"max {road_stress.max():.0f}")
+    car_graph, flows.to_dict(), 'flow_estimate', fill_value=0.0)
+print(f"flows (veh/day): "
+      f"median {flows.median():.0f}, "
+      f"P95 {flows.quantile(0.95):.0f}, "
+      f"max {flows.max():.0f}")
 
-OUTPUT_PATH = PREPARED_DIR / 'road_stress.csv'
-road_stress_df = pd.DataFrame(
-    [(u, v, k, float(road_stress.get((u, v, k), 0.0)))
+OUTPUT_PATH = PREPARED_DIR / 'flow_estimate.csv'
+flows_df = pd.DataFrame(
+    [(u, v, k, float(flows.get((u, v, k), 0.0)))
      for u, v, k in car_graph.edges(keys=True)],
-    columns=['u', 'v', 'k', 'road_stress'],
+    columns=['u', 'v', 'k', 'flow_estimate'],
 )
-road_stress_df.to_csv(OUTPUT_PATH, index=False)
-print(f"Saved {len(road_stress_df):,} rows to {OUTPUT_PATH}")
+flows_df.to_csv(OUTPUT_PATH, index=False)
+print(f"Saved {len(flows_df):,} rows to {OUTPUT_PATH}")
 
 
 # %% [markdown]
 # ## 9. Visualise — raw flows on the network
 #
-# Per-edge `road_stress` as a colour map, cropped to 90 % of the
+# Per-edge `flow_estimate` as a colour map, cropped to 90 % of the
 # destination polygon bounding box. Motorways drawn on top (sorted by
 # `HIGHWAY_RANKS`) so they stay visible at junctions; colour scale
 # clips at P99.
 #
 # A more sophisticated visualisation is *capacity-normalised stress* —
 # `(V/C)^β` with `β` typically 2 or 4 (BPR convention). Divides
-# road_stress by `capacity_per_lane[highway] · lanes_per_direction`
+# flows by `capacity_per_lane[highway] · lanes_per_direction`
 # (the per-direction lanes attribute is set by
 # `consolidate_intersections`), then raises to `β`. Useful for spotting
 # bottlenecks regardless of road class — a 4-lane motorway at 50k AADT
@@ -474,15 +474,15 @@ print(f"Saved {len(road_stress_df):,} rows to {OUTPUT_PATH}")
 # %%
 import _figures as figures   # noqa: E402  — project-local plot helpers
 
-stress_arr = np.array([float(d.get('road_stress', 0.0))
+stress_arr = np.array([float(d.get('flow_estimate', 0.0))
                        for _, _, d in car_graph.edges(data=True)])
 xlim, ylim = figures.crop_to_polygon(dest_polygon)
 
 fig, ax = plt.subplots(figsize=(12, 11))
 figures.plot_network_map(
-    ax, car_graph, road_stress,
-    cbar_label='road_stress (veh/day, clipped at P99)',
-    title=(f'road_stress — {LOCATION_LABEL} + 25 km '
+    ax, car_graph, flows,
+    cbar_label='flows (veh/day, clipped at P99)',
+    title=(f'flows — {LOCATION_LABEL} + 25 km '
            f'(median {np.median(stress_arr):.0f}, '
            f'P99 {np.quantile(stress_arr, 0.99):.0f}, '
            f'max {stress_arr.max():.0f} veh/day)'),
@@ -502,7 +502,7 @@ plt.tight_layout(); plt.show()
 # - **Output isn't consumed by `accessibility.ipynb`.** That notebook
 #   ships with published-paper edge weights instead of using estimated
 #   flows. Each showcase notebook stands alone — they aren't wired into
-#   a pipeline. Production *does* wire road_stress into edge-weight
+#   a pipeline. Production *does* wire flows into edge-weight
 #   calibration as a `(V/C)^β` BPR-style feature.
 # - **Calibration is one parameter, one metric.** A real fit would
 #   coordinate-descent over `shape`, `scale`, `trips_per_person_per_day`

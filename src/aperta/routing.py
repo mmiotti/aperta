@@ -51,33 +51,33 @@ from aperta.od_pairs import TieredODNodePairs, TieredODPairs
 # ---------------------------------------------------------------------------
 
 
-def apply_edge_weights(g: nx.Graph, weight_fn: Callable, weight_name: str, **fn_kwargs) -> None:
-    """Apply `weight_fn` to each edge of `g` (mutates `g` in place).
+def apply_edge_weights(graph: nx.Graph, weight_fn: Callable, weight_name: str, **fn_kwargs) -> None:
+    """Apply `weight_fn` to each edge of `graph` (mutates `graph` in place).
 
     `weight_fn` receives the edge data dict plus any extra `fn_kwargs`. The
     dict supports `row['key']` access just like a pandas Series, so callables
     written against a GeoDataFrame edge-row pattern work without modification.
     """
-    if isinstance(g, (nx.MultiGraph, nx.MultiDiGraph)):
-        for _u, _v, _k, data in g.edges(keys=True, data=True):
+    if isinstance(graph, (nx.MultiGraph, nx.MultiDiGraph)):
+        for _u, _v, _k, data in graph.edges(keys=True, data=True):
             data[weight_name] = weight_fn(data, **fn_kwargs)
     else:
-        for _u, _v, data in g.edges(data=True):
+        for _u, _v, data in graph.edges(data=True):
             data[weight_name] = weight_fn(data, **fn_kwargs)
 
 
-def combine_edge_weights(g: nx.Graph, source_names: list[str], target_name: str) -> None:
+def combine_edge_weights(graph: nx.Graph, source_names: list[str], target_name: str) -> None:
     """Sum multiple per-edge attributes into one combined weight (in place).
 
     Use case (lumos pattern): travel time and intersection penalty are computed
     separately, stored as `duration_edge_t3` and `duration_node_t3`, then summed
     into the routing weight `duration_t3`.
     """
-    if isinstance(g, (nx.MultiGraph, nx.MultiDiGraph)):
-        for _u, _v, _k, data in g.edges(keys=True, data=True):
+    if isinstance(graph, (nx.MultiGraph, nx.MultiDiGraph)):
+        for _u, _v, _k, data in graph.edges(keys=True, data=True):
             data[target_name] = sum(float(data[name]) for name in source_names)
     else:
-        for _u, _v, data in g.edges(data=True):
+        for _u, _v, data in graph.edges(data=True):
             data[target_name] = sum(float(data[name]) for name in source_names)
 
 
@@ -403,7 +403,7 @@ def tiered_path_costs(
             cutoff is small relative to graph diameter (e.g. walk accessibility
             on a country-scale graph). Destinations beyond cutoff are stored
             as `np.inf` — same convention as unreachable, so downstream metrics
-            (`count_in_bins` etc.) handle them naturally. Default `None` = no
+            (`cumulative_opportunities` etc.) handle them naturally. Default `None` = no
             cutoff (`limit=np.inf`).
         dtype: dtype of returned cost arrays (default `np.float32` — halves
             memory + on-disk size vs `float64`, with seconds-resolution
@@ -861,8 +861,8 @@ def tiered_path_aggregate(
 
 
 def add_trip_overhead(
-    pairs: TieredODPairs,
     costs: TieredODPairs,
+    pairs: TieredODPairs,
     cell_info: pd.DataFrame,
     *,
     zone_info: pd.DataFrame | None = None,
@@ -996,7 +996,7 @@ def add_trip_overhead(
     )
 
 
-def set_min_intrazonal_cost(
+def floor_intrazonal_costs(
     costs: TieredODPairs,
     min_cost: float | dict | pd.Series,
 ) -> TieredODPairs:

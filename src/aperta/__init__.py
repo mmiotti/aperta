@@ -28,7 +28,7 @@ The library is organized around a six-phase workflow:
                               `routing.aggregate_along_paths` is the path-walker
                               primitive when you have a pre-computed list of
                               paths rather than a `TieredODPairs`.
-  6. Calculate accessibility — `accessibility.count_in_bins` (cumulative),
+  6. Calculate accessibility — `accessibility.cumulative_opportunities` (cumulative),
                                `accessibility.gravity`, `accessibility.nearest_k`.
                                Cross-modal: combine per-mode `TieredODGeoPairs`
                                with `od_pairs.aggregate_across_modes` first.
@@ -53,7 +53,7 @@ Key types:
                                    accessibility and geo-unit-keyed overhead.
   - `od_pairs.TieredODPairs`     — abstract base of the two above; use as a
                                    type hint when key space doesn't matter.
-  - `accessibility.Bin`       — half-open cost bin for `count_in_bins`.
+  - `accessibility.Bin`       — half-open cost bin for `cumulative_opportunities`.
   - `accessibility.Decay`     — named cost-decay callable for `gravity`.
   - `utility.Utility`         — linear utility spec (constant + cost + route
                                 + origin + destination feature coefficients).

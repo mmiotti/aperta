@@ -328,7 +328,7 @@ car_graph = graphs['drive']
 # highway-class default for the (many) edges without one. The resulting
 # `speed_kph` attribute on every car edge is consumed by the edge-time
 # formula in `accessibility.ipynb` / `calibrate_edge_weights.ipynb` /
-# `road_stress.ipynb`. Idempotent — safe to re-run on a cached graphml.
+# `traffic_flows.ipynb`. Idempotent — safe to re-run on a cached graphml.
 #
 # Walk and bike use a constant per-mode speed set inline downstream,
 # so no per-edge speed is needed for them.

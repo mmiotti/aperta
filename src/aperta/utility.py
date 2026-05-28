@@ -30,7 +30,7 @@ downstream cell-mode accessibility handle per-cell additions on its own terms:
 
 For **cell-mode** accessibility (per-cell overheads), the cell-overhead
 contribution to utility (`β_cost · cell_walking_overhead`) is added by the
-downstream accessibility function (`gravity`, `count_in_bins`, `nearest_k`)
+downstream accessibility function (`gravity`, `cumulative_opportunities`, `nearest_k`)
 via the existing `cell_overhead_column` mechanism. Precompute the per-cell
 utility-overhead column in user code:
 
@@ -134,7 +134,7 @@ class Utility:
 def route_utility(
     pairs: TieredODPairs,
     graph: nx.Graph,
-    cost_weight: str,
+    weight: str,
     utility: Utility,
     *,
     mask: TieredODPairs | None = None,
@@ -146,7 +146,7 @@ def route_utility(
         U_route(i, j) = cost_coefficient * cost(i, j)
                       + Σ_f f.coefficient * aggregated_f(i, j)
 
-    where cost(i, j) is the shortest-path cost under `cost_weight` and the
+    where cost(i, j) is the shortest-path cost under `weight` and the
     aggregations are over the edges of the realised (i, j) path.
 
     Origin, destination, and constant components are NOT included — add them
@@ -160,7 +160,7 @@ def route_utility(
     Args:
         pairs: tiered destination IDs (typically from `od_pairs.get_pairs`).
         graph: routable networkx graph.
-        cost_weight: edge attribute name used for routing AND as the cost
+        weight: edge attribute name used for routing AND as the cost
             contribution to utility (multiplied by `utility.cost_coefficient`).
         utility: the `Utility` spec.
         mask, dtype: as in `tiered_path_aggregate`.
@@ -181,7 +181,7 @@ def route_utility(
         costs, aggs = tiered_path_aggregate(
             pairs,
             graph,
-            cost_weight,
+            weight,
             edge_aggregations=path_aggs,
             mask=mask,
             dtype=dtype,
@@ -191,7 +191,7 @@ def route_utility(
         costs = tiered_path_costs(
             pairs,
             graph,
-            cost_weight,
+            weight,
             mask=mask,
             dtype=dtype,
         )

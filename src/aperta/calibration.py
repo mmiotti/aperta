@@ -532,7 +532,7 @@ def calibrate_edge_weights(
 
 # --- Traffic-counter calibration -----------------------------------------
 #
-# Calibration of a modeled traffic-flow estimate (e.g. the road_stress
+# Calibration of a modeled traffic-flow estimate (e.g. the flows
 # output from `traffic_flows.nested_node_sample` + betweenness) against
 # observed point counters. Two primitives:
 #

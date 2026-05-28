@@ -82,7 +82,7 @@ pairs = od_pairs.get_pairs(cells, r_cells=2000.0, node_column='node_id')
 times = routing.tiered_path_costs(pairs, graph, weight='walk_time_s')
 sm_weights = od_pairs.dest_values('supermarkets', pairs, cells, node_column='node_id')
 
-acc = accessibility.count_in_bins(
+acc = accessibility.cumulative_opportunities(
     times, {'supermarkets': sm_weights}, {},
     [accessibility.Bin('15min', 0, 15 * 60)],
 )

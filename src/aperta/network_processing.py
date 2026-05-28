@@ -104,9 +104,9 @@ def collapse_highway_lists_by_rank(graph: nx.Graph) -> None:
 
 
 def set_nx_edge_attributes_filled(
-    g: nx.MultiGraph, attr: dict | pd.Series, attr_name: str, fill_value=0, strict: bool = False
+    graph: nx.MultiGraph, attr: dict | pd.Series, attr_name: str, fill_value=0, strict: bool = False
 ):
-    """Set per-edge attribute `attr_name` on `g`, filling missing edges with `fill_value`.
+    """Set per-edge attribute `attr_name` on `graph`, filling missing edges with `fill_value`.
 
     `nx.set_edge_attributes` silently leaves edges absent from the input mapping
     without the attribute, which is a footgun for downstream code that expects
@@ -114,7 +114,7 @@ def set_nx_edge_attributes_filled(
     instead.
 
     Args:
-        g: a MultiGraph (uses `(u, v, k)` edge keys).
+        graph: a MultiGraph (uses `(u, v, k)` edge keys).
         attr: edge → value mapping, keyed by `(u, v, k)` tuples.
         attr_name: edge attribute name to write.
         fill_value: value to assign to edges missing from `attr`. Default 0.
@@ -122,29 +122,29 @@ def set_nx_edge_attributes_filled(
             graph's edges. Default False (silently fill).
 
     Returns:
-        `g`, mutated in place.
+        `graph`, mutated in place.
     """
     if strict:
-        _idx = pd.Series(index=list(g.edges(keys=True)))
+        _idx = pd.Series(index=list(graph.edges(keys=True)))
         n = len(_idx.index.difference(pd.Series(attr).index))
         if n > 0:
             raise DataError("Incomplete data: {n:,} edges are missing in `attr'.")
-    _data = {k: attr.get(k, fill_value) for k in g.edges(keys=True)}
-    nx.set_edge_attributes(g, _data, attr_name)
-    return g
+    _data = {k: attr.get(k, fill_value) for k in graph.edges(keys=True)}
+    nx.set_edge_attributes(graph, _data, attr_name)
+    return graph
 
 
 def get_nested_edge_betweenness(
-    g: nx.Graph,
+    graph: nx.Graph,
     nested_node_sample: dict,
-    weights: str | None = None,
+    weight: str | None = None,
     *,
     cutoff: float | None = None,
 ) -> pd.Series:
     """Edge usage counts from a nested (origin → sampled-destinations) sample.
 
     For each origin in `nested_node_sample`, runs a single-source Dijkstra
-    on `g` (via `scipy.sparse.csgraph.dijkstra` with `return_predecessors`),
+    on `graph` (via `scipy.sparse.csgraph.dijkstra` with `return_predecessors`),
     walks the predecessor chain from each sampled destination back to the
     origin, and adds 1 to every edge on the path. The result is the
     weighted sum over all sampled OD pairs — a "traffic-stress"-style edge
@@ -155,13 +155,13 @@ def get_nested_edge_betweenness(
     from the upstream sampling step's destination distribution.
 
     Args:
-        g: networkx graph (any variant). MultiGraph parallel edges with the
+        graph: networkx graph (any variant). MultiGraph parallel edges with the
             same `(u, v)` collapse to the min-`weight` edge for routing,
             and the chosen key is the one credited in the output.
         nested_node_sample: `{origin_node -> array_of_dest_nodes}`, typically
             from `traffic_flows.nested_node_sample`. Origins are unique;
             duplicate destinations within an origin's array are fine.
-        weights: edge attribute name to use as the per-edge cost (e.g.
+        weight: edge attribute name to use as the per-edge cost (e.g.
             `'duration_s'`). Required — there's no "all edges weight 1"
             default since traffic-flow sampling always needs real costs.
         cutoff: optional network-distance cutoff in weight units. Passed to
@@ -182,10 +182,12 @@ def get_nested_edge_betweenness(
 
     from aperta.routing import _graph_to_csr
 
-    if weights is None:
-        raise ValueError("`weights` is required: traffic-flow sampling needs a real edge cost.")
-    is_multi = g.is_multigraph()
-    csr, nx_to_seq, seq_to_nx, parallel_keys = _graph_to_csr(g, weights, return_parallel_keys=True)
+    if weight is None:
+        raise ValueError("`weight` is required: traffic-flow sampling needs a real edge cost.")
+    is_multi = graph.is_multigraph()
+    csr, nx_to_seq, seq_to_nx, parallel_keys = _graph_to_csr(
+        graph, weight, return_parallel_keys=True
+    )
     limit = cutoff if cutoff is not None else np.inf
 
     out: dict = defaultdict(float)
@@ -231,8 +233,12 @@ def _add_to_edge_info(node_row, collected_edge_information, cols, node_edge_rela
     return collected_edge_information
 
 
-def add_node_features_to_edges(
-    df_nodes: pd.DataFrame, cols: list[str], node_edge_relations: str | nx.Graph, agg_func: str
+def aggregate_nodes_to_edges(
+    df_nodes: pd.DataFrame,
+    cols: list[str],
+    node_edge_relations: str | nx.Graph,
+    *,
+    aggregator: str,
 ) -> pd.DataFrame:
     """Aggregate node-level features onto the edges they touch (sum or mean).
 
@@ -242,8 +248,8 @@ def add_node_features_to_edges(
         node_edge_relations: if str, must list the edges belonging to each node in column
             'node_edge_relations' in df_nodes, separated by a comma (,). Otherwise, supply an
             nx.Graph where the ID of each node corresponds to the index in df_nodes.
-        agg_func: how to aggregate values from different nodes onto a single edge. 'sum' or 'mean',
-            or 'median'.
+        aggregator: how to aggregate values from different nodes onto a single edge.
+            One of `'sum'`, `'mean'`, `'median'`.
     """
 
     collected_edge_information: dict = {}
@@ -253,14 +259,14 @@ def add_node_features_to_edges(
     )
     for k, d in collected_edge_information.items():
         for col, values in d.items():
-            if agg_func == "sum":
+            if aggregator == "sum":
                 collected_edge_information[k][col] = sum(values)
-            elif agg_func == "mean":
+            elif aggregator == "mean":
                 collected_edge_information[k][col] = float(np.average(values))
-            elif agg_func == "median":
+            elif aggregator == "median":
                 collected_edge_information[k][col] = float(np.median(values))
             else:
-                raise NotImplementedError(f"agg_func `{agg_func}` is not implemented.")
+                raise NotImplementedError(f"aggregator `{aggregator}` is not implemented.")
     return pd.DataFrame.from_dict(collected_edge_information, orient="index")
 
 
@@ -788,7 +794,7 @@ def aggregate_edges_to_nodes(
 ) -> pd.Series:
     """For each node in `graph`, aggregate `edge_attribute` across its connected edges.
 
-    The inverse of `add_node_features_to_edges` (which propagates per-node
+    The inverse of `aggregate_nodes_to_edges` (which propagates per-node
     features onto edges). Common use: classify each node by the highest-class
     road that touches it (`aggregator='max'`) — useful for filtering snap
     targets in `snap_to_network_nodes` (skip motorway-only nodes, etc.).

@@ -291,7 +291,7 @@ def make_distance_mask(pairs, graph, cutoff_m: float):
     nodes_xy = pd.DataFrame.from_dict(
         {n: (float(graph.nodes[n]['x']), float(graph.nodes[n]['y']))
          for n in graph.nodes}, orient='index', columns=['x', 'y'])
-    dists = od_pairs.get_euclidian_dists(nodes_xy, pairs)
+    dists = od_pairs.get_euclidean_dists(nodes_xy, pairs)
     return od_pairs.make_mask(dists, lambda d: d < cutoff_m)
 
 MASKS = {
@@ -502,7 +502,7 @@ ACC = {}  # (variant_label, destination) -> per-cell pd.Series
 for label, _, _, _, _, _ in ROUTING_PLAN:
     net_label = NETWORK_OF[label]
     _, dest_vals = REINDEXED[net_label]
-    cost_floored = routing.set_min_intrazonal_cost(
+    cost_floored = routing.floor_intrazonal_costs(
         GEO_COSTS_WITH_OVERHEAD[label], min_cost=30.0)
     result = accessibility.gravity(
         cost_floored, dest_vals, CELL_TO_ZONE, [DECAYS[label]],
@@ -561,7 +561,7 @@ logsum_pairs, logsum_costs = od_pairs.aggregate_across_modes(
     },
     aggregator='logsum', scale=LOGSUM_SCALE,
 )
-logsum_costs_floored = routing.set_min_intrazonal_cost(logsum_costs, min_cost=30.0)
+logsum_costs_floored = routing.floor_intrazonal_costs(logsum_costs, min_cost=30.0)
 # Destination weights: any of the per-network dest_vals will do — they're
 # the same per-cell counts; geo-pairs alignment is handled internally.
 logsum_dest_vals = {
@@ -605,7 +605,7 @@ plt.show()
 # - **Edge weights are paper-derived, not re-calibrated** for this
 #   region. To re-derive them from ground-truth travel times, see
 #   `calibrate_edge_weights.ipynb`. To add a traffic-flow / congestion
-#   feature, see `road_stress.ipynb`. None of those are wired into this
+#   feature, see `traffic_flows.ipynb`. None of those are wired into this
 #   notebook by design — each showcase notebook stands alone.
 # - **Cross-modal logsum uses a coarse `θ = 60 s`.** Production
 #   calibrates `θ` per destination class against revealed mode choice.

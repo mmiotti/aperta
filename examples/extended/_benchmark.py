@@ -184,7 +184,7 @@ def run_variant_a_all_nodes(graph, time_attr, cells, node_col, weight_col,
     w_vals = od_pairs.dest_values(
         weight_col, pairs, nodes_gdf, node_column='node_id_synth',
     )
-    acc = accessibility.count_in_bins(
+    acc = accessibility.cumulative_opportunities(
         times, {'w': w_vals}, {},
         [accessibility.Bin('in_T', 0, t_metric)],
     )
@@ -219,7 +219,7 @@ def run_variant_tiered(graph, time_attr, cells, zones, node_col,
     w_geo = od_pairs.dest_values_geo(
         weight_col, pairs_geo, cells, zones=zones)
     cell_to_zone = cells['zone_id'].to_dict()
-    acc = accessibility.count_in_bins(
+    acc = accessibility.cumulative_opportunities(
         times_geo, {'w': w_geo}, cell_to_zone,
         [accessibility.Bin('in_T', 0, t_metric)],
     )

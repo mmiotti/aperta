@@ -44,7 +44,7 @@ class RouteUtilityTestCase(unittest.TestCase):
         """With only a cost coefficient and no route features, U = β_cost · cost."""
         g, pairs = _graph_and_pairs()
         u = Utility(cost_coefficient=-2.0)
-        out = route_utility(pairs, g, cost_weight="w", utility=u)
+        out = route_utility(pairs, g, weight="w", utility=u)
         # Costs: a→a = 0, a→b = 1, a→c via b = 3.
         # Utilities: -2*0 = 0, -2*1 = -2, -2*3 = -6.
         np.testing.assert_array_almost_equal(out.cells_to_cells["a"], np.array([0.0, -2.0, -6.0]))
@@ -58,7 +58,7 @@ class RouteUtilityTestCase(unittest.TestCase):
                 RouteFeature("attr_total", "attr", coefficient=-0.1, aggregator="sum"),
             ],
         )
-        out = route_utility(pairs, g, cost_weight="w", utility=u)
+        out = route_utility(pairs, g, weight="w", utility=u)
         # a→a: cost 0, attr_total 0 → -0 - 0 = 0
         # a→b: cost 1, attr_total 10 → -2 - 1 = -3
         # a→c via b: cost 3, attr_total 30 → -6 - 3 = -9
@@ -69,7 +69,7 @@ class RouteUtilityTestCase(unittest.TestCase):
         `tiered_path_costs` exactly (modulo inf → NaN convention for utility)."""
         g, pairs = _graph_and_pairs()
         u = Utility(cost_coefficient=1.0)
-        u_out = route_utility(pairs, g, cost_weight="w", utility=u)
+        u_out = route_utility(pairs, g, weight="w", utility=u)
         costs = tiered_path_costs(pairs, g, weight="w")
         # With cost_coefficient=1.0, U = cost (where finite).
         np.testing.assert_array_almost_equal(u_out.cells_to_cells["a"], costs.cells_to_cells["a"])
@@ -82,7 +82,7 @@ class RouteUtilityTestCase(unittest.TestCase):
         # No edge between them.
         pairs = TieredODNodePairs(cells_to_cells={"a": np.array(["a", "x"])})
         u = Utility(cost_coefficient=-1.0)
-        out = route_utility(pairs, g, cost_weight="w", utility=u)
+        out = route_utility(pairs, g, weight="w", utility=u)
         self.assertEqual(out.cells_to_cells["a"][0], 0.0)  # self-pair, finite
         self.assertTrue(np.isnan(out.cells_to_cells["a"][1]))  # unreachable → NaN
 
@@ -96,7 +96,7 @@ class RouteUtilityTestCase(unittest.TestCase):
                 RouteFeature("attr_mean", "attr", coefficient=-0.01, aggregator="mean"),
             ],
         )
-        out = route_utility(pairs, g, cost_weight="w", utility=u)
+        out = route_utility(pairs, g, weight="w", utility=u)
         # a→c: cost 3, attr_sum 30, attr_mean 15.
         # U = -1*3 - 0.1*30 - 0.01*15 = -3 - 3 - 0.15 = -6.15
         self.assertAlmostEqual(out.cells_to_cells["a"][2], -6.15)
@@ -119,7 +119,7 @@ class RouteUtilityTestCase(unittest.TestCase):
                 RouteFeature("attr_mean", "attr", coefficient=-0.1, aggregator="mean"),
             ],
         )
-        out = route_utility(pairs, g, cost_weight="w", utility=u)
+        out = route_utility(pairs, g, weight="w", utility=u)
         # Self-pair a→a: cost 0, no edges. Route utility should be
         # -2*0 + (-0.1)*0_contribution = 0.0 — finite, not NaN.
         self.assertFalse(np.isnan(out.cells_to_cells["a"][0]))
@@ -146,7 +146,7 @@ class RouteUtilityTestCase(unittest.TestCase):
                 RouteFeature("attr_mean", "attr", coefficient=-0.1, aggregator="mean"),
             ],
         )
-        out = route_utility(pairs, g, cost_weight="w", utility=u)
+        out = route_utility(pairs, g, weight="w", utility=u)
         # Self-pair: finite (0).
         self.assertEqual(out.cells_to_cells["a"][0], 0.0)
         # Reachable destination: finite (-1*1 - 0.1*10 = -2).
@@ -181,7 +181,7 @@ class AddEndpointUtilityTestCase(unittest.TestCase):
         """With only a constant, U_full = U_route + constant for every OD."""
         g, pairs, cells = self._setup()
         u = Utility(cost_coefficient=-1.0, constant=5.0)
-        r_u = route_utility(pairs, g, cost_weight="w", utility=u)
+        r_u = route_utility(pairs, g, weight="w", utility=u)
         full = add_endpoint_utility(r_u, pairs, u, cells=cells)
         np.testing.assert_array_almost_equal(
             full.cells_to_cells["a"], r_u.cells_to_cells["a"] + 5.0
@@ -194,7 +194,7 @@ class AddEndpointUtilityTestCase(unittest.TestCase):
             cost_coefficient=-1.0,
             destination_features={"jobs": 0.5},
         )
-        r_u = route_utility(pairs, g, cost_weight="w", utility=u)
+        r_u = route_utility(pairs, g, weight="w", utility=u)
         full = add_endpoint_utility(r_u, pairs, u, cells=cells)
         # Destinations are nodes a, b, c with jobs 10, 20, 30.
         # Full utility = route_utility + 0.5 * jobs at dest.
@@ -210,7 +210,7 @@ class AddEndpointUtilityTestCase(unittest.TestCase):
             cost_coefficient=-1.0,
             origin_features={"pop_density": 0.01},
         )
-        r_u = route_utility(pairs, g, cost_weight="w", utility=u)
+        r_u = route_utility(pairs, g, weight="w", utility=u)
         full = add_endpoint_utility(r_u, pairs, u, cells=cells)
         # Origin a has pop_density 100. Contribution: 0.01 * 100 = 1.0 (added to every OD from a).
         # Costs: 0, 1, 3 → utility = 0, -1, -3.
@@ -226,7 +226,7 @@ class AddEndpointUtilityTestCase(unittest.TestCase):
             origin_features={"pop_density": 0.01},  # +1.0 at origin a
             destination_features={"jobs": 0.5},  # +5, +10, +15 at dests
         )
-        r_u = route_utility(pairs, g, cost_weight="w", utility=u)
+        r_u = route_utility(pairs, g, weight="w", utility=u)
         full = add_endpoint_utility(r_u, pairs, u, cells=cells)
         # a→a: 0  + 2 + 1 + 5  = 8
         # a→b: -1 + 2 + 1 + 10 = 12
@@ -236,14 +236,14 @@ class AddEndpointUtilityTestCase(unittest.TestCase):
     def test_missing_origin_feature_raises(self):
         g, pairs, cells = self._setup()
         u = Utility(origin_features={"nonexistent": 1.0})
-        r_u = route_utility(pairs, g, cost_weight="w", utility=u)
+        r_u = route_utility(pairs, g, weight="w", utility=u)
         with self.assertRaisesRegex(ValueError, "Origin feature"):
             add_endpoint_utility(r_u, pairs, u, cells=cells)
 
     def test_missing_dest_feature_raises(self):
         g, pairs, cells = self._setup()
         u = Utility(destination_features={"nonexistent": 1.0})
-        r_u = route_utility(pairs, g, cost_weight="w", utility=u)
+        r_u = route_utility(pairs, g, weight="w", utility=u)
         with self.assertRaisesRegex(ValueError, "Destination feature"):
             add_endpoint_utility(r_u, pairs, u, cells=cells)
 
@@ -262,7 +262,7 @@ class AddEndpointUtilityTestCase(unittest.TestCase):
             index=pd.Index(["c1", "c2", "c3"], name="cell_id"),
         )
         u = Utility(cost_coefficient=0.0, origin_features={"density": 1.0})
-        r_u = route_utility(pairs, g, cost_weight="w", utility=u)
+        r_u = route_utility(pairs, g, weight="w", utility=u)
         full = add_endpoint_utility(r_u, pairs, u, cells=cells)
         # Origin 'a' has two cells with density 100 and 200; mean = 150.
         # Origin contribution: 1.0 * 150 = 150 (added to every OD from 'a').
@@ -293,7 +293,7 @@ class UtilityCompositionTestCase(unittest.TestCase):
             origin_features={"pop": 0.001},
             destination_features={"pop": 0.002},
         )
-        r_u = route_utility(pairs, g, cost_weight="w", utility=u)
+        r_u = route_utility(pairs, g, weight="w", utility=u)
         full = add_endpoint_utility(r_u, pairs, u, cells=cells)
         # a→b: cost=2, attr_sum=10, orig pop=100, dest pop=200.
         # U_route = -0.5 * 2 - 0.01 * 10 = -1 - 0.1 = -1.1

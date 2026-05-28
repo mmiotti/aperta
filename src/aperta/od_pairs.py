@@ -170,7 +170,7 @@ class TieredODNodePairs(TieredODPairs):
     masks, distances) aligned to those dest IDs.
 
     Produced by `get_pairs`, `routing.tiered_path_costs`,
-    `routing.tiered_path_aggregate`, `dest_values`, `get_euclidian_dists`,
+    `routing.tiered_path_aggregate`, `dest_values`, `get_euclidean_dists`,
     `make_mask`, `overhead.add_node_overheads`, `utility.route_utility`,
     `utility.add_endpoint_utility`. The default working representation for
     single-mode pipelines — lightweight, no fan-out.
@@ -712,11 +712,19 @@ def get_pairs(
 
 def node_values(
     column: str,
-    node_list: pd.Series | list | np.ndarray,
     df: pd.DataFrame,
     node_column: str,
+    node_list: pd.Series | list | np.ndarray,
 ) -> np.ndarray:
-    """Single-tier lookup of `column` for every node in a list of node IDs."""
+    """Single-tier lookup of `column` for every node in `node_list`.
+
+    Args:
+        column: column on `df` whose value to return for each node.
+        df: source DataFrame.
+        node_column: column on `df` holding the network node ID for each row.
+        node_list: node IDs to look up. Returned array is position-aligned
+            with this input.
+    """
     if column not in df.columns:
         raise ValueError(f"`df` is missing column {column!r}.")
     df_lookup = _node_to_value_lookup(df, node_column, column)
@@ -1118,8 +1126,8 @@ def _aggregate_modes_tier(
 
 def aggregate_across_modes(
     odms: dict[str, tuple[TieredODGeoPairs, TieredODGeoPairs]],
-    aggregator: str | Callable = "min",
     *,
+    aggregator: str | Callable = "min",
     scale: float = 1.0,
 ) -> tuple[TieredODGeoPairs, TieredODGeoPairs]:
     """Aggregate per-mode geo-keyed cost ODMs into a combined cost ODM.
@@ -1149,7 +1157,7 @@ def aggregate_across_modes(
 
     - **`'min'`** (default): per OD pair, take the minimum cost across modes.
       Use case: "how reachable is each destination under the fastest available
-      mode?" Combine with `count_in_bins` for "destinations within X min by ANY
+      mode?" Combine with `cumulative_opportunities` for "destinations within X min by ANY
       mode"; with `gravity` or `nearest_k` for fastest-mode variants.
 
     - **`'logsum'`**: per OD pair, compute `-scale * ln Σ_m exp(-cost_m / scale)`
@@ -1273,9 +1281,10 @@ def aggregate_across_modes(
     return union_pairs, combined
 
 
-def get_euclidian_dists(
+def get_euclidean_dists(
     nodes: pd.DataFrame | gpd.GeoDataFrame,
     pairs: TieredODPairs,
+    *,
     dtype: np.dtype | type = np.float32,
 ) -> TieredODPairs:
     """Euclidean origin→destination distance for every pair in `pairs`, per tier.
@@ -1295,14 +1304,14 @@ def max_cost(costs: TieredODPairs) -> float:
     """Largest finite value across all tiers of `costs`.
 
     Designed as a one-liner upper bound to pass as `cutoff=` to downstream
-    routing helpers (`routing.tiered_path_costs`, `traffic_flows.get`,
+    routing helpers (`routing.tiered_path_costs`, `traffic_flows.estimate_edge_flows`,
     `network_processing.get_nested_edge_betweenness`, etc.) when the
     routing targets are guaranteed to live inside this `costs` ODM — e.g.
     the canonical traffic-flows workflow::
 
         costs  = routing.tiered_path_costs(pairs, g, weight)
         sample = traffic_flows.nested_node_sample(pairs, weights, costs, ...)
-        flows  = traffic_flows.get(g, weight, expected_km, sample,
+        flows  = traffic_flows.estimate_edge_flows(g, weight, expected_km, sample,
                                    cutoff=od_pairs.max_cost(costs))
 
     Correctness-preserving: every (origin, dest) pair in `costs` is

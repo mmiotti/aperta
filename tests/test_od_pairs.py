@@ -25,7 +25,7 @@ Zone *polygon centroids* (what tier classification uses):
 Zone-pair distances: d(Z0, Z1) = 1.0, d(Z1, Z2) = 1.0, d(Z0, Z2) = 2.0.
 
 (The network nodes ZN0/ZN1/ZN2 are placed elsewhere — at (1, 0.5), (1, 1),
-(1, 2) — and only matter for tests that exercise `get_euclidian_dists` etc.)
+(1, 2) — and only matter for tests that exercise `get_euclidean_dists` etc.)
 
 Populations: each cell `Ci` has `population = (i + 1) * 100` (total = 4500).
 Zones are aggregated through the cell→zone mapping so the conservation
@@ -46,7 +46,7 @@ from aperta.od_pairs import (
     TieredODPairs,
     aggregate_across_modes,
     dest_values,
-    get_euclidian_dists,
+    get_euclidean_dists,
     get_pairs,
 )
 
@@ -441,7 +441,7 @@ class ConservationTestCase(unittest.TestCase):
 
 
 class GetEuclidianDistsTestCase(unittest.TestCase):
-    """`get_euclidian_dists` returns a TieredODPairs of float distance arrays."""
+    """`get_euclidean_dists` returns a TieredODPairs of float distance arrays."""
 
     @classmethod
     def setUpClass(cls):
@@ -451,7 +451,7 @@ class GetEuclidianDistsTestCase(unittest.TestCase):
         pairs = get_pairs(
             self.cells, r_cells=1.5, node_column="node_id", zones=self.zones, r_zones=2.5
         )
-        dists = get_euclidian_dists(self.nodes, pairs)
+        dists = get_euclidean_dists(self.nodes, pairs)
         for origin, dest_ids in pairs.cells_to_cells.items():
             self.assertEqual(len(dest_ids), len(dists.cells_to_cells[origin]))
             for i, d in enumerate(dest_ids):
@@ -463,7 +463,7 @@ class GetEuclidianDistsTestCase(unittest.TestCase):
 
     def test_dists_dtype_param(self):
         pairs = get_pairs(self.cells, r_cells=1.5, node_column="node_id")
-        dists = get_euclidian_dists(self.nodes, pairs, dtype=np.float32)
+        dists = get_euclidean_dists(self.nodes, pairs, dtype=np.float32)
         first = next(iter(dists.cells_to_cells.values()))
         self.assertEqual(first.dtype, np.float32)
 
@@ -483,7 +483,7 @@ class GetEuclidianDistsTestCase(unittest.TestCase):
             r_medium=3.5,
             zones_centroids=custom,
         )
-        dists = get_euclidian_dists(self.nodes, pairs)
+        dists = get_euclidean_dists(self.nodes, pairs)
         assert dists.cells_to_zones is not None
         assert dists.zones_to_zones is not None
         # ZN0 at (1, 0.5), ZN2 at (1, 2.0) → d = 1.5 (uses *network node*
@@ -540,7 +540,7 @@ class DescribeTestCase(unittest.TestCase):
         pairs = get_pairs(
             self.cells, r_cells=1.5, node_column="node_id", zones=self.zones, r_zones=2.5
         )
-        dists = get_euclidian_dists(self.nodes, pairs)
+        dists = get_euclidean_dists(self.nodes, pairs)
         out = dists.describe()
         # Numeric tier should produce a stats line with 'mean' / 'median'.
         self.assertIn("mean", out)

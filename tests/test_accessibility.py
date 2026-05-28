@@ -16,7 +16,7 @@ import pandas as pd
 from aperta.accessibility import (
     Bin,
     Decay,
-    count_in_bins,
+    cumulative_opportunities,
     exp_decay,
     gravity,
     nearest_k,
@@ -54,21 +54,21 @@ def _toy_inputs() -> tuple[TieredODNodePairs, TieredODNodePairs, TieredODNodePai
 
 
 class CountInBinsTestCase(unittest.TestCase):
-    """`count_in_bins` sums per-property weights over destinations whose cost falls in each bin."""
+    """`cumulative_opportunities` sums per-property weights over destinations whose cost falls in each bin."""
 
     def setUp(self):
         self.costs, self.w_pop, self.w_emp, self.c2z = _toy_inputs()
         self.bins = [Bin("short", 0, 300), Bin("medium", 300, 1000), Bin("long", 1000, 6000)]
 
     def test_output_shape_and_index(self):
-        df = count_in_bins(self.costs, {"pop": self.w_pop}, self.c2z, self.bins)
+        df = cumulative_opportunities(self.costs, {"pop": self.w_pop}, self.c2z, self.bins)
         self.assertEqual(list(df.index), ["a", "b"])
         self.assertEqual(df.index.name, "node")
         self.assertEqual(df.columns.names, ["bin", "property"])
         self.assertEqual(list(df.columns), [("short", "pop"), ("medium", "pop"), ("long", "pop")])
 
     def test_single_property_known_values(self):
-        df = count_in_bins(self.costs, {"pop": self.w_pop}, self.c2z, self.bins)
+        df = cumulative_opportunities(self.costs, {"pop": self.w_pop}, self.c2z, self.bins)
         # a: short = 10+20 = 30; medium = 30; long = 100+200 = 300
         self.assertEqual(df.loc["a", ("short", "pop")], 30.0)
         self.assertEqual(df.loc["a", ("medium", "pop")], 30.0)
@@ -80,8 +80,8 @@ class CountInBinsTestCase(unittest.TestCase):
 
     def test_multi_property_amortized_same_result(self):
         """Adding a second property should not change the first's values."""
-        single = count_in_bins(self.costs, {"pop": self.w_pop}, self.c2z, self.bins)
-        multi = count_in_bins(
+        single = cumulative_opportunities(self.costs, {"pop": self.w_pop}, self.c2z, self.bins)
+        multi = cumulative_opportunities(
             self.costs, {"pop": self.w_pop, "emp": self.w_emp}, self.c2z, self.bins
         )
         for col in single.columns:
@@ -95,7 +95,7 @@ class CountInBinsTestCase(unittest.TestCase):
         costs = TieredODNodePairs(cells_to_cells={"a": np.array([300.0, 600.0])})
         w = TieredODNodePairs(cells_to_cells={"a": np.array([1.0, 1.0])})
         bins = [Bin("lo_inclusive", 300, 600), Bin("hi_inclusive", 600, 900)]
-        df = count_in_bins(costs, {"w": w}, {"a": None}, bins)
+        df = cumulative_opportunities(costs, {"w": w}, {"a": None}, bins)
         # 300 falls in the first bin (lo-inclusive); 600 falls in the second.
         self.assertEqual(df.loc["a", ("lo_inclusive", "w")], 1.0)
         self.assertEqual(df.loc["a", ("hi_inclusive", "w")], 1.0)
@@ -105,7 +105,7 @@ class CountInBinsTestCase(unittest.TestCase):
         costs = TieredODNodePairs(cells_to_cells={"a": np.array([100.0, np.inf, np.nan, 200.0])})
         w = TieredODNodePairs(cells_to_cells={"a": np.array([1.0, 9.0, 9.0, 1.0])})
         bins = [Bin("any", 0, 1e9)]
-        df = count_in_bins(costs, {"w": w}, {"a": None}, bins)
+        df = cumulative_opportunities(costs, {"w": w}, {"a": None}, bins)
         # Only the two finite-cost rows contribute (1 + 1 = 2). The 9-valued
         # rows at inf/NaN cost are dropped, not counted toward 'any'.
         self.assertEqual(df.loc["a", ("any", "w")], 2.0)
@@ -115,7 +115,7 @@ class CountInBinsTestCase(unittest.TestCase):
         costs = TieredODNodePairs(cells_to_cells={"a": np.array([100.0, 500.0])})
         w = TieredODNodePairs(cells_to_cells={"a": np.array([1.0, 2.0])})
         bins = [Bin("short", 0, 300), Bin("long", 300, 1000)]
-        df = count_in_bins(costs, {"w": w}, {"a": None}, bins)
+        df = cumulative_opportunities(costs, {"w": w}, {"a": None}, bins)
         self.assertEqual(df.loc["a", ("short", "w")], 1.0)
         self.assertEqual(df.loc["a", ("long", "w")], 2.0)
 
@@ -124,7 +124,7 @@ class CountInBinsTestCase(unittest.TestCase):
         costs = TieredODNodePairs(cells_to_cells={"a": np.array([5000.0, 6000.0])})
         w = TieredODNodePairs(cells_to_cells={"a": np.array([1.0, 1.0])})
         bins = [Bin("short", 0, 100)]
-        df = count_in_bins(costs, {"w": w}, {"a": None}, bins)
+        df = cumulative_opportunities(costs, {"w": w}, {"a": None}, bins)
         self.assertEqual(df.loc["a", ("short", "w")], 0.0)
         self.assertFalse(df.isna().any().any())
 
@@ -141,14 +141,14 @@ class CountInBinsTestCase(unittest.TestCase):
             zones_to_zones={"Z": np.array([100.0])},
         )
         bins = [Bin("short", 0, 300), Bin("medium", 300, 5000), Bin("long", 5000, 100_000)]
-        df = count_in_bins(costs, {"w": w}, {"a": "Z"}, bins)
+        df = cumulative_opportunities(costs, {"w": w}, {"a": "Z"}, bins)
         self.assertEqual(df.loc["a", ("short", "w")], 3.0)  # 1 + 2 cell-tier
         self.assertEqual(df.loc["a", ("medium", "w")], 10.0)  # middle (cells_to_zones)
         self.assertEqual(df.loc["a", ("long", "w")], 100.0)  # far (zones_to_zones)
 
 
 class CountInBinsGeoKeyedTestCase(unittest.TestCase):
-    """`count_in_bins` with `TieredODGeoPairs` input: cell-indexed output;
+    """`cumulative_opportunities` with `TieredODGeoPairs` input: cell-indexed output;
     per-cell origin overhead via `add_origin_cell_overhead` upstream."""
 
     def setUp(self):
@@ -186,13 +186,13 @@ class CountInBinsGeoKeyedTestCase(unittest.TestCase):
 
     def test_output_indexed_by_cell(self):
         """Geo-keyed input → output indexed by cell_id (not by node)."""
-        df = count_in_bins(self.costs, {"pop": self.w_pop}, self.c2z, self.bins)
+        df = cumulative_opportunities(self.costs, {"pop": self.w_pop}, self.c2z, self.bins)
         self.assertEqual(df.index.name, "cell")
         self.assertSetEqual(set(df.index), {"c1", "c2", "c3"})
 
     def test_no_overhead_baked_matches_zero_overhead(self):
         """With zero overhead, c1 result matches the raw cost bins."""
-        df = count_in_bins(self.costs, {"pop": self.w_pop}, self.c2z, self.bins)
+        df = cumulative_opportunities(self.costs, {"pop": self.w_pop}, self.c2z, self.bins)
         # c1: cell dests at 100, 200, 800 (in bins short, short, medium);
         # zone-tier 1500, 5000 (both long).
         self.assertEqual(df.loc["c1", ("short", "pop")], 30.0)  # 10 + 20
@@ -202,7 +202,7 @@ class CountInBinsGeoKeyedTestCase(unittest.TestCase):
     def test_baked_overhead_shifts_bins(self):
         """`add_origin_cell_overhead` shifts every cost by the per-cell value."""
         baked = add_origin_cell_overhead(self.costs, self.pairs, self.cells_df, "walk_overhead_s")
-        df = count_in_bins(baked, {"pop": self.w_pop}, self.c2z, self.bins)
+        df = cumulative_opportunities(baked, {"pop": self.w_pop}, self.c2z, self.bins)
         # c1 has overhead 0 → unchanged from raw.
         self.assertEqual(df.loc["c1", ("short", "pop")], 30.0)
         self.assertEqual(df.loc["c1", ("medium", "pop")], 30.0)

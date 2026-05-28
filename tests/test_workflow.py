@@ -86,7 +86,7 @@ class WorkflowTestCase(unittest.TestCase):
             crs="EPSG:2056",
         )
 
-        # -- Nodes: one Point per network node, used by `get_euclidian_dists`.
+        # -- Nodes: one Point per network node, used by `get_euclidean_dists`.
         cls.nodes = gpd.GeoDataFrame(
             geometry=[Point(r[1], r[2]) for r in cell_rows],
             index=pd.Index([r[3] for r in cell_rows], name="node_id"),
@@ -139,7 +139,7 @@ class WorkflowTestCase(unittest.TestCase):
         self.assertEqual(set(pairs.zones_to_zones["c0"]), {"a0", "b0"})
 
         # ===== Phase 3 (cont.): euclidean OD distances ===================
-        dists = od_pairs.get_euclidian_dists(self.nodes, pairs)
+        dists = od_pairs.get_euclidean_dists(self.nodes, pairs)
         # cell-tier dists for a0 are [a0→a1, a0→a0] = {0, 1} regardless of order.
         self.assertEqual(sorted(dists.cells_to_cells["a0"].tolist()), [0.0, 1.0])
 
@@ -172,7 +172,9 @@ class WorkflowTestCase(unittest.TestCase):
             accessibility.Bin("medium", 5, 15),
             accessibility.Bin("long", 15, 100),
         ]
-        df = accessibility.count_in_bins(times, {"population": pop}, cell_to_zone_node, bins)
+        df = accessibility.cumulative_opportunities(
+            times, {"population": pop}, cell_to_zone_node, bins
+        )
 
         # Output shape: 6 origins × (3 bins × 1 property).
         self.assertEqual(df.shape, (6, 3))

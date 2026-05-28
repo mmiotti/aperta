@@ -4,7 +4,7 @@ Run with:
     python -m unittest tests.test_traffic_flows
 
 Two public entry points:
-    - `get` — naive edge-betweenness-based traffic flow with optional cutoff
+    - `estimate_edge_flows` — naive edge-betweenness-based traffic flow with optional cutoff
       OR a `nested_node_sample` dict for nested betweenness.
     - `nested_node_sample` — sample destinations for sampled origins, weighted
       by cost-derived scores, integrating all three OD tiers (cells_to_cells,
@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 
 from aperta.od_pairs import TieredODNodePairs
-from aperta.traffic_flows import get, nested_node_sample
+from aperta.traffic_flows import estimate_edge_flows, nested_node_sample
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -86,7 +86,7 @@ def _inverse_distance(x: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# `get` — naive betweenness-based traffic flow estimation
+# `estimate_edge_flows` — naive betweenness-based traffic flow estimation
 # ---------------------------------------------------------------------------
 
 
@@ -94,8 +94,8 @@ class GetTrafficFlowsTestCase(unittest.TestCase):
     def test_returns_series_keyed_by_multidigraph_edge(self):
         g = _toy_graph()
         sample = {"A": ["D"]}
-        flows = get(
-            g, routing_edge_weight="cost", expected_km_driven=10.0, nested_node_sample=sample
+        flows = estimate_edge_flows(
+            g, weight="cost", expected_km_driven=10.0, nested_node_sample=sample
         )
         self.assertIsInstance(flows, pd.Series)
         # Each edge is keyed by (u, v, k) (MultiDiGraph).
@@ -107,8 +107,8 @@ class GetTrafficFlowsTestCase(unittest.TestCase):
         `expected_km_driven` normaliser is exact."""
         g = _toy_graph()
         sample = {"A": ["D"]}
-        flows = get(
-            g, routing_edge_weight="cost", expected_km_driven=10.0, nested_node_sample=sample
+        flows = estimate_edge_flows(
+            g, weight="cost", expected_km_driven=10.0, nested_node_sample=sample
         )
         lengths = nx.get_edge_attributes(g, "length")
         total_vkt = sum(v * lengths[k] for k, v in flows.items())

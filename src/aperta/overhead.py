@@ -24,7 +24,7 @@ Each category in detail:
   assigned network node). Different cells at the same node have *different*
   values. Cannot be added to a `TieredODPairs` because TieredODPairs is
   keyed by node, not by cell. Applied at accessibility-computation time via
-  the `cell_overhead_column` kwarg on `gravity`, `count_in_bins`, etc.
+  the `cell_overhead_column` kwarg on `gravity`, `cumulative_opportunities`, etc.
 
 - **(2) Origin overhead at node** — per-node overhead independent of which
   cell at that node is the actual origin (e.g., parking-find time on

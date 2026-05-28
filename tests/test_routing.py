@@ -15,14 +15,14 @@ from aperta.routing import (
     NodeAggregation,
     PathAggregation,
     aggregate_along_paths,
-    set_min_intrazonal_cost,
+    floor_intrazonal_costs,
     tiered_path_aggregate,
     tiered_path_costs,
 )
 
 
 class SetMinIntrazonalCostTestCase(unittest.TestCase):
-    """`set_min_intrazonal_cost` floors every cell-tier cost entry at `min_cost`.
+    """`floor_intrazonal_costs` floors every cell-tier cost entry at `min_cost`.
 
     The floor applies uniformly (not just to self-pairs) to keep cost geometry
     consistent: if intrazonal travel is floored at X, then a longer trip should
@@ -39,7 +39,7 @@ class SetMinIntrazonalCostTestCase(unittest.TestCase):
     def test_scalar_floors_all_entries(self):
         """Floor applies uniformly: every entry below `min_cost` becomes `min_cost`."""
         costs = self._costs()
-        out = set_min_intrazonal_cost(costs, min_cost=10.0)
+        out = floor_intrazonal_costs(costs, min_cost=10.0)
         # 'a': self-pair 0 → 10; close pair 5 → 10; far pair 200 unchanged.
         np.testing.assert_array_equal(out.cells_to_cells["a"], np.array([10.0, 10.0, 200.0]))
         # 'b': self-pair 0 → 10; far pair 300 unchanged.
@@ -48,7 +48,7 @@ class SetMinIntrazonalCostTestCase(unittest.TestCase):
     def test_entries_above_floor_unchanged(self):
         """Costs already above the floor pass through unchanged."""
         costs = self._costs()
-        out = set_min_intrazonal_cost(costs, min_cost=1.0)
+        out = floor_intrazonal_costs(costs, min_cost=1.0)
         # All non-self-pair entries are >= 1, so only self-pairs (cost 0) get floored.
         np.testing.assert_array_equal(out.cells_to_cells["a"], np.array([1.0, 5.0, 200.0]))
         np.testing.assert_array_equal(out.cells_to_cells["b"], np.array([1.0, 300.0]))
@@ -56,21 +56,21 @@ class SetMinIntrazonalCostTestCase(unittest.TestCase):
     def test_other_tiers_unchanged(self):
         """cells_to_zones and zones_to_zones pass through untouched."""
         costs = self._costs()
-        out = set_min_intrazonal_cost(costs, min_cost=10.0)
+        out = floor_intrazonal_costs(costs, min_cost=10.0)
         self.assertIs(out.zones_to_zones, costs.zones_to_zones)
         self.assertIsNone(out.cells_to_zones)
 
     def test_dict_per_origin(self):
         """Per-origin floors apply independently."""
         costs = self._costs()
-        out = set_min_intrazonal_cost(costs, min_cost={"a": 10.0, "b": 50.0})
+        out = floor_intrazonal_costs(costs, min_cost={"a": 10.0, "b": 50.0})
         np.testing.assert_array_equal(out.cells_to_cells["a"], np.array([10.0, 10.0, 200.0]))
         np.testing.assert_array_equal(out.cells_to_cells["b"], np.array([50.0, 300.0]))
 
     def test_dict_missing_origin_passes_through(self):
         """Origins absent from the dict get no floor applied."""
         costs = self._costs()
-        out = set_min_intrazonal_cost(costs, min_cost={"a": 10.0})  # no 'b'
+        out = floor_intrazonal_costs(costs, min_cost={"a": 10.0})  # no 'b'
         np.testing.assert_array_equal(out.cells_to_cells["a"], np.array([10.0, 10.0, 200.0]))
         # 'b' unchanged — its self-pair 0 is preserved.
         np.testing.assert_array_equal(out.cells_to_cells["b"], np.array([0.0, 300.0]))
@@ -78,7 +78,7 @@ class SetMinIntrazonalCostTestCase(unittest.TestCase):
     def test_series_per_origin(self):
         costs = self._costs()
         s = pd.Series({"a": 10.0, "b": 50.0})
-        out = set_min_intrazonal_cost(costs, min_cost=s)
+        out = floor_intrazonal_costs(costs, min_cost=s)
         np.testing.assert_array_equal(out.cells_to_cells["a"], np.array([10.0, 10.0, 200.0]))
         np.testing.assert_array_equal(out.cells_to_cells["b"], np.array([50.0, 300.0]))
 
@@ -87,7 +87,7 @@ class SetMinIntrazonalCostTestCase(unittest.TestCase):
         costs = TieredODNodePairs(
             cells_to_cells={"a": np.array([0.0, np.inf, np.nan, 200.0])},
         )
-        out = set_min_intrazonal_cost(costs, min_cost=10.0)
+        out = floor_intrazonal_costs(costs, min_cost=10.0)
         # 0 → 10; inf and nan preserved; 200 unchanged.
         self.assertEqual(out.cells_to_cells["a"][0], 10.0)
         self.assertTrue(np.isinf(out.cells_to_cells["a"][1]))
@@ -98,7 +98,7 @@ class SetMinIntrazonalCostTestCase(unittest.TestCase):
         """Original cost arrays must not be mutated."""
         costs = self._costs()
         original_a = costs.cells_to_cells["a"].copy()
-        _ = set_min_intrazonal_cost(costs, min_cost=10.0)
+        _ = floor_intrazonal_costs(costs, min_cost=10.0)
         np.testing.assert_array_equal(costs.cells_to_cells["a"], original_a)
 
     def test_works_with_gravity_to_avoid_inf(self):
@@ -109,7 +109,7 @@ class SetMinIntrazonalCostTestCase(unittest.TestCase):
         weights = TieredODNodePairs(cells_to_cells={"a": np.array([10.0, 1.0, 1.0])})
         # Without the floor, c=0 would give 1/0 → inf; the defensive drop in
         # gravity would silently lose the self-pair weight.
-        fixed_costs = set_min_intrazonal_cost(costs, min_cost=0.5)
+        fixed_costs = floor_intrazonal_costs(costs, min_cost=0.5)
         df = gravity(fixed_costs, {"w": weights}, {"a": None}, power_decay("inv", 1.0))
         # 10 / 0.5 + 1 / 1 + 1 / 2 = 20 + 1 + 0.5 = 21.5
         self.assertAlmostEqual(df.loc["a", ("inv", "w")], 21.5)

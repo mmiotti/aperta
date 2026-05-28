@@ -138,8 +138,9 @@ def sum_within_radius(
     gdf: gpd.GeoDataFrame,
     cols: list[str],
     radius: int | float,
-    return_densities: bool,
-    add_filled_densities: bool,
+    *,
+    return_densities: bool = False,
+    add_filled_densities: bool = False,
 ) -> pd.DataFrame:
     """Same-set neighbourhood sum: for each cell in `gdf`, sum the values
     of `cols` over all cells (including itself) within `radius`.

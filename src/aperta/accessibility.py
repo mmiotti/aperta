@@ -33,7 +33,7 @@ Two valid input shapes, distinguished by the costs/weights subclass:
   Build the `cell_to_zone` map directly: `cells['zone_id'].to_dict()`. Weights
   from `od_pairs.dest_values_geo` (per-cell direct lookup, no implicit summing).
 
-The same three functions (`count_in_bins`, `gravity`, `nearest_k`) accept
+The same three functions (`cumulative_opportunities`, `gravity`, `nearest_k`) accept
 either shape; output index name (`'node'` vs `'cell'`) reflects the input.
 
 For cross-modal accessibility ("destinations within X min by ANY mode",
@@ -43,13 +43,13 @@ is not supported — different modes live on different graphs.
 
 For gravity in particular, the intrazonal-cost issue (cell-tier self-pairs
 route at cost 0, which sends exp(0)=1 to maximum weight) is addressed by
-calling `routing.set_min_intrazonal_cost` on the cost ODM before passing here.
+calling `routing.floor_intrazonal_costs` on the cost ODM before passing here.
 
 Provides:
     - `Bin` namedtuple — half-open `[lo, hi)` cost bin with a name.
     - `Decay` namedtuple — named callable for gravity-style cost decay.
     - `exp_decay`, `power_decay` — convenience constructors for common families.
-    - `count_in_bins` — sum each property's weights over destinations within each
+    - `cumulative_opportunities` — sum each property's weights over destinations within each
       cost bin (cumulative-opportunity accessibility).
     - `gravity` — sum each property's weights weighted by f(cost), over all
       destinations, for one or more decay specs.
@@ -202,7 +202,7 @@ def _sniff_dtype(costs: TieredODPairs) -> np.dtype:
     return np.dtype(np.float32)
 
 
-def count_in_bins(
+def cumulative_opportunities(
     costs: TieredODPairs,
     weights: dict[str, TieredODPairs],
     cell_to_zone: dict,
@@ -296,7 +296,7 @@ def gravity(
     `ln(...)` of the same sum).
 
     Args:
-        costs, weights, cell_to_zone: see `count_in_bins`.
+        costs, weights, cell_to_zone: see `cumulative_opportunities`.
         decays: a single `Decay` or list of `Decay` specs. Output columns are
             MultiIndex `(decay_name, property_name)` with decay names outer.
 
@@ -391,7 +391,7 @@ def nearest_k(
     cheaper than `k` individual calls.
 
     Args:
-        costs, weights, cell_to_zone: see `count_in_bins`.
+        costs, weights, cell_to_zone: see `cumulative_opportunities`.
         ks: a single `k` or list of `k`s; positive values, integer or float.
             Output columns are MultiIndex `(k, property_name)` with `k` outer.
         aggregator: `'cost_mean'` (default) or `'cost_at_k'`.

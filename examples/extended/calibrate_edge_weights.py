@@ -255,9 +255,9 @@ print(f"Wrote calibrated graph + edge layer to {PREPARED_DIR}/.")
 # keep it readable as a tutorial, it deliberately omits things that
 # matter for production:
 #
-# - **No road_stress / traffic-flow features.** The library's
+# - **No flows / traffic-flow features.** The library's
 #   `calibrate_edge_weights` accepts arbitrary multiplier features, so a
-#   `road_stress` AADT estimate (see `road_stress.ipynb`) can enter
+#   `flow_estimate` AADT estimate (see `traffic_flows.ipynb`) can enter
 #   through a BPR-style `(V/C)²` transform to capture congestion. The
 #   production lumos pipeline does this. Showcase keeps the model
 #   interpretable.
