@@ -46,7 +46,7 @@ Requires Python ≥ 3.11.
   feature aggregation, ~40 s).
 - **Production-scale demo** —
   [`examples/extended/`](https://github.com/mmiotti/aperta/tree/main/examples/extended)
-  (Bern + 25 km, calibration, traffic flows, ~30 min).
+  (Bern + 40 km, calibration, traffic flows, ~30 min).
 
 ## API reference
 

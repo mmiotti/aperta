@@ -82,19 +82,17 @@ def combine_edge_weights(graph: nx.Graph, source_names: list[str], target_name: 
 
 
 # ---------------------------------------------------------------------------
-# scipy backend (cutoff-aware) — opt-in via `cutoff=` on tiered routing.
+# Cutoff semantics — opt-in via `cutoff=` on tiered routing.
 #
 # When the caller passes `cutoff=T` to `tiered_path_costs` /
 # `tiered_path_aggregate`, the per-origin Dijkstra is run via
 # scipy.sparse.csgraph.dijkstra with `limit=T`. This truncates the
-# Dijkstra at network distance T (in weight units), which can be
-# dramatically faster than igraph's no-cutoff exploration when T is
-# small relative to graph diameter (verified empirically: ~35× speed-up
-# for the Bern + 25 km walk case at T = 2 km, 144k-node graph).
-#
-# igraph's Graph.distances() doesn't support cutoff; scipy does. See
-# memory `aperta-routing-cutoff-design-and-constraints` for the design
-# discussion + benchmark.
+# Dijkstra at network distance T (in weight units): destinations beyond
+# T return `inf` cost / `nan` aggregations, and the inner loop exits
+# early instead of exploring the full settled-set. The speed-up grows
+# as T shrinks relative to graph diameter (most pronounced for walk on
+# country-scale networks with short cumulative-opportunity bins, where
+# T can be 1-2 orders of magnitude below diameter).
 # ---------------------------------------------------------------------------
 
 

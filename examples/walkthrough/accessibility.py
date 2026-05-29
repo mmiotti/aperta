@@ -8,7 +8,7 @@
 #       format_name: percent
 #       format_version: '1.3'
 #   kernelspec:
-#     display_name: Python 3 (ipykernel)
+#     display_name: aperta
 #     language: python
 #     name: python3
 # ---

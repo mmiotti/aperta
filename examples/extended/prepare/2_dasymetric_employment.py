@@ -67,7 +67,7 @@
 #    we have. Simple, conservative; assumes uniform within-muni
 #    distribution (it isn't, but the bias is small at our scope).
 #
-# **Cross-border note.** All munis at the default Bern + 25 km scope are
+# **Cross-border note.** All munis at the default Bern + 40 km scope are
 # inside Switzerland, so we don't need cross-border extrapolation yet.
 # The notebook is structured to make the future extension easy: the
 # fitted per-OSM-tag coefficients are saved separately and could be
@@ -248,7 +248,7 @@ print(f"  Marginal sliver (≤1 %):"
 # ## 4. Join buildings to municipalities
 #
 # Each building is assigned to the muni containing its centroid. At the
-# default Bern + 25 km scope every building should land inside a Swiss
+# default Bern + 40 km scope every building should land inside a Swiss
 # muni; assertion enforces this and will be relaxed when the scope
 # expands across the border.
 

@@ -1,5 +1,5 @@
 """
-Aperta vs pandana benchmark on the Bern + 25 km consolidated graphs.
+Aperta vs pandana benchmark on the Bern + 40 km consolidated graphs.
 
 **Requires `examples/extended/prepare/` to have been run first** — this
 script consumes `data/prepared/{walk,car}_graph.graphml`, `cells.gpkg`,
@@ -39,7 +39,7 @@ routing backend) with `cutoff=metric_t_s` applied uniformly.
 
 Toggle `TEST_MODE = True` at the top of this file for a fast end-to-end
 smoke test on a small bbox subset (~30 s); leave `TEST_MODE = False` for
-the full Bern + 25 km run.
+the full Bern + 40 km run.
 """
 import time
 from pathlib import Path

@@ -16,7 +16,8 @@
 # %% [markdown]
 # # Multi-modal accessibility — extended example
 #
-# Default scope: Bern + 25 km. Change `LOCATION_LABEL` and the crop
+# Default scope: Bern + 40 km (10 km AOI buffer + 30 km dest buffer).
+# Change `LOCATION_LABEL` and the crop
 # constants below to retarget plots; the underlying data is whatever
 # `prepare/1_download` produced (driven by `SEED_LOCATION` there).
 #
@@ -132,8 +133,8 @@ for d in DESTINATIONS:
 
 # %%
 # Origin / destination split — origins are only cells inside the AOI
-# (seed + 5 km from `prepare/1_download`), but every cell in the dest
-# polygon (AOI + 25 km) remains a valid destination. This dramatically
+# (seed + 10 km from `prepare/1_download`), but every cell in the dest
+# polygon (AOI + 30 km) remains a valid destination. This dramatically
 # cuts routing cost: each Dijkstra is one-to-many, so the cost scales
 # with origin count, not destination count.
 aoi_polygon = gpd.read_file(PREPARED_DIR / 'aoi_polygon.gpkg').geometry.iloc[0]

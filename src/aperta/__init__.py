@@ -42,7 +42,7 @@ See `tests/test_workflow.py` for the ~150-line end-to-end toy-world
 example, `examples/minimal/accessibility.ipynb` for a ~40-line OSM
 quickstart, `examples/walkthrough/accessibility.ipynb` for the full
 guided tour, and `examples/extended/` for a multi-notebook showcase
-with published-paper calibration (Bern + 25 km).
+with published-paper calibration (Bern + 40 km).
 
 Key types:
   - `od_pairs.TieredODNodePairs` — three-tier OD dict-of-arrays keyed by network

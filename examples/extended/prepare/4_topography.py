@@ -31,7 +31,7 @@
 #
 # The aperta library function `topography.fetch_copernicus_dem` handles
 # AWS download, mosaic across 1° × 1° tiles, clip to the polygon, and
-# (optionally) reprojection to a metric CRS. For the default Bern + 25 km
+# (optionally) reprojection to a metric CRS. For the default Bern + 40 km
 # scope that's 4 tiles covering 46–48° N × 6–8° E — cached locally on
 # first run.
 
@@ -76,7 +76,7 @@ dest_polygon = gpd.read_file(PREPARED_DIR / 'dest_polygon.gpkg').geometry.iloc[0
 # %% [markdown]
 # ## 2. Download + mosaic + clip Copernicus DEM (30 m)
 #
-# Per-tile 1° × 1° GeoTIFFs from AWS Open Data. The default Bern + 25 km
+# Per-tile 1° × 1° GeoTIFFs from AWS Open Data. The default Bern + 40 km
 # scope needs 4 tiles covering 46–48° N × 6–8° E; other scopes pull
 # whatever tiles intersect the dest polygon. Tiles + the clipped mosaic
 # are cached locally — re-running is fast on subsequent runs.
