@@ -138,6 +138,7 @@ def route_utility(
     utility: Utility,
     *,
     mask: TieredODPairs | None = None,
+    cutoff: float | None = None,
     dtype: np.dtype | type = np.float32,
 ) -> TieredODPairs:
     """Compute the route-dependent components of utility for every OD pair.
@@ -163,7 +164,9 @@ def route_utility(
         weight: edge attribute name used for routing AND as the cost
             contribution to utility (multiplied by `utility.cost_coefficient`).
         utility: the `Utility` spec.
-        mask, dtype: as in `tiered_path_aggregate`.
+        mask, cutoff, dtype: as in `tiered_path_aggregate`. Beyond-cutoff
+            destinations become `np.nan` in the returned utility ODM (same
+            convention as unreachable / masked-out).
 
     Returns:
         `TieredODPairs` of route-utility values (float64 by default).
@@ -184,6 +187,7 @@ def route_utility(
             weight,
             edge_aggregations=path_aggs,
             mask=mask,
+            cutoff=cutoff,
             dtype=dtype,
         )
     else:
@@ -193,6 +197,7 @@ def route_utility(
             graph,
             weight,
             mask=mask,
+            cutoff=cutoff,
             dtype=dtype,
         )
         aggs = {}

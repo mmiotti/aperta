@@ -8,76 +8,61 @@
 #       format_name: percent
 #       format_version: '1.3'
 #   kernelspec:
-#     display_name: Python 3 (ipykernel)
+#     display_name: aperta
 #     language: python
 #     name: python3
 # ---
 
 # %% [markdown]
-# # `flow_estimate` — calibration + production estimate
+# # `flow_estimate` — per-edge AADT as a congestion proxy
 #
 # Estimates per-edge AADT for the car network via cost-decay-weighted
-# nested-betweenness sampling, calibrated against observed traffic
-# counters. Three knobs:
+# nested-betweenness sampling. The output is a rough proxy for "traffic
+# pressure" on each edge, suitable as a feature in car edge-weight
+# calibration (e.g. a BPR-style `(V/C)²` congestion multiplier feeding
+# into typical-time-of-day speeds for accessibility). It is NOT a
+# traffic assignment.
 #
-# 1. `lognorm_shape` (σ) — width of the trip-time distribution used as
+# **Two simplifications worth flagging upfront.** No stochastic
+# routing — every OD pair takes a single deterministic shortest path,
+# so flow piles up on the "winner" route and any parallel alternative
+# sees nothing. No capacity-based slowdown — a saturated motorway and
+# an empty one carry the same edge weight, so loading keeps stacking
+# on the highest-rank corridor even past capacity. The net effect is
+# over-prediction on highways / main roads and under-prediction on
+# parallel local roads. That's acceptable for a *relative* pressure
+# feature feeding edge-speed calibration; it's not acceptable for
+# road design. The library calibration loop (see
+# `aperta-lab/projects/lumos/`) fits BPR multipliers against observed
+# counters to compensate on the way to typical edge speeds.
+#
+# **Three calibration knobs**, exposed but not optimised here:
+#
+# 1. `LOGNORM_SHAPE` (σ) — width of the trip-time distribution used as
 #    the cost-decay weight in `nested_node_sample`.
-# 2. `lognorm_scale` (μ) — location of the trip-time distribution.
-# 3. `TRIPS_PER_PERSON_PER_DAY` — overall scaling of the betweenness
-#    counts to vehicles/day.
+# 2. `LOGNORM_SCALE` (μ) — location of the same distribution.
+# 3. `TRIPS_PER_PERSON_PER_DAY` — overall scaling to vehicles/day.
 #
-# Initial values come from fitting a lognormal to ground-truth
-# Google-Maps trip times + a default of 1.5 trips/person/day — a
-# reasonable prior, but not the same thing as "what weighting produces
-# flows that match traffic counters".
+# `LOGNORM_SHAPE` and `LOGNORM_SCALE` are fitted at runtime from
+# ground-truth Google-Maps trip times; `TRIPS_PER_PERSON_PER_DAY` is a
+# constant prior of 1.5. The known sampling bias (cost-weighted dest
+# draw under-normalises sparse-periphery origins, see §4) makes
+# single-parameter scans against counters unreliable, so this notebook
+# just runs once at the prior values and shows the resulting fit.
 #
-# ## Two design choices worth flagging upfront
+# ## Design choices
 #
-# **Zones, not cells, as the granular unit.** Unlike `accessibility.ipynb`
-# (which uses H3-res-10 cells, ~95k in the Bern dest polygon), flows
-# uses H3-res-8 **zones** (~5500). Two reasons:
+# **Nested cell + zone hierarchy.** Origins and short-trip destinations
+# use H3-res-10 cells (~130 m); medium- and far-tier destinations
+# aggregate to H3-res-8 zones (~460 m). Cell-level origins matter
+# because intra-zone short trips contribute disproportionately to
+# local-road flows — collapsing them to zone-only sampling
+# systematically under-counts low-volume residential edges.
 #
-# - Flow estimation is bulk-attributing — thousands of OD pairs accumulate
-#   on each road segment, so per-cell origin precision is washed out at
-#   the edge level anyway. Zone granularity (~17 cells per zone) gives
-#   enough origin resolution to differentiate density patterns without
-#   the per-cell overhead.
-# - The calibration loop reruns `simulate_flows` many times. Per-call
-#   cost scales with the number of unique sampled origins; zone-level
-#   sampling keeps each call snappy (~25 s on full Bern + 25 km).
-#
-# A single-tier OD structure (`cells_to_cells` only, with zones playing
-# the role of "cells") suffices — no middle or far tier needed since the
-# zone universe is small enough that the all-zones-within-200-km OD
-# matrix fits comfortably in memory.
-#
-# **Origins are NOT restricted to the AOI.** Unlike accessibility (where
-# AOI-restriction is fine because we only care about accessibility at
-# origins inside the AOI), flow estimation has boundary effects: trips
-# originating *outside* the AOI but passing through it contribute to
-# observed counter readings. Restricting origins to AOI would
-# systematically under-predict flows near the AOI boundary.
-#
-# ## Flow of the notebook
-#
-# 1. Load inputs (graph, zones, counters).
-# 2. Snap counters to edges (bearing-aware, per-tier eligibility).
-# 3. Build the fixed routing inputs (OD pairs, costs, lognormal prior).
-# 4. `simulate_flows` helper — one parameter set → per-edge AADT.
-# 5. Baseline evaluation at the prior values.
-# 6. 1D scan over lognormal shape, pick best.
-# 7. Derive `TRIPS_PER_PERSON_PER_DAY` from the slope.
-# 8. **Production run** — re-simulate with calibrated params + save
-#    `data/prepared/flow_estimate.csv`.
-# 9. Visualise the per-edge stress map.
-#
-# Sections 5-7 use the library helpers `snap_counters_to_edges` and
-# `evaluate_against_counters` from `aperta.calibration`; the scan
-# loop + parameter selection are project-specific and live here.
-#
-# `data/prepared/flow_estimate.csv` is consumed by
-# `calibrate_edge_weights.ipynb` as the `flow_estimate` feature for the
-# BPR-style edge-weight calibration.
+# **Origins NOT restricted to AOI.** Trips originating outside the AOI
+# but passing through it contribute to observed counter readings, so
+# restricting origins to AOI would systematically under-predict near
+# the boundary.
 
 # %%
 import warnings
@@ -96,26 +81,64 @@ from aperta import (
     routing,
     traffic_flows,
 )
+from aperta.network_processing import HIGHWAY_RANKS
 
 warnings.filterwarnings('ignore', category=FutureWarning)
 warnings.filterwarnings('ignore', category=UserWarning, module='geopandas')
 
+
+# %% [markdown]
+# ## Parameters
+#
+# Everything tunable in one place.
+
+# %%
 PREPARED_DIR = Path('data/prepared')
 GROUND_TRUTH_DIR = Path('data/ground_truth')
-CRS_METRIC = 'EPSG:2056'
+LOCATION_LABEL = 'Bern'   # for plot titles; keep in sync with prepare/1_download
 
-# Short name for plot titles + prints. Keep in sync with `LOCATION_LABEL`
-# in `prepare/1_download.py`.
-LOCATION_LABEL = 'Bern'
+# Counter-to-edge snap. Highway counters get a wider radius (sparser
+# layout, lower risk of catching a parallel local road) but can only
+# snap to highway edges. Bearing tolerance prevents opposite-direction
+# counters from cross-snapping on two-way roads.
+HIGHWAY_RADIUS_M = 25.0
+NON_HIGHWAY_RADIUS_M = 10.0
+BEARING_TOL_DEG = 20.0
+
+# Initial per-edge durations: base = length / speed_kph, with
+# multiplicative + additive corrections for density and intersection /
+# signal load. Features from `prepare/5_density`; coefficients are
+# off-peak car priors.
+INITIAL_MULT = {'density_norm': 0.25}
+INITIAL_ADD = {'is_degree_4': 3.0, 'is_traffic_signal': 7.0}
+
+# OD-tier radii (CRS metres) + travel-time cutoff.
+R_CELLS_M = 1_500
+R_MEDIUM_M = 10_000
+R_ZONES_M = 100_000
+CAR_TIME_CUTOFF_S = 1800
+
+# Inner-core polygon for counter filtering (AOI shrunk by this buffer)
+# to avoid boundary effects on the evaluation set.
+INNER_BUFFER_M = 5_000.0
+
+# Sampling. Origins drawn population-weighted (with replacement, then
+# deduped); destinations drawn per-origin via the cost-decay weight.
+N_ORIG = 50_000
+N_DEST = 10
+RNG_SEED = 42
+
+# Volume scaling — vehicles per person per day. Reasonable prior;
+# production calibration fits this against observed counters.
+TRIPS_PER_PERSON_PER_DAY = 1.5
 
 
 # %% [markdown]
 # ## 1. Load inputs
 #
-# Graph + zones (the granular unit for flow estimation — see header
-# rationale) + counters. The counters file holds directional point
-# counters with `traffic_cars`, `bearing_deg`, and per-tier flags
-# (`is_highway`, `is_main`, `is_local`).
+# Graph + cells + zones + counters. The counters file holds
+# directional point counters with `traffic_cars`, `bearing_deg`, and
+# per-tier flags (`is_highway`, `is_main`, `is_local`).
 
 # %%
 car_graph = network_processing.load_consolidated_graphml(
@@ -125,8 +148,16 @@ print(f"Car graph: {car_graph.number_of_nodes():,} nodes / "
 
 zones = gpd.read_file(PREPARED_DIR / 'zones.gpkg').set_index('zone_id')
 zones['pop_plus_emp'] = zones['population'] + zones['employment_total']
+zones = zones.rename(columns={'node_id_car': 'node_id'})
 total_pop = float(zones['population'].sum())
 print(f"Zones: {len(zones):,} (Σ pop {total_pop:,.0f})")
+
+cells = gpd.read_file(PREPARED_DIR / 'cells.gpkg').set_index('cell_id')
+cells['pop_plus_emp'] = cells['population'] + cells['employment_total']
+# Drop POI-only cells (no orig weight + no dest weight = pure routing cost).
+cells = cells[cells['pop_plus_emp'] > 0].copy()
+cells = cells.rename(columns={'node_id_car': 'node_id'})
+print(f"Cells: {len(cells):,} (after dropping pop+emp=0)")
 
 counters_all = gpd.read_file(GROUND_TRUTH_DIR / 'traffic_counters.gpkg')
 print(f"Counters: {len(counters_all):,} "
@@ -134,66 +165,51 @@ print(f"Counters: {len(counters_all):,} "
       f"main: {int(counters_all['is_main'].sum()):,}, "
       f"local: {int(counters_all['is_local'].sum()):,})")
 
-# Filter to counters inside the "core" area: dest_polygon shrunk by a
-# buffer. The dest_polygon defines the analysis area, but counters near
-# its edge see a lot of traffic going to / coming from places outside
-# the model area (which the simulation can't account for, since trips
-# with one endpoint outside aren't generated). Inner-core counters
-# avoid that edge-effect bias — fit quality on this subset is ~10
-# percentage points of R² better, and highway slope is near 1 even at
-# trips=1.5 (the model is essentially correctly-scaled in the core).
+# Restrict the evaluation set to counters in the AOI core (AOI shrunk
+# by INNER_BUFFER_M): counters near the edge see traffic going to /
+# from places outside the model area that the simulation can't
+# generate. Inner-core counters avoid that edge-effect bias.
 dest_polygon = gpd.read_file(PREPARED_DIR / 'dest_polygon.gpkg').geometry.iloc[0]
-INNER_BUFFER_M = 5000.0
 inner_polygon = dest_polygon.buffer(-INNER_BUFFER_M)
 in_inner = counters_all.geometry.within(inner_polygon)
 counters = counters_all[in_inner].copy()
 print(f"  inside core (dest_polygon − {INNER_BUFFER_M / 1000:.0f} km): "
-      f"{len(counters):,} — used for calibration below")
+      f"{len(counters):,} — used for evaluation below")
 
-legs = pd.read_csv(GROUND_TRUTH_DIR / 'car_pessimistic.csv')
+legs = pd.read_csv(GROUND_TRUTH_DIR / 'travel_times_car_peak.csv')
 
 
 # %% [markdown]
 # ## 2. Snap counters to the car-graph edges
 #
-# Highway counters get a wider search radius (sparser layout, lower
-# risk of catching a parallel local road) but can only snap to highway
-# edges. Same for main / local. Bearing tolerance keeps the two
-# opposite-direction counters on a two-way road from cross-snapping
-# to the wrong directional edge.
+# Per-counter eligibility restricts the search to edges of the matching
+# road tier so a highway counter can't snap to a parallel residential
+# road. Each matched counter is tagged with the OSM `highway_rank`
+# (-1 = service/unclassified … 7 = motorway) — useful downstream for
+# filtering e.g. `counters['highway_rank'] >= 3`.
 
 # %%
-HIGHWAY_RADIUS_M = 120.0
-NON_HIGHWAY_RADIUS_M = 50.0
-BEARING_TOL_DEG = 20.0
-
-from aperta.network_processing import HIGHWAY_RANKS
-
-# Per-edge tier flags. `_tier` returns the canonical bucket the counter
-# expects to match against.
-def _edge_tier(d) -> str:
+def _edge_rank_and_tier(d) -> tuple[int, str]:
+    """Return (OSM rank, tier bucket) for an edge attribute dict."""
     hwy = d.get('highway')
     if isinstance(hwy, list):
         hwy = hwy[0] if hwy else None
     rank = HIGHWAY_RANKS.get(hwy, -1)
-    if rank >= 6: return 'highway'    # motorway / trunk
-    if rank >= 3: return 'main'       # primary / secondary / tertiary
-    return 'local'                    # residential / service / unknown
+    if rank >= 6: tier = 'highway'    # motorway / trunk
+    elif rank >= 3: tier = 'main'     # primary / secondary / tertiary
+    else: tier = 'local'              # residential / service / unknown
+    return rank, tier
 
 for _, _, _, d in car_graph.edges(keys=True, data=True):
-    d['_tier'] = _edge_tier(d)
+    d['_highway_rank'], d['_tier'] = _edge_rank_and_tier(d)
 
-# Per-counter search radius (highway counters → wider).
 search_radius = counters['is_highway'].map(
     {1: HIGHWAY_RADIUS_M, 0: NON_HIGHWAY_RADIUS_M})
 
 def _eligible_for_counter(counter_row, candidate_edges):
-    if counter_row['is_highway']:
-        wanted = 'highway'
-    elif counter_row['is_main']:
-        wanted = 'main'
-    else:
-        wanted = 'local'
+    if counter_row['is_highway']:    wanted = 'highway'
+    elif counter_row['is_main']:     wanted = 'main'
+    else:                            wanted = 'local'
     return candidate_edges[candidate_edges['_tier'] == wanted]
 
 snapped = calibration.snap_counters_to_edges(
@@ -203,6 +219,10 @@ snapped = calibration.snap_counters_to_edges(
     eligible_edges=_eligible_for_counter,
 )
 counters = counters.join(snapped)
+counters['highway_rank'] = [
+    car_graph[u][v][k]['_highway_rank'] if pd.notna(u) else np.nan
+    for u, v, k in zip(counters['u'], counters['v'], counters['k'])
+]
 n_matched = counters['u'].notna().sum()
 print(f"Snapped: {n_matched:,} of {len(counters):,} counters "
       f"({n_matched / len(counters) * 100:.1f}%)")
@@ -214,229 +234,95 @@ for tier_col, label in [('is_highway', 'highway'), ('is_main', 'main'),
     if n_tot:
         print(f"  {label:8s}: {n_ma:,} of {n_tot:,} "
               f"({n_ma / n_tot * 100:.1f}%)")
+_rank_counts = (counters.loc[counters['u'].notna(), 'highway_rank']
+                .astype(int).value_counts().sort_index())
+print(f"  matched edges by OSM highway rank: {_rank_counts.to_dict()}")
 
 
 # %% [markdown]
-# ## 3. Build the (fixed) routing inputs
+# ## 3. Build the routing inputs
 #
-# Everything that *doesn't* depend on calibrated parameters goes here.
-# The expensive routing happens once and gets reused across all
-# simulation runs.
+# Per-edge initial durations, OD pairs across the three tiers, costs
+# along each pair, sampling weights, and the cost-decay prior fitted
+# from ground-truth trip times.
 
 # %%
-# Initial per-edge durations — features from prep: `speed_kph` (1_download),
-# `density_norm`, `is_degree_4`, `is_traffic_signal` (5_density).
+# Per-edge initial durations.
 KMH_TO_MS = 1.0 / 3.6
-INITIAL_MULT = {'density_norm': -0.45}
-INITIAL_ADD = {'is_degree_4': 2.6, 'is_traffic_signal': 4.4}
 for u, v, k, d in car_graph.edges(keys=True, data=True):
     base = float(d['length']) / (float(d['speed_kph']) * KMH_TO_MS)
     mult_term = base * sum(c * float(d[f]) for f, c in INITIAL_MULT.items())
     add_term = sum(c * float(d[f]) for f, c in INITIAL_ADD.items())
     d['duration_initial'] = max(base + mult_term + add_term, base * 0.2)
 
-# Snap zone centroids to the car graph (zones play the role of "cells"
-# in the OD structure below — see header rationale).
-zone_centroids = zones.copy()
-zone_centroids['geometry'] = zones.geometry.centroid
-nid, _ = network_processing.snap_to_network_nodes(zone_centroids, car_graph)
-zones['node_id'] = nid
-
-# Single-tier OD pairs: `get_pairs` with no `zones=` kwarg returns a
-# TieredODNodePairs with only the `cells_to_cells` slot populated. With
-# r_cells=200 km the all-zones-within-200-km matrix is ~5500² entries,
-# which fits comfortably at FP32 (~120 MB).
-R_ZONE_PAIR_M = 200_000.0
-CAR_TIME_CUTOFF_S = 2 * 3600  # 2-hour ceiling on any single trip
-
+# Tiered OD pairs + per-pair routing costs.
+cells['_dest_weight'] = cells['employment_total']
+zones['_dest_weight'] = zones['employment_total']
 pairs = od_pairs.get_pairs(
-    zones, r_cells=R_ZONE_PAIR_M, node_column='node_id',
+    cells, r_cells=R_CELLS_M, node_column='node_id',
+    zones=zones, r_zones=R_ZONES_M, r_medium=R_MEDIUM_M,
 )
 costs = routing.tiered_path_costs(
     pairs, car_graph, weight='duration_initial', cutoff=CAR_TIME_CUTOFF_S,
 )
-
-zones['_dest_weight'] = zones['employment_total']
 orig_weights = od_pairs.node_values(
-    'pop_plus_emp', zones, 'node_id',
+    'pop_plus_emp', cells, 'node_id',
     list(pairs.cells_to_cells.keys()))
 dest_weights = od_pairs.dest_values(
-    '_dest_weight', pairs, zones, 'node_id')
+    '_dest_weight', pairs, cells, 'node_id', zones=zones)
+cell_to_zone_node = od_pairs.build_cell_to_zone_node_map(
+    cells, zones, node_column='node_id')
 
-# `nested_node_sample` calls `cell_to_zone_node.get(origin)` to look up
-# the parent zone for the (absent) zone-tier and middle-tier. With a
-# single-tier OD structure the lookup just returns None and the function
-# skips the zone-tier code path entirely.
-cell_to_zone_node = {}
-
-# Initial lognormal prior fit from ground-truth times.
+# Lognormal cost-decay prior, fitted from ground-truth trip times.
 _pos_times = legs.loc[legs['time_measured'] > 0, 'time_measured']
-shape0, _, scale0 = scipy.stats.lognorm.fit(_pos_times, floc=0)
-print(f"Initial lognormal (from ground-truth times): "
-      f"shape={shape0:.3f}, scale={scale0:.1f}")
+LOGNORM_SHAPE, LOGNORM_LOC, LOGNORM_SCALE = scipy.stats.lognorm.fit(
+    _pos_times, loc=0)
+print(f"Lognormal prior (fitted from ground-truth times): "
+      f"shape={LOGNORM_SHAPE:.3f}, loc={LOGNORM_LOC:.3f}, "
+      f"scale={LOGNORM_SCALE:.1f}")
 
 
 # %% [markdown]
-# ## 4. `simulate_flows` — one parameter set → per-edge AADT
+# ## 4. Run the flow estimation
 #
-# The expensive bit. Re-runs the betweenness pipeline for one
-# `(shape, scale, trips_per_person_per_day)` triple. ~tens of seconds
-# per call on this graph.
+# Sample population-weighted origins; for each origin sample
+# destinations weighted by `dest_weight × cost_to_weight(travel_time)`;
+# accumulate shortest-path betweenness; scale counts to AADT.
+#
+# **AADT scaling.** `nested_node_sample` dedupes the with-replacement
+# origin draw, so the actual sample count is
+# `len(nested_sample) · N_DEST` (not the nominal `N_ORIG · N_DEST`).
+# Scaling by the actual count keeps results invariant to the
+# `N_ORIG / N_DEST` split.
+#
+# **Known sampling bias (deferred fix).** Cost-weighted destination
+# sampling under-normalises sparse-periphery origins — each of their
+# samples ends up carrying relatively more weight, which can inflate
+# flows on through-corridors as the analysis area grows. A per-origin
+# reweighting (under consideration in the library) would handle this
+# at source. Because the bias trades off against the routing knobs in
+# unpredictable ways, this notebook deliberately does NOT try to scan
+# `(LOGNORM_SHAPE, LOGNORM_SCALE, TRIPS_PER_PERSON_PER_DAY)` against
+# counters; the production calibration in
+# `aperta-lab/projects/lumos/` does this once the bias is corrected.
 
 # %%
-N_ORIG, N_DEST = 500, 250
-RNG_SEED = 42
+def cost_to_weight(c):
+    return scipy.stats.lognorm.pdf(c, LOGNORM_SHAPE, -10, LOGNORM_SCALE)
 
-def simulate_flows(shape: float, scale: float,
-                   trips_per_person_per_day: float = 1.5,
-                   n_orig: int = N_ORIG, n_dest: int = N_DEST,
-                   seed: int = RNG_SEED) -> pd.Series:
-    """Run the full flows estimation for one parameter set."""
-    def _cost_to_weight(c):
-        return scipy.stats.lognorm.pdf(c, shape, 0.0, scale)
-    rng = np.random.RandomState(seed)
-    nested_sample = traffic_flows.nested_node_sample(
-        pairs=pairs, weights=dest_weights, costs=costs,
-        cell_to_zone_node=cell_to_zone_node, orig_weights=orig_weights,
-        cost_to_weight=_cost_to_weight, n_orig=n_orig, n_dest=n_dest,
-        random_state=rng,
-    )
-    edge_bc = network_processing.get_nested_edge_betweenness(
-        car_graph, nested_sample, weights='duration_initial',
-        cutoff=od_pairs.max_cost(costs),  # correctness-preserving Dijkstra cap
-    )
-    aadt_scale = (total_pop * trips_per_person_per_day) / (n_orig * n_dest)
-    return edge_bc * aadt_scale
-
-
-# %% [markdown]
-# ## 5. Baseline evaluation at the prior values
-#
-# Run once with the lognormal-from-times prior + the default
-# `trips_per_person_per_day = 1.5`. Sets the bar for the scans below.
-
-# %%
-TRIPS_PER_PERSON_PER_DAY_INIT = 1.5
-
-flows_init = simulate_flows(shape0, scale0, TRIPS_PER_PERSON_PER_DAY_INIT)
-eval_init = calibration.evaluate_against_counters(flows_init, counters)
-eval_hw   = calibration.evaluate_against_counters(
-    flows_init, counters[counters['is_highway'] == 1])
-print(f"Baseline (shape={shape0:.3f}, scale={scale0:.1f}, "
-      f"trips={TRIPS_PER_PERSON_PER_DAY_INIT}):")
-print(f"  All inner counters:  R²={eval_init['r2']:.4f}, "
-      f"slope={eval_init['slope']:.3f}, "
-      f"RMSE={eval_init['rmse']:.0f}, n={eval_init['n_matched']:,}")
-print(f"  Highway only:        R²={eval_hw['r2']:.4f}, "
-      f"slope={eval_hw['slope']:.3f}, "
-      f"RMSE={eval_hw['rmse']:.0f}, n={eval_hw['n_matched']:,}")
-
-# Modeled-vs-observed scatter on log axes (counters span 0–100k AADT
-# so a linear plot collapses everything below 5k against the axis).
-# Highway counters coloured separately to show whether the high-AADT
-# regime fits as well as the bulk.
-m = eval_init['merged']
-# Join `is_highway` flag back via the shared index (preserved by
-# `evaluate_against_counters`'s dropna).
-m = m.join(counters['is_highway'], how='left')
-is_hw_mask = m['is_highway'] == 1
-
-fig, ax = plt.subplots(figsize=(7, 7))
-ax.scatter(m.loc[~is_hw_mask, 'observed'], m.loc[~is_hw_mask, 'modeled'],
-           s=8, alpha=0.3, color='tab:blue', label='main + local')
-ax.scatter(m.loc[is_hw_mask, 'observed'], m.loc[is_hw_mask, 'modeled'],
-           s=14, alpha=0.6, color='tab:red', label='highway')
-lim = float(max(m['observed'].max(), m['modeled'].max())) * 1.1
-ax.plot([1, lim], [1, lim], color='black', linewidth=0.5, label='1:1')
-ax.set_xscale('log'); ax.set_yscale('log')
-ax.set_xlim(50, lim); ax.set_ylim(50, lim)
-ax.set_xlabel('Observed AADT (counter, veh/day)')
-ax.set_ylabel('Modeled AADT (flows, veh/day)')
-ax.set_title(f'Baseline fit — all: R²={eval_init["r2"]:.3f}, '
-             f'slope={eval_init["slope"]:.2f}   |   '
-             f'highway: R²={eval_hw["r2"]:.3f}, '
-             f'slope={eval_hw["slope"]:.2f}')
-ax.set_aspect('equal'); ax.legend()
-plt.tight_layout(); plt.show()
-
-
-# %% [markdown]
-# ## 6. Scan the lognormal **shape** (σ) — calibration in one parameter
-#
-# Holds `scale` fixed at the prior; sweeps `shape` over a small grid
-# centred on the prior value. Picks the value that maximises R²
-# against the counters.
-#
-# **This is the simplest possible calibration**: one parameter, one
-# metric (R²), one pass. Production calibration (see
-# `aperta-lab/projects/lumos/`) does coordinate-descent over multiple
-# parameters with a scale-invariant combined loss, an inner-vs-outer
-# counter filter, and a min-RMSE vs slope=1 trade-off for the final
-# scaling. The library's `calibration.evaluate_against_counters`
-# returns all the building blocks if you want to wire something
-# fancier — `scale` and `trips_per_person_per_day` can be scanned the
-# same way as `shape`.
-
-# %%
-shape_grid = np.linspace(0.6 * shape0, 1.4 * shape0, 5)
-shape_results = []
-for s in shape_grid:
-    flows = simulate_flows(s, scale0, TRIPS_PER_PERSON_PER_DAY_INIT)
-    ev = calibration.evaluate_against_counters(flows, counters)
-    shape_results.append({'shape': s, 'r2': ev['r2'], 'slope': ev['slope']})
-    print(f"  shape={s:.3f}: R²={ev['r2']:.4f}, slope={ev['slope']:.3f}")
-shape_df = pd.DataFrame(shape_results)
-
-best_idx = shape_df['r2'].idxmax()
-shape_best = float(shape_df.loc[best_idx, 'shape'])
-scale_best = scale0  # scale unscanned in this showcase
-print(f"\nBest shape (by R²): {shape_best:.3f} "
-      f"(R²={shape_df.loc[best_idx, 'r2']:.4f}, "
-      f"slope={shape_df.loc[best_idx, 'slope']:.3f})")
-
-fig, ax = plt.subplots(figsize=(8, 5))
-ax.plot(shape_df['shape'], shape_df['r2'], 'o-', color='tab:blue')
-ax.axvline(shape0, color='gray', linestyle='--', label=f'prior ({shape0:.3f})')
-ax.axvline(shape_best, color='tab:red', label=f'best ({shape_best:.3f})')
-ax.set_xlabel('lognormal shape (σ)'); ax.set_ylabel('R² vs counters')
-ax.set_title('1D shape scan'); ax.legend()
-plt.tight_layout(); plt.show()
-
-
-# %% [markdown]
-# ## 7. Derive `trips_per_person_per_day` from the regression slope
-#
-# The shape scan picked by R² alone (scale-invariant), so the
-# absolute-volume knob remains. Set `trips_per_person_per_day` to
-# remove the systematic over/under-prediction:
-#
-# ```
-# trips_new = trips_old × (1 / slope)
-# ```
-#
-# This makes the no-intercept regression slope = 1 — modeled volumes
-# match observed counters on average (weighted by observed magnitude).
-# A more careful production analysis would compare this against a
-# min-RMSE scaling and pick deliberately — see lumos.
-
-# %%
-flows_at_best = simulate_flows(shape_best, scale_best, TRIPS_PER_PERSON_PER_DAY_INIT)
-eval_at_best = calibration.evaluate_against_counters(flows_at_best, counters)
-trips_final = TRIPS_PER_PERSON_PER_DAY_INIT / eval_at_best['slope']
-print(f"Slope at trips={TRIPS_PER_PERSON_PER_DAY_INIT} is {eval_at_best['slope']:.3f} "
-      f"→ trips_per_person_per_day = {trips_final:.3f}")
-
-
-# %% [markdown]
-# ## 8. Production run + save `flow_estimate.csv`
-#
-# Re-runs `simulate_flows` with the calibrated `(shape, trips)` to
-# produce the final per-edge AADT. Attaches as `flow_estimate` edge
-# attribute (for the map below) and writes `data/prepared/flow_estimate.csv`
-# for downstream consumers.
-
-# %%
-flows = simulate_flows(shape_best, scale_best, trips_final)
+rng = np.random.RandomState(RNG_SEED)
+nested_sample = traffic_flows.nested_node_sample(
+    pairs=pairs, weights=dest_weights, costs=costs,
+    cell_to_zone_node=cell_to_zone_node, orig_weights=orig_weights,
+    cost_to_weight=cost_to_weight, n_orig=N_ORIG, n_dest=N_DEST,
+    random_state=rng,
+)
+edge_bc = network_processing.get_nested_edge_betweenness(
+    car_graph, nested_sample, weight='duration_initial',
+    cutoff=od_pairs.max_cost(costs),  # correctness-preserving Dijkstra cap
+)
+aadt_scale = (total_pop * TRIPS_PER_PERSON_PER_DAY) / (len(nested_sample) * N_DEST)
+flows = edge_bc * aadt_scale
 network_processing.set_nx_edge_attributes_filled(
     car_graph, flows.to_dict(), 'flow_estimate', fill_value=0.0)
 print(f"flows (veh/day): "
@@ -455,63 +341,88 @@ print(f"Saved {len(flows_df):,} rows to {OUTPUT_PATH}")
 
 
 # %% [markdown]
-# ## 9. Visualise — raw flows on the network
+# ## 5. Diagnostics
 #
-# Per-edge `flow_estimate` as a colour map, cropped to 90 % of the
-# destination polygon bounding box. Motorways drawn on top (sorted by
-# `HIGHWAY_RANKS`) so they stay visible at junctions; colour scale
-# clips at P99.
-#
-# A more sophisticated visualisation is *capacity-normalised stress* —
-# `(V/C)^β` with `β` typically 2 or 4 (BPR convention). Divides
-# flows by `capacity_per_lane[highway] · lanes_per_direction`
-# (the per-direction lanes attribute is set by
-# `consolidate_intersections`), then raises to `β`. Useful for spotting
-# bottlenecks regardless of road class — a 4-lane motorway at 50k AADT
-# has more spare capacity than a 2-lane primary at 20k. See
-# `aperta-lab/projects/lumos/` for the production version.
+# Scatter of modeled vs observed AADT at matched counters (the fit
+# this rough proxy achieves at the prior parameters), and a per-edge
+# flow map for visual sanity-checking. The over-/under-prediction
+# pattern flagged in the header is visible on both: highway points
+# typically sit above the 1:1 line, local-road points below.
+
+# %%
+ev = calibration.evaluate_against_counters(flows, counters)
+print(f"Fit at counters: R²={ev['r2']:.3f}, slope={ev['slope']:.3f}, "
+      f"RMSE={ev['rmse']:.0f}, n={ev['n_matched']:,}")
+
+m = ev['merged']
+fig, ax = plt.subplots(figsize=(7, 7))
+ax.scatter(m['observed'], m['modeled'], s=10, alpha=0.4, color='tab:blue')
+lim = float(max(m['observed'].max(), m['modeled'].max())) * 1.1
+ax.plot([1, lim], [1, lim], color='black', linewidth=0.5, label='1:1')
+ax.set_xscale('log'); ax.set_yscale('log')
+ax.set_xlim(50, lim); ax.set_ylim(50, lim)
+ax.set_xlabel('Observed AADT (counter, veh/day)')
+ax.set_ylabel('Modeled AADT (flows, veh/day)')
+ax.set_title(f'Modeled vs observed — R²={ev["r2"]:.3f}, '
+             f'slope={ev["slope"]:.2f}, RMSE={ev["rmse"]:.0f}')
+ax.set_aspect('equal'); ax.legend()
+plt.tight_layout(); plt.show()
+
 
 # %%
 import _figures as figures   # noqa: E402  — project-local plot helpers
 
 stress_arr = np.array([float(d.get('flow_estimate', 0.0))
                        for _, _, d in car_graph.edges(data=True)])
-xlim, ylim = figures.crop_to_polygon(dest_polygon)
+
+# Crop to the inner (calibration) polygon + a small pad so per-edge
+# values stay legible.
+_minx, _miny, _maxx, _maxy = inner_polygon.bounds
+_pad_x, _pad_y = 0.10 * (_maxx - _minx), 0.10 * (_maxy - _miny)
+xlim = (_minx - _pad_x, _maxx + _pad_x)
+ylim = (_miny - _pad_y, _maxy + _pad_y)
+
+FLOW_VMAX = 30_000   # AADT cap for the colour scale
 
 fig, ax = plt.subplots(figsize=(12, 11))
 figures.plot_network_map(
     ax, car_graph, flows,
-    cbar_label='flows (veh/day, clipped at P99)',
-    title=(f'flows — {LOCATION_LABEL} + 25 km '
+    cbar_label=f'flows (veh/day, clipped at {FLOW_VMAX:,})',
+    title=(f'flows — {LOCATION_LABEL} area '
            f'(median {np.median(stress_arr):.0f}, '
            f'P99 {np.quantile(stress_arr, 0.99):.0f}, '
            f'max {stress_arr.max():.0f} veh/day)'),
     xlim=xlim, ylim=ylim,
+    vmax=FLOW_VMAX,
 )
+ax.plot(*inner_polygon.exterior.xy,
+        color='black', linewidth=1.0, linestyle='--',
+        label='inner polygon (calibration region)', zorder=5)
+ax.scatter(counters_all.geometry.x, counters_all.geometry.y,
+           s=18, facecolor='white', edgecolor='black', linewidth=0.6,
+           label=f'counters (n={len(counters_all):,})', zorder=6)
+_legend = ax.legend(loc='upper right', framealpha=0.9, fontsize=9)
+_legend.set_zorder(20)   # above the counter dots
 plt.tight_layout(); plt.show()
 
 
 # %% [markdown]
 # ## What this notebook does NOT do
 #
-# This is a self-contained showcase of *one* library capability —
-# estimating per-edge traffic flows via cost-decay-weighted nested
-# betweenness, then calibrating against observed counters. It
-# deliberately omits things production code would do:
+# Beyond the no-stochastic-routing / no-capacity simplifications
+# flagged in the header:
 #
-# - **Output isn't consumed by `accessibility.ipynb`.** That notebook
-#   ships with published-paper edge weights instead of using estimated
-#   flows. Each showcase notebook stands alone — they aren't wired into
-#   a pipeline. Production *does* wire flows into edge-weight
-#   calibration as a `(V/C)^β` BPR-style feature.
-# - **Calibration is one parameter, one metric.** A real fit would
-#   coordinate-descent over `shape`, `scale`, `trips_per_person_per_day`
-#   with a combined scale-invariant loss + inner-vs-outer counter
-#   filter, and pick the trips scaling deliberately (min-RMSE vs
-#   slope=1 trade-off). Here we scan just `shape` and pick by R².
-# - **No long-tail diagnostics.** Capacity-normalised `(V/C)²` maps
-#   and per-edge outlier tables are useful for QA but are a deep dive.
-#
-# For an example of all the above wired into a production stack
-# (scaffolding scenarios, typed I/O, dependency tracking), see
-# [`aperta-lab/src/projects/lumos/`](https://github.com/mmiotti/aperta-lab/tree/main/src/projects/lumos).
+# - **No automated calibration against counters.** The three knobs
+#   (`LOGNORM_SHAPE`, `LOGNORM_SCALE`, `TRIPS_PER_PERSON_PER_DAY`)
+#   come from priors. Production coordinate-descents these (with a
+#   slope-vs-RMSE trade-off and an inner-vs-outer counter filter)
+#   once the sampling bias is fixed.
+# - **Output isn't consumed by `accessibility.ipynb`.** Each showcase
+#   notebook stands alone. Production *does* feed `flow_estimate` into
+#   edge-weight calibration as a `(V/C)²` BPR-style multiplicative
+#   feature — that's the link from this notebook's output to typical
+#   edge speeds.
+# - **No capacity-normalised stress map.** Dividing flows by
+#   `lanes × per-lane capacity` and raising to `β` (≈ 2 or 4, BPR
+#   convention) highlights bottlenecks regardless of road class, but
+#   is a deep dive. See `aperta-lab/projects/lumos/`.

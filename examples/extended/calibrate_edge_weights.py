@@ -8,7 +8,7 @@
 #       format_name: percent
 #       format_version: '1.3'
 #   kernelspec:
-#     display_name: Python 3 (ipykernel)
+#     display_name: aperta
 #     language: python
 #     name: python3
 # ---
@@ -62,7 +62,7 @@ warnings.filterwarnings('ignore', category=FutureWarning)
 warnings.filterwarnings('ignore', category=UserWarning, module='geopandas')
 
 PREPARED_DIR = Path('data/prepared')
-GROUND_TRUTH_PATH = Path('data/ground_truth/car_pessimistic.csv')
+GROUND_TRUTH_PATH = Path('data/ground_truth/travel_times_car_peak.csv')
 CRS_METRIC = 'EPSG:2056'
 
 
@@ -95,9 +95,9 @@ print(f"Ground-truth legs: {len(legs):,} "
 # - `density_norm`, `is_degree_4`, `is_traffic_signal` per edge (from
 #   `prepare/5_density`)
 #
-# The calibration library function casts these from string-loaded
-# graphml values internally, so no manual cast is needed here. Just a
-# diagnostic.
+# These attrs are cast back to floats on graphml load via
+# `network_processing.CONSOLIDATED_EDGE_DTYPES`, which
+# `load_consolidated_graphml` applies. Just a diagnostic.
 
 # %%
 speeds = np.array([float(d['speed_kph'])
@@ -128,7 +128,9 @@ print(f"Baseline car edge speeds: median {np.median(speeds):.0f} km/h, "
 result = calibration.calibrate_edge_weights(
     car_graph, legs,
     baseline_speed_attr='speed_kph',
-    multiplier_features={},
+    multiplier_features={
+        'density_norm':      0.2,    # Higher density = lower speeds
+    },
     additive_route_features={
         # is_degree_3 dropped — multicollinear with density.
         'is_degree_4':       2.6,    # secs per 4-way intersection

@@ -387,12 +387,25 @@ CONSOLIDATED_NODE_DTYPES: dict[str, Callable] = {
     "is_roundabout": _int_via_float,
 }
 
-# Per-edge attribute dtypes that `consolidate_intersections` writes that
-# aren't covered by OSMnx's `default_edge_dtypes`. Without this,
-# `lanes_per_direction` round-trips as a string and arithmetic breaks
-# downstream.
+# Per-edge attribute dtypes used downstream by aperta but not covered by
+# OSMnx's `default_edge_dtypes`. Without these, the attrs round-trip as
+# strings and arithmetic breaks downstream.
+#
+# Sources:
+#   - `lanes_per_direction`: written by `consolidate_intersections`.
+#   - `density_norm`, `is_degree_3`, `is_degree_4`, `is_traffic_signal`:
+#     endpoint-mean of the per-node values, written by per-project density
+#     prep steps (see `examples/extended/prepare/5_density.py`). Values
+#     live in {0, 0.5, 1} on edges (mean of {0, 1} node flags), so `float`
+#     casts cleanly. Listed here so per-edge-feature aggregation (e.g.
+#     `calibration.calibrate_edge_weights`) doesn't choke on string-typed
+#     numerics post-reload.
 CONSOLIDATED_EDGE_DTYPES: dict[str, Callable] = {
     "lanes_per_direction": float,
+    "density_norm": float,
+    "is_degree_3": float,
+    "is_degree_4": float,
+    "is_traffic_signal": float,
 }
 
 

@@ -51,6 +51,7 @@ docs/_build/
 
 # Project-specific
 data/
+**/data/
 # HTTP response caches from prep notebooks (OSMnx Overpass, etc.). Can be
 # multi-GB. Re-fetched on demand by the prep notebooks.
 cache/

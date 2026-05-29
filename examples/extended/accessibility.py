@@ -72,6 +72,7 @@ from aperta import (
     od_pairs,
     overhead,
     routing,
+    utility,
     visualization as viz,
 )
 
@@ -529,7 +530,7 @@ import _figures as figures   # noqa: E402  — project-local plot helpers
 ORIG_CELLS = cells.loc[ORIG_MASK]
 
 fig, axes = plt.subplots(3, 3, figsize=(18, 18))
-for row, (label, _, _, _, _) in enumerate(ROUTING_PLAN):
+for row, (label, _, _, _, _, _) in enumerate(ROUTING_PLAN):
     for col, d in enumerate(DESTINATIONS):
         figures.plot_cell_map_cropped(
             axes[row, col], ORIG_CELLS, ACC[(label, d)].loc[ORIG_MASK],
@@ -540,45 +541,289 @@ plt.show()
 
 
 # %% [markdown]
-# ## 10. Cross-modal logsum
+# ## 10. Per-mode utility specification
 #
-# Combine walk + regular-bike + car off-peak into a single combined
-# cost ODM via the discrete-choice logsum, then run gravity on top.
-# The result is "how reachable is each destination if the agent picks
-# the best available mode" — without committing to a single mode for
-# the entire trip-set.
+# Section 8's gravity accessibility weights destinations purely by trip
+# time. That ignores everything we know about *why* trips happen — that
+# the same trip time feels different on a quiet residential street vs a
+# busy arterial, that long trips are increasingly painful per added
+# minute, and that different modes have different inherent attractions
+# (the alternative-specific constants).
 #
-# This is the multi-modal half of the multi-scale × multi-modal
-# combination that the toolkit paper makes the central claim about.
+# A discrete-choice utility spec captures these per-mode (here `m`):
+#
+# ```
+# U_ijm = β_asc
+#       + β_time      · t_ijm / 60                       (linear time, in min)
+#       + β_time_log  · ln(t_ijm / 60)                   (diminishing marginal cost)
+#       + β_density   · mean(density_norm)  along route  (per-edge density)
+#       + β_bike_score· mean(bike_score)    along route  (per-edge quietness)
+# ```
+#
+# `bike_score` is a per-edge quietness score from 1 (busy primary) to 5
+# (cycleway / pedestrian / quiet path), computed inline below from
+# `highway` and `cycleway*` tags. High score is good for cycling *and*
+# walking — quieter routes are pleasanter on foot too — but neutral for
+# cars. `density_norm` is the same square-root per-edge density we
+# routed on in §2.
+#
+# **Coefficients** — approximations informed by an ongoing project;
+# placeholders pending a public reference:
+#
+# | Coefficient    |    Walk | Bike (regular) | Car (off-peak) |
+# |----------------|--------:|---------------:|---------------:|
+# | `β_asc`        |    0    |     −4         |    −6.1        |
+# | `β_time` (/min)|   −0.01 |     −0.02      |    −0.07       |
+# | `β_time_log`   |   −3.3  |     −2.3       |    −0.9        |
+# | `β_density`    |    0    |     −0.25      |    −0.6        |
+# | `β_bike_score` |    0.4  |      1.1       |     0          |
+#
+# Original table in `coefficients/utility_coefficients.csv` — also
+# carries transit and elevation-std columns this tutorial skips.
 
 # %%
-LOGSUM_SCALE = 60.0  # nest scale (θ); 60 s ≈ "1 minute = 1 utility unit"
-logsum_pairs, logsum_costs = od_pairs.aggregate_across_modes(
-    {
-        'walk':         (GEO_PAIRS['walk'],         GEO_COSTS_WITH_OVERHEAD['walk']),
-        'bike_regular': (GEO_PAIRS['bike_regular'], GEO_COSTS_WITH_OVERHEAD['bike_regular']),
-        'car_offpeak':  (GEO_PAIRS['car_offpeak'],  GEO_COSTS_WITH_OVERHEAD['car_offpeak']),
-    },
-    aggregator='logsum', scale=LOGSUM_SCALE,
+# Per-edge quietness score. 1 = motorway / busy primary; 5 = cycleway,
+# footway, pedestrian path, or any edge with a dedicated bike track.
+# Reads only OSM `highway` / `cycleway*` / `bicycle` tags so it works
+# unchanged on all three networks.
+def edge_bike_score(u, v, data) -> float:
+    h = data.get('highway')
+    if isinstance(h, list):
+        h = h[0] if h else None
+    if h in ('cycleway', 'footway', 'pedestrian', 'path', 'living_street') \
+            or data.get('bicycle') == 'designated':
+        return 5.0
+    rank = network_processing.HIGHWAY_RANKS.get(h, -1)
+    if rank < 0:
+        return 4.0   # service / track / unclassified — mid-good default
+    # Higher OSM rank = busier road = worse.
+    base = max(1, min(5, 6 - rank))
+    cw = (data.get('cycleway') or data.get('cycleway:left')
+          or data.get('cycleway:right'))
+    if isinstance(cw, list):
+        cw = cw[0] if cw else None
+    if cw in ('track', 'opposite_track'):
+        bonus = 2
+    elif cw:
+        bonus = 1
+    else:
+        bonus = 0
+    return float(min(5, base + bonus))
+
+
+# Time coefficients are per minute, but edge times (`*_time_s`) are in
+# seconds — convert here so the rest of the pipeline reads naturally.
+# Both linear and log time enter as route features (no `cost_coefficient`
+# shortcut), so the per-minute unit is explicit in both aggregators.
+def time_minutes(arr: np.ndarray) -> float:
+    """Sum of per-edge times in minutes."""
+    return float(arr.sum() / 60.0) if arr.size else 0.0
+
+def time_log_minutes(arr: np.ndarray) -> float:
+    """log of total path time in minutes. 0 for empty / zero paths so
+    intrazonal self-pairs don't blow up to log(0) = -inf."""
+    if arr.size == 0:
+        return 0.0
+    s = float(arr.sum())
+    return float(np.log(s / 60.0)) if s > 0 else 0.0
+
+
+UTILITY_COEF = {
+    # mode          asc    time(/min) time_log  density   bike_score
+    'walk':         {'asc':  0.0, 'time': -0.01, 'time_log': -3.3,
+                     'density':  0.0,  'bike_score': 0.4},
+    'bike_regular': {'asc': -4.0, 'time': -0.02, 'time_log': -2.3,
+                     'density': -0.25, 'bike_score': 1.1},
+    'car_offpeak':  {'asc': -6.1, 'time': -0.07, 'time_log': -0.9,
+                     'density': -0.6,  'bike_score': 0.0},
+}
+
+
+def build_utility_spec(label: str, time_attr: str) -> utility.Utility:
+    """Translate the per-mode coefficient dict into a `Utility` spec.
+
+    Both time terms (linear and log) enter as `RouteFeature`s whose
+    aggregators return minutes — so the coefficients in `UTILITY_COEF`
+    are applied directly in their natural per-minute units.
+    """
+    c = UTILITY_COEF[label]
+    return utility.Utility(
+        constant=c['asc'],
+        route_features=[
+            utility.RouteFeature(
+                name='time_min', attribute=time_attr,
+                coefficient=c['time'], aggregator=time_minutes,
+            ),
+            utility.RouteFeature(
+                name='time_log_min', attribute=time_attr,
+                coefficient=c['time_log'], aggregator=time_log_minutes,
+            ),
+            utility.RouteFeature(
+                name='density_norm', attribute='density_norm',
+                coefficient=c['density'], aggregator='mean',
+            ),
+            utility.RouteFeature(
+                name='bike_score', attribute=edge_bike_score,
+                coefficient=c['bike_score'], aggregator='mean',
+            ),
+        ],
+    )
+
+
+# %% [markdown]
+# ## 11. Per-mode utility ODMs + logsums
+#
+# Three steps per mode:
+#
+# 1. `utility.route_utility` — one routing pass returns the cost + all
+#    route-feature aggregations along realised paths, combined into
+#    per-OD route utility.
+# 2. `utility.add_endpoint_utility` — adds the ASC constant (no origin
+#    / destination features in this spec).
+# 3. Lift to geo-keyed form and bake in cell-tier overhead, converted
+#    to utility units via the linear time coefficient.
+#
+# **Per-mode logsum** = `ln Σ_j W_j · exp(U_ij)`, implemented as
+# gravity with a custom decay `Decay('exp_u', np.exp)` then `log` of
+# the result. Units are utils; less negative = better access.
+#
+# **Overhead caveat.** Per-cell overhead enters utility through the
+# linear `β_time` coefficient only — the `β_time_log` and per-edge
+# (`density`, `bike_score`) terms see the routed path only. For
+# typical tens-of-seconds overheads this is a small distortion; a
+# fully consistent treatment would add overhead to total time before
+# applying log.
+
+# %%
+UTIL_GEO_PAIRS = {}     # label -> TieredODGeoPairs
+UTIL_GEO = {}           # label -> TieredODGeoPairs (utility values)
+LOGSUM_PER_MODE = {}    # (label, destination) -> per-cell pd.Series (utils)
+
+exp_utility_decay = accessibility.Decay('exp_u', np.exp)
+
+for label, graph, pairs, mask, time_attr, cutoff_s in ROUTING_PLAN:
+    net_label = NETWORK_OF[label]
+    node_col = f'node_id_{net_label}'
+    spec = build_utility_spec(label, time_attr)
+
+    # 1. Route + combine route-dependent utility components.
+    route_u = utility.route_utility(
+        pairs, graph, weight=time_attr, utility=spec,
+        mask=mask, cutoff=cutoff_s,
+    )
+    # 2. Add the ASC constant.
+    full_u = utility.add_endpoint_utility(route_u, pairs, spec, cells=cells)
+
+    # 3. Lift to geo + bake per-cell overhead (in utils) at both endpoints.
+    pairs_geo, full_u_geo = od_pairs.reindex_by_geo_unit(
+        pairs, full_u, cells,
+        cell_node_column=node_col,
+        zones=zones, zone_node_column=node_col,
+    )
+    coef = OVERHEAD_COEF[label]
+    overhead_per_cell_s = overhead.linear_per_cell_overhead(
+        cells, constant=coef['const'],
+        feature_coefficients={'density_norm': coef['density']},
+    )
+    # Convert overhead seconds → utility units via `β_time` (per minute).
+    overhead_per_cell_u = UTILITY_COEF[label]['time'] * overhead_per_cell_s / 60.0
+    full_u_geo = overhead.add_geo_overheads(
+        full_u_geo, pairs_geo,
+        origin_cell=overhead_per_cell_u,
+        dest_cell=overhead_per_cell_u,
+    )
+    UTIL_GEO_PAIRS[label] = pairs_geo
+    UTIL_GEO[label] = full_u_geo
+
+    # Per-mode logsum per destination.
+    _, dest_vals = REINDEXED[net_label]
+    grav = accessibility.gravity(
+        full_u_geo, dest_vals, CELL_TO_ZONE, [exp_utility_decay],
+    )
+    for d in DESTINATIONS:
+        with np.errstate(divide='ignore'):
+            ls = np.log(grav[('exp_u', d)])
+        # No-destination-reachable origins → log(0) = −∞; surface as NaN so
+        # downstream plot bounds aren't dragged to -inf.
+        LOGSUM_PER_MODE[(label, d)] = ls.replace([-np.inf, np.inf], np.nan)
+        s = LOGSUM_PER_MODE[(label, d)].loc[ORIG_MASK].dropna()
+        if len(s):
+            print(f"  {label:14s} × {d:24s}: "
+                  f"logsum median {s.median():>7.2f}  "
+                  f"P95 {s.quantile(0.95):>7.2f}")
+
+
+# %% [markdown]
+# Per-mode logsum maps (3 modes × 3 destinations), same crop as §9.
+
+# %%
+fig, axes = plt.subplots(3, 3, figsize=(18, 18))
+for row, (label, _, _, _, _, _) in enumerate(ROUTING_PLAN):
+    for col, d in enumerate(DESTINATIONS):
+        figures.plot_cell_map_cropped(
+            axes[row, col], ORIG_CELLS,
+            LOGSUM_PER_MODE[(label, d)].loc[ORIG_MASK],
+            crop_center_xy=MAP_CROP_CENTER_XY, crop_half_m=MAP_CROP_HALF_M,
+            title=f'{label} × {d} — logsum')
+plt.tight_layout()
+plt.show()
+
+
+# %% [markdown]
+# ## 12. Cross-modal logsum
+#
+# Combine the three per-mode utility ODMs via a utility-domain logsum
+# aggregator (`ln Σ_m exp(U_ijm)` per OD pair), then apply
+# gravity + log to get the cross-modal accessibility:
+#
+# ```
+# A_i = ln Σ_j W_j · Σ_m exp(U_ijm)
+# ```
+#
+# The per-mode logsums above tell you how reachable destinations are
+# by each mode separately; the cross-modal logsum tells you how
+# reachable they are if the agent picks whichever mode gives the
+# highest utility per trip. This is the multi-modal half of the
+# multi-scale × multi-modal combination that the toolkit paper centres
+# on.
+
+# %%
+def logsum_utility(stacked: np.ndarray) -> np.ndarray:
+    """Cross-modal logsum in utility space: ln Σ_m exp(U_m) per OD pair.
+
+    NaN entries (mode-unreachable for that OD pair) contribute 0 to the sum.
+    """
+    exp_terms = np.exp(stacked)
+    exp_terms = np.where(np.isnan(exp_terms), 0.0, exp_terms)
+    sum_exp = exp_terms.sum(axis=0)
+    with np.errstate(divide='ignore'):
+        return np.log(sum_exp)
+
+
+combined_pairs, combined_u = od_pairs.aggregate_across_modes(
+    {label: (UTIL_GEO_PAIRS[label], UTIL_GEO[label])
+     for label, _, _, _, _, _ in ROUTING_PLAN},
+    aggregator=logsum_utility,
 )
-logsum_costs_floored = routing.floor_intrazonal_costs(logsum_costs, min_cost=30.0)
-# Destination weights: any of the per-network dest_vals will do — they're
-# the same per-cell counts; geo-pairs alignment is handled internally.
-logsum_dest_vals = {
-    d: od_pairs.dest_values_geo(d, logsum_pairs, cells, zones=zones)
+combined_dest_vals = {
+    d: od_pairs.dest_values_geo(d, combined_pairs, cells, zones=zones)
     for d in DESTINATIONS
 }
-logsum_decay = accessibility.exp_decay('logsum', 1.0 / LOGSUM_SCALE)
-logsum_acc = accessibility.gravity(
-    logsum_costs_floored, logsum_dest_vals, CELL_TO_ZONE, [logsum_decay],
+combined_grav = accessibility.gravity(
+    combined_u, combined_dest_vals, CELL_TO_ZONE, [exp_utility_decay],
 )
+CROSS_LOGSUM = {}
+for d in DESTINATIONS:
+    with np.errstate(divide='ignore'):
+        ls = np.log(combined_grav[('exp_u', d)])
+    CROSS_LOGSUM[d] = ls.replace([-np.inf, np.inf], np.nan)
 
 fig, axes = plt.subplots(1, 3, figsize=(18, 6))
 for col, d in enumerate(DESTINATIONS):
     figures.plot_cell_map_cropped(
-        axes[col], ORIG_CELLS, logsum_acc[('logsum', d)].loc[ORIG_MASK],
+        axes[col], ORIG_CELLS, CROSS_LOGSUM[d].loc[ORIG_MASK],
         crop_center_xy=MAP_CROP_CENTER_XY, crop_half_m=MAP_CROP_HALF_M,
-        title=f'Cross-modal logsum (walk+bike+car off-peak) × {d}')
+        title=f'Cross-modal logsum (walk + bike + car) × {d}')
 plt.tight_layout()
 plt.show()
 
@@ -586,26 +831,27 @@ plt.show()
 # %% [markdown]
 # ## What this notebook does NOT do
 #
-# This is a tutorial-scope accessibility analysis using published-paper
-# default coefficients (Miotti et al., *Transportation*, 20XX), chosen
-# to demonstrate aperta's library API on real data with realistic edge
-# weights. It deliberately omits things production code would do:
+# Tutorial-scope analysis using published-paper edge-weight coefficients
+# (Miotti et al., *Transportation*, 20XX) and approximate per-mode
+# utility coefficients informed by an ongoing project. It deliberately
+# omits things production code would do:
 #
-# - **Only one variant per mode.** Walk + regular bike + car off-peak.
-#   The paper has more (e-bike 25/45, car peak/night) — see
+# - **One variant per mode.** Walk + regular bike + car off-peak. The
+#   paper has more (e-bike 25/45, car peak/night) — see
 #   [`projects/lumos/`](https://github.com/mmiotti/aperta-lab/tree/main/src/projects/lumos)
 #   for the full variant matrix with peak vs off-peak congestion deltas
 #   and bike vs e-bike comparisons.
 # - **Cell-tier overheads only.** Production aggregates destination
 #   overhead at middle / far tiers via centroid-to-centroid distance.
-#   Cells are small enough here that the difference is minor for a
-#   showcase.
+#   Cells are small enough here that the difference is minor.
 # - **No `overhead_*_dist` term.** The published coefficient table
 #   doesn't have it; production may add it back per regional fit.
+# - **Overhead enters utility through linear time only.** Per-cell
+#   overhead is multiplied by `β_time` but not folded into the
+#   `β_time_log` term. Small distortion at typical overhead magnitudes
+#   (~tens of seconds).
 # - **Edge weights are paper-derived, not re-calibrated** for this
 #   region. To re-derive them from ground-truth travel times, see
-#   `calibrate_edge_weights.ipynb`. To add a traffic-flow / congestion
-#   feature, see `traffic_flows.ipynb`. None of those are wired into this
+#   `calibrate_edge_weights.ipynb`; to add a traffic-flow / congestion
+#   feature, see `traffic_flows.ipynb`. Neither is wired into this
 #   notebook by design — each showcase notebook stands alone.
-# - **Cross-modal logsum uses a coarse `θ = 60 s`.** Production
-#   calibrates `θ` per destination class against revealed mode choice.

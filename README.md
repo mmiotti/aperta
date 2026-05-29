@@ -145,6 +145,25 @@ Aperta deliberately doesn't try to do everything in-house. Two interoperability 
 - **Public transit via R5.** Aperta has no native public-transit support right now (no GTFS reader, no RAPTOR-style time-dependent routing). Anything that can be expressed as a `networkx` graph with appropriate edge weights — including simplified transit-as-graph models — will route in aperta like any other network. For full GTFS-based transit routing (calendars, transfers, frequency-based services), the pragmatic pattern is to compute the transit OD cost matrix with [R5](https://github.com/conveyal/r5) (via [r5py](https://r5py.readthedocs.io/)), align its origins/destinations to the same cell layer aperta uses, and feed the resulting per-mode cost ODM into `od_pairs.aggregate_across_modes` alongside the walk / cycle / car ODMs computed by aperta. The cross-modal aggregation proceeds identically whether each per-mode ODM came from aperta's router or elsewhere.
 - **Faster cost-only routing via Pandana/pandarm.** Aperta's live-graph routing is the right trade-off for path-first, iterative, and scenario-comparative workloads, but for one-shot cost-only accessibility on a large fixed network, contraction-hierarchy backends like [Pandana](https://udst.github.io/pandana/) (and its recent modernized fork pandarm) route faster per query. The calibrated edge weights produced by `calibration.calibrate_edge_weights` are plain per-edge attributes on the `networkx` graph and transfer cleanly to a Pandana/pandarm network built from the same OSM extract — i.e., you can calibrate edge weights in aperta and then route with them in Pandana/pandarm.
 
+## Benchmark vs Pandana
+
+Cumulative-opportunity accessibility to total employment on the consolidated walk and car networks of Bern + 25 km (the same area the extended example notebooks build). End-to-end wall time, including each library's setup phase (Pandana network construction + `precompute`; aperta OD-pair construction + routing + accessibility); lower is better.
+
+| Setup                                                       | Walk (15 min) |  Car (30 min) |
+|-------------------------------------------------------------|--------------:|--------------:|
+| Pandana — all graph nodes                                   |           …s  |           …s  |
+| Aperta A — all graph nodes (single-tier, Euclidean cutoff)  |           …s  |           …s  |
+| Aperta B — cell-snap origins, tiered destinations           |           …s  |           …s  |
+| Aperta C — AOI-restricted cell origins, tiered destinations |           …s  |           …s  |
+
+Three things this is meant to show:
+
+- **Pandana wins on A** (its design centre: one-shot all-pairs cost on a fixed graph via contraction hierarchies).
+- **B narrows the gap** by leveraging the 3-tier destination structure (cell-tier close, zone-tier far) — the tiers replace what would otherwise be a wall of redundant intra-zone routing.
+- **C overtakes Pandana** in the realistic production setup (an AOI buffer provides destinations and through-routing but is not itself an origin), where Aperta routes only from the cells that need accessibility values and Pandana still pays its full all-pairs precompute.
+
+Reproduce: run [examples/extended/prepare/](examples/extended/prepare/) end to end (one-time, slow — downloads + consolidates OSM networks), then `python examples/extended/benchmark.py`.
+
 ## Engineering
 
 - **CI**: full test suite runs on Python 3.11 / 3.12 / 3.13 (every push + PR), alongside [Ruff](https://github.com/astral-sh/ruff) (lint + format) and mypy (type checking).

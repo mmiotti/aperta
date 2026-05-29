@@ -8,7 +8,7 @@
 #       format_name: percent
 #       format_version: '1.3'
 #   kernelspec:
-#     display_name: Python 3 (ipykernel)
+#     display_name: aperta
 #     language: python
 #     name: python3
 # ---
@@ -462,10 +462,11 @@ print(f"  Σ dropped (no eligible buildings in muni): "
 fig, ax = plt.subplots(figsize=(8, 8))
 # Hexbin needs point coords; buildings are polygon footprints, so use centroids.
 b_centroids = buildings.geometry.centroid
+buildings['employment_total_log'] = np.log(buildings['employment_total'] + 1)
 ax.hexbin(
     b_centroids.x, b_centroids.y,
-    C=buildings['employment_total'], reduce_C_function=np.sum,
-    gridsize=80, cmap='viridis', mincnt=0.1,
+    C=buildings['employment_total_log'], reduce_C_function=np.sum,
+    gridsize=120, cmap='viridis', mincnt=0.1,
 )
 gpd.GeoSeries([dest_polygon], crs=CRS_METRIC).boundary.plot(
     ax=ax, color='black', linewidth=0.5,
@@ -474,7 +475,7 @@ cx.add_basemap(
     ax, source=cx.providers.CartoDB.Positron(r='@2x'), crs=CRS_METRIC,
 )
 ax.set_title(
-    f"Per-building employment (FTE), summed into hex bins\n"
+    f"Per-building employment (FTE, log scale), summed into hex bins\n"
     f"BFS STATENT {STATENT_YEAR} × OSM buildings, dasymetric (3-sector NOGA)"
 )
 ax.set_axis_off()

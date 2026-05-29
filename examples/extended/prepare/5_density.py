@@ -8,7 +8,7 @@
 #       format_name: percent
 #       format_version: '1.3'
 #   kernelspec:
-#     display_name: Python 3 (ipykernel)
+#     display_name: aperta
 #     language: python
 #     name: python3
 # ---
@@ -86,7 +86,7 @@ print(f"Cells: {len(cells):,} (Σ pop+emp = {cells['pop_plus_emp'].sum():,.0f})"
 # ```
 #
 # where the numerator aggregates pop+emp from cell centroids within
-# 1 km of the node. `cross_sum_within_radius` with `return_density=True`
+# 1 km of the node. `aggregate_within_radius` with `return_density=True`
 # returns the density per m²; multiplying by 100 (× 1e6 to convert to
 # per-km², then ÷ 10_000) gives the quantity under the sqrt.
 

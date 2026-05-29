@@ -397,6 +397,13 @@ plt.tight_layout()
 plt.show()
 
 # %%
+# Zoom box centred on Bern (LV95). The full study area is ~50 km across,
+# which makes individual H3-res-10 cells (~130 m diameter) hard to see;
+# this crop shows roughly inner Bern + immediate suburbs so per-cell
+# values are legible. Adjust ZOOM_HALF_WIDTH_M to widen / tighten.
+BERN_CENTER_LV95 = (2_600_000, 1_200_000)
+ZOOM_HALF_WIDTH_M = 5_000   # → 10 km × 10 km extent
+
 fig, axes = plt.subplots(1, 3, figsize=(18, 7))
 for ax, col, title, cmap in [
     (axes[0], 'population',       'Population per cell',           'viridis'),
@@ -410,11 +417,20 @@ for ax, col, title, cmap in [
         column=col, ax=ax, legend=True, cmap=cmap, edgecolor='none',
         legend_kwds={'shrink': 0.6},
     )
+    # Set zoom extents BEFORE add_basemap so contextily fetches tiles
+    # at the appropriate zoom level rather than for the full study area.
+    ax.set_xlim(BERN_CENTER_LV95[0] - ZOOM_HALF_WIDTH_M,
+                BERN_CENTER_LV95[0] + ZOOM_HALF_WIDTH_M)
+    ax.set_ylim(BERN_CENTER_LV95[1] - ZOOM_HALF_WIDTH_M,
+                BERN_CENTER_LV95[1] + ZOOM_HALF_WIDTH_M)
     cx.add_basemap(
         ax, source=cx.providers.CartoDB.Positron(r='@2x'), crs=CRS_METRIC,
     )
     ax.set_title(title)
     ax.set_axis_off()
 cells.drop(columns=['_poi_total'], inplace=True)
+plt.suptitle(f'Zoomed to {2 * ZOOM_HALF_WIDTH_M // 1000} km × '
+             f'{2 * ZOOM_HALF_WIDTH_M // 1000} km centred on Bern',
+             y=1.02, fontsize=11)
 plt.tight_layout()
 plt.show()

@@ -17,7 +17,8 @@
 # # Prep notebook 1: Download
 #
 # Downloads everything needed for the extended accessibility example into a
-# sibling `prepared/` folder.
+# sibling `prepared/` folder, except employment land use data (covered in
+# `2_dasymetric_employment.ipynb`)
 #
 # **Geographical scope:**
 #
@@ -56,7 +57,7 @@
 #
 # | Data | Source | Notes |
 # |---|---|---|
-# | Mode-specific networks | OSM via `osmnx` | `network_type='walk'` / `'bike'` / `'drive'` |
+# | Mode-specific networks | OSM via `osmnx` | `network_type='all'` / `'bike'` / `'drive'` |
 # | Population | GHSL R2023A, 100 m, Mollweide | Single JRC tile (R4_C19 covers Switzerland) |
 # | Building footprints | OSM via `osmnx` | Tag-aware: `building=office\|retail\|...` |
 # | Points of interest | OSM via `osmnx` | Schools, hospitals, supermarkets, etc. |
@@ -177,8 +178,8 @@ cx.add_basemap(
 )
 ax.set_title(
     f'{LOCATION_LABEL} accessibility scope\n'
-    f'red = seed ({LOCATION_LABEL}) · '
-    f'gold = AOI (seed + {AOI_BUFFER_M // 1000:.0f} km) · '
+    f'red = seed ({LOCATION_LABEL}) | '
+    f'gold = AOI (seed + {AOI_BUFFER_M // 1000:.0f} km) | '
     f'blue = destination area (AOI + {DEST_BUFFER_M // 1000:.0f} km)'
 )
 ax.set_axis_off()
@@ -195,10 +196,12 @@ plt.show()
 #
 # Network-type notes:
 #
-# - **`'walk'`**: walkable streets and paths. Excludes motorways. Accepts
-#   the rare-island trade-off (a few foot-only paths whose only connector
-#   is a trunk road get dropped) for the cleaner exclusion of motorways
-#   from pedestrian routing.
+# - **`'walk'`**: walkable streets and paths. Set to 'all' because 'walk' networks
+#   can currently exclude important pedestrian-ony paths next to motorways if they
+#   are connected to the rest of the network via those motorways in the graph
+#   topology. It's a trade-off: 'all' risks overestimating pedestrian
+#   accessibility, 'walk' risks the introduction of pedestrian network islands
+#   that don't exist in the real world.
 # - **`'bike'`**: cycle-accessible network. Includes pedestrian paths
 #   (where cycling is typically allowed) plus residential / cycleway
 #   infrastructure. Excludes motorways.
@@ -213,28 +216,34 @@ plt.show()
 # The raw form is kept so the before/after comparison plot at the end of this
 # section is reproducible on re-runs (cached cleanly), and so future
 # experiments with different consolidation tolerances don't require re-fetch.
+#
+# `(mode_label, osm_network_type, name_stem)`. We fetch the walking
+# network with OSMnx `network_type='all'` (not `'walk'`) so trunk roads
+# stay in — pedestrians legitimately use sidewalks along these, and
+# `'walk'` over-filters in urban areas. See the walkthrough notebook
+# for the full rationale. The dict key stays `'walk'` (semantic).
 MODES = [
-    ('walk',  'walk_graph'),
-    ('bike',  'bike_graph'),
-    ('drive', 'car_graph'),
+    ('walk',  'all',   'walk_graph'),
+    ('bike',  'bike',  'bike_graph'),
+    ('drive', 'drive', 'car_graph'),
 ]
 raw_graphs: dict[str, 'ox.graph'] = {}
 
-for network_type, name_stem in MODES:
+for mode, osm_type, name_stem in MODES:
     raw_path = PREPARED_DIR / f'{name_stem}_raw.graphml'
     if raw_path.exists():
-        print(f"{network_type} raw network cached at {raw_path} — loading.")
-        raw_graphs[network_type] = ox.load_graphml(raw_path)
+        print(f"{mode} raw network cached at {raw_path} — loading.")
+        raw_graphs[mode] = ox.load_graphml(raw_path)
     else:
-        print(f"Fetching {network_type} network...")
-        raw_graphs[network_type] = osm_helpers.fetch_network(
+        print(f"Fetching {mode} network (OSMnx network_type='{osm_type}')...")
+        raw_graphs[mode] = osm_helpers.fetch_network(
             polygon=dest_polygon, polygon_crs=CRS_METRIC,
-            network_type=network_type, target_crs=CRS_METRIC,
+            network_type=osm_type, target_crs=CRS_METRIC,
             simplify=True,
         )
-        ox.save_graphml(raw_graphs[network_type], raw_path)
-    g = raw_graphs[network_type]
-    print(f"  {network_type:5s}: {g.number_of_nodes():,} nodes, "
+        ox.save_graphml(raw_graphs[mode], raw_path)
+    g = raw_graphs[mode]
+    print(f"  {mode:5s}: {g.number_of_nodes():,} nodes, "
           f"{g.number_of_edges():,} edges")
 
 # %% [markdown]
@@ -288,33 +297,42 @@ print(f"Obstacles extracted from raw car graph: "
       + f", roundabouts={len(shared_roundabouts)}")
 
 graphs: dict[str, 'ox.graph'] = {}
-for network_type, name_stem in MODES:
+for mode, osm_type, name_stem in MODES:
     cons_path = PREPARED_DIR / f'{name_stem}.graphml'
     if cons_path.exists():
-        print(f"{network_type} consolidated network cached at {cons_path} — loading.")
+        print(f"{mode} consolidated network cached at {cons_path} — loading.")
         # `load_consolidated_graphml` (not `ox.load_graphml`) so aperta's
         # custom node + edge attrs (`is_*` flags, `lanes_per_direction`)
         # round-trip with the right dtypes — otherwise they come back as
         # strings and silently break arithmetic.
-        graphs[network_type] = network_processing.load_consolidated_graphml(cons_path)
+        graphs[mode] = network_processing.load_consolidated_graphml(cons_path)
     else:
-        print(f"Consolidating {network_type} (tol={CONSOLIDATION_TOLERANCE[network_type]} m)...")
-        graphs[network_type] = network_processing.consolidate_intersections(
-            raw_graphs[network_type],
-            tolerance=CONSOLIDATION_TOLERANCE[network_type],
+        print(f"Consolidating {mode} (tol={CONSOLIDATION_TOLERANCE[mode]} m)...")
+        graphs[mode] = network_processing.consolidate_intersections(
+            raw_graphs[mode],
+            tolerance=CONSOLIDATION_TOLERANCE[mode],
             obstacle_buffer=30.0,
             obstacle_locations=shared_obstacles,
             roundabout_locations=shared_roundabouts,
             detect_roundabouts=True,
         )
-        ox.save_graphml(graphs[network_type], cons_path)
-    raw = raw_graphs[network_type]
-    cons = graphs[network_type]
+        ox.save_graphml(graphs[mode], cons_path)
+    raw = raw_graphs[mode]
+    cons = graphs[mode]
     pct = 100 * (1 - cons.number_of_nodes() / raw.number_of_nodes())
     n_sig = sum(int(d.get('is_traffic_signal', 0)) for _, d in cons.nodes(data=True))
     n_rb  = sum(int(d.get('is_roundabout',     0)) for _, d in cons.nodes(data=True))
-    print(f"  {network_type:5s}: {raw.number_of_nodes():,} → {cons.number_of_nodes():,} nodes "
+    print(f"  {mode:5s}: {raw.number_of_nodes():,} → {cons.number_of_nodes():,} nodes "
           f"({pct:.0f}% reduction); signals={n_sig:,}, roundabouts={n_rb:,}")
+
+# Undirect walk and bike graphs so one-way street rules (a directed-graph
+# default from OSMnx's MultiDiGraph) don't silently produce zero-accessibility
+# outliers at one-way termini — pedestrians and cyclists typically contraflow.
+# For fully accurate bicycle evaluation, directedness should be preserved, but
+# cells should be snapped in a way that they cannot get snapped to termini.
+# A corresponding feature is planned.
+for mode in ('walk', 'bike'):
+    graphs[mode] = graphs[mode].to_undirected()
 
 walk_graph = graphs['walk']
 bike_graph = graphs['bike']
