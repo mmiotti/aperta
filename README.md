@@ -33,8 +33,9 @@ python -m unittest discover -s tests -t .
 ```
 
 > If you plan to edit the example notebooks under `examples/`, run the
-> [notebook editing setup](#editing-notebooks) once after cloning. Not
-> needed if you're only using the library or modifying Python source.
+> [jupytext + nbstripout setup](CONTRIBUTING.md#editing-notebooks) once
+> after cloning. Not needed if you're only using the library or
+> modifying Python source.
 
 ## Workflow
 
@@ -109,20 +110,20 @@ Runnable end-to-end version (with plotting): [examples/minimal/accessibility.ipy
 
 | Module | Purpose |
 |---|---|
-| `od_pairs` | Tiered OD pair structures (`TieredODNodePairs`, `TieredODGeoPairs`) + builders (`get_pairs`, `dest_values`, `reindex_by_geo_unit`, `make_mask`, `aggregate_across_modes` for cross-modal alignment). |
-| `routing` | Shortest paths on `networkx` graphs via `scipy.sparse.csgraph.dijkstra`. Edge-weighting helpers, single-source / one-to-one primitives, tiered OD routing (`tiered_path_costs`, `tiered_path_aggregate` with per-edge `PathAggregation` and per-node `NodeAggregation` feature aggregation along realised paths), pure path-walker primitive `aggregate_along_paths` (for prebuilt path lists), intrazonal-cost flooring. |
-| `accessibility` | `cumulative_opportunities` (cumulative), `gravity` (decay-based), `nearest_k` (cost to nearest k). Outputs per-node or per-cell depending on input ODM class. |
-| `utility` | Linear utility specs (`Utility`, `RouteFeature`) and pipeline (`route_utility`, `add_endpoint_utility`) for utility-based costs; consumed by `accessibility.gravity` with an exp decay for logsum accessibility. |
-| `overhead` | First/last-mile overheads on cost ODMs. `add_node_overheads` (node-keyed); `add_geo_overheads` / `add_origin_cell_overhead` (geo-keyed); `aggregate_dest_overhead_per_*` helpers for zone-tier last-mile. |
-| `traffic_flows` | Traffic-volume estimation via cost-weighted nested-node sampling (`nested_node_sample`). |
-| `calibration` | OLS calibration of per-edge weights (`calibrate_edge_weights`) against observed point-to-point travel times; bearing-aware traffic-counter snapping (`snap_counters_to_edges`) + counter-fit evaluation (`evaluate_against_counters`) for traffic-flow calibration. |
-| `network_processing` | Network helpers — `consolidate_intersections` (OSMnx-output cleanup with obstacle re-attachment), `get_nested_edge_betweenness` (sampled edge-usage counts from a `nested_node_sample`), `snap_to_network_nodes`, `assign_to_eligible_centroid`, `aggregate_edges_to_nodes`, `lanes_per_direction`. |
-| `geo_processing` | Geometry helpers — H3 grids, line bearings, `sum_within_radius` (same-set neighbourhood sum) and `cross_sum_within_radius` (cross-set buffer aggregation) via scipy KDTree, raster sampling. |
-| `geo_mapping` | Spatial-join wrappers — `map_points_to_polygons`, `map_polygons_to_points`, `map_points_to_points`, `map_points_to_filtered_lines`. |
-| `osm_helpers` | OSM data fetching + per-edge categorisation via `osmnx` (`fetch_network`, `fetch_pois`, `categorize_edges`). Requires `aperta[osm]`. |
-| `topography` | Copernicus GLO-30 DEM download + raster sampling (`fetch_copernicus_dem`). Requires `aperta[topo]`. |
-| `visualization` | Plot helpers — `plot_cell_values` (single-panel choropleth), `plot_cell_values_comparison` (multi-panel with shared scale), `plot_tiered_destinations` (origin-cell tier viz), `plot_edge_values` (LineCollection-based with sort/z-order control), `add_styled_colorbar`. |
-| `errors` | Aperta-specific exception types (`ContextError`, `DataError`, `ProcessingError`). |
+| `od_pairs` | Tiered OD pair structures + builders, including cross-modal alignment. |
+| `routing` | Shortest paths on `networkx` graphs via `scipy.sparse.csgraph.dijkstra`: tiered OD routing, per-edge / per-node feature aggregation along realised paths, intrazonal-cost flooring. |
+| `accessibility` | Cumulative-opportunity, gravity, nearest-k metrics. Per-node or per-cell output depending on input ODM class. |
+| `utility` | Linear utility specifications and the routing-+-endpoint pipeline for utility-based costs; consumed by `gravity` with an exp decay for logsum accessibility. |
+| `overhead` | First/last-mile overheads on cost ODMs (node-keyed and geo-keyed), with helpers for zone-tier last-mile aggregation. |
+| `traffic_flows` | Traffic-volume estimation via cost-weighted nested-node sampling. |
+| `calibration` | OLS calibration of per-edge weights against observed travel times; bearing-aware traffic-counter snapping + counter-fit evaluation for flow calibration. |
+| `network_processing` | Network helpers — intersection consolidation, sampled edge betweenness, node snapping, per-direction lane counts. |
+| `geo_processing` | Geometry helpers — H3 grids, line bearings, KDTree-based buffer aggregations, raster sampling. |
+| `geo_mapping` | Spatial-join wrappers between points, polygons, and filtered lines. |
+| `osm_helpers` | OSM data fetching + per-edge categorisation via `osmnx`. Requires `aperta[osm]`. |
+| `topography` | Copernicus GLO-30 DEM download + raster sampling. Requires `aperta[topo]`. |
+| `visualization` | Plot helpers — choropleth panels, multi-panel comparisons, per-edge `LineCollection` rendering, styled colourbars. |
+| `errors` | Aperta-specific exception types. |
 
 ## Design
 
@@ -178,49 +179,7 @@ Reproduce: run [examples/extended/prepare/](examples/extended/prepare/) end to e
 
 ## Contributing
 
-Internal repository for now. External contributions will open after the toolkit-paper publication.
-
-## Editing notebooks
-
-Notebooks here are **jupytext-paired**: each `.ipynb` has a `.py` shadow
-under the same basename. Edits in either form propagate to the other via
-`jupytext --sync <file>`. The `.py` shadow is the human-readable form for
-code review; the `.ipynb` carries the executed outputs.
-
-Two pieces of automation handle the friction. Both need to be activated
-once per local clone:
-
-```bash
-# 1. Auto-sync .py <-> .ipynb on every commit (jupytext via pre-commit).
-pip install pre-commit
-pre-commit install
-
-# 2. Strip outputs from non-example notebooks on commit
-#    (keeps git history clean; example notebooks are exempt and ship
-#    with their outputs intact so figures render on GitHub).
-pip install nbstripout
-nbstripout --install
-```
-
-After this setup:
-
-- Edit either the `.py` or the `.ipynb` — the pre-commit hook keeps the
-  pair in sync (if your commit changes only one side, the hook updates
-  the other and asks you to re-stage).
-- `git diff` and `git log` on non-example `.ipynb` files show only code
-  and markdown changes (outputs stripped by `nbstripout`).
-- Notebooks under [`examples/`](examples/) are exempt from output-stripping
-  via [`.gitattributes`](.gitattributes) and ship with their executed
-  outputs intact. Before committing changes to an example notebook,
-  execute it end-to-end (in VSCode / Jupyter, or via
-  `jupytext --sync --execute <file>`) so the committed outputs reflect
-  the current code.
-
-If you skip the `nbstripout --install` step, your commits to non-example
-notebooks will include output cells (large diffs, slow GitHub renders).
-If you skip the `pre-commit install` step, you'll need to run
-`jupytext --sync` manually after notebook edits so the `.py` and `.ipynb`
-don't drift apart. Both are one-time setups; install them.
+Internal repository for now — external contributions open after the toolkit-paper publication. Collaborators with commit access: see [CONTRIBUTING.md](CONTRIBUTING.md) for the one-time jupytext + nbstripout setup.
 
 ## Acknowledgments
 

@@ -633,18 +633,106 @@ def aggregate_along_paths(
     if len(set(names)) != len(names):
         raise ValueError(f"Aggregation names must be unique across edge + node specs; got {names}.")
 
-    edge_attr_fns = [_resolve_attribute(a.attribute) for a in edge_aggregations]
-    edge_agg_fns = [_resolve_aggregator(a.aggregator) for a in edge_aggregations]
-    node_attr_fns = [_resolve_node_attribute(a.attribute) for a in node_aggregations]
-    node_agg_fns = [_resolve_aggregator(a.aggregator) for a in node_aggregations]
-    node_include_endpoints = [a.include_endpoints for a in node_aggregations]
-    is_multi = isinstance(graph, (nx.MultiGraph, nx.MultiDiGraph))
+    # Precompute per-edge / per-node arrays once, then walk paths using
+    # numpy fancy-indexing. Big win when there are many paths and/or
+    # per-edge attribute extraction is a Python callable (e.g. derived
+    # quietness scores) — the callable runs once per graph edge instead
+    # of once per (path, edge) traversal.
+    edge_cache = _precompute_edge_arrays(graph, weight, edge_aggregations, dtype)
+    node_cache = (_precompute_node_arrays(graph, node_aggregations, dtype)
+                  if node_aggregations else None)
+    return _walk_paths_with_arrays(
+        paths, edge_cache, node_cache, edge_aggregations, node_aggregations, dtype,
+    )
 
-    def _get_edge(u, v):
-        """Min-`weight` edge between `u` and `v` (collapses MultiGraph parallels)."""
-        if is_multi:
-            return min(graph[u][v].values(), key=lambda d: d.get(weight, np.inf))
-        return graph[u][v]
+
+# ---------------------------------------------------------------------------
+# Path-walking with precomputed per-edge / per-node arrays
+# ---------------------------------------------------------------------------
+def _precompute_edge_arrays(
+    graph: nx.Graph,
+    weight: str,
+    edge_aggregations: Sequence["PathAggregation"],
+    dtype: np.dtype | type,
+) -> tuple[dict, np.ndarray, list[np.ndarray]]:
+    """Build `(u, v) -> edge_index` map + per-edge weight array + per-spec
+    feature arrays. For MultiGraph / MultiDiGraph parallels, collapses to
+    the min-`weight` edge per `(u, v)` — matches the router's choice in
+    `_graph_to_csr`.
+
+    Each per-edge attribute extractor runs *once* here (per graph edge),
+    not once per (path, edge) traversal. That's the optimisation that lets
+    callable attributes (e.g. derived per-edge quietness scores) stop
+    dominating the inner loop.
+    """
+    is_multi = isinstance(graph, (nx.MultiGraph, nx.MultiDiGraph))
+    edge_attr_fns = [_resolve_attribute(a.attribute) for a in edge_aggregations]
+
+    chosen: dict = {}  # (u, v) -> (weight, data)
+    if is_multi:
+        for u, v, _k, data in graph.edges(keys=True, data=True):
+            w = float(data.get(weight, np.inf))
+            prev = chosen.get((u, v))
+            if prev is None or prev[0] > w:
+                chosen[(u, v)] = (w, data)
+    else:
+        for u, v, data in graph.edges(data=True):
+            chosen[(u, v)] = (float(data.get(weight, np.inf)), data)
+
+    n_edges = len(chosen)
+    edge_index: dict = {}
+    weight_arr = np.empty(n_edges, dtype=dtype)
+    feat_arrs = [np.empty(n_edges, dtype=dtype) for _ in edge_aggregations]
+    for i, ((u, v), (w, data)) in enumerate(chosen.items()):
+        edge_index[(u, v)] = i
+        weight_arr[i] = w
+        for j, attr_fn in enumerate(edge_attr_fns):
+            feat_arrs[j][i] = float(attr_fn(u, v, data))
+    return edge_index, weight_arr, feat_arrs
+
+
+def _precompute_node_arrays(
+    graph: nx.Graph,
+    node_aggregations: Sequence["NodeAggregation"],
+    dtype: np.dtype | type,
+) -> tuple[dict, list[np.ndarray]]:
+    """Build `node_id -> node_index` map + per-spec node-feature arrays.
+    Each per-node attribute extractor runs once here, not once per
+    (path, node) traversal."""
+    node_attr_fns = [_resolve_node_attribute(a.attribute) for a in node_aggregations]
+    node_ids = list(graph.nodes())
+    node_index = {n: i for i, n in enumerate(node_ids)}
+    n_nodes = len(node_ids)
+    node_attr_arrs = [np.empty(n_nodes, dtype=dtype) for _ in node_aggregations]
+    for i, n in enumerate(node_ids):
+        data = graph.nodes[n]
+        for j, attr_fn in enumerate(node_attr_fns):
+            node_attr_arrs[j][i] = float(attr_fn(n, data))
+    return node_index, node_attr_arrs
+
+
+def _walk_paths_with_arrays(
+    paths: list[list],
+    edge_cache: tuple[dict, np.ndarray, list[np.ndarray]],
+    node_cache: tuple[dict, list[np.ndarray]] | None,
+    edge_aggregations: Sequence["PathAggregation"],
+    node_aggregations: Sequence["NodeAggregation"],
+    dtype: np.dtype | type,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Walk paths using precomputed arrays. The inner loop is a single
+    numpy fancy-index per path per spec, not a Python iteration over edges.
+    See `_precompute_edge_arrays` for cache shape."""
+    edge_index, weight_arr, feat_arrs = edge_cache
+    edge_agg_fns = [_resolve_aggregator(a.aggregator) for a in edge_aggregations]
+    if node_cache is not None:
+        node_index, node_attr_arrs = node_cache
+        node_agg_fns = [_resolve_aggregator(a.aggregator) for a in node_aggregations]
+        node_include_endpoints = [a.include_endpoints for a in node_aggregations]
+    else:
+        node_index = {}
+        node_attr_arrs = []
+        node_agg_fns = []
+        node_include_endpoints = []
 
     n = len(paths)
     n_edge = len(edge_aggregations)
@@ -652,42 +740,49 @@ def aggregate_along_paths(
     costs = np.full(n, np.inf, dtype=dtype)
     edge_out = [np.full(n, np.nan, dtype=dtype) for _ in range(n_edge)]
     node_out = [np.full(n, np.nan, dtype=dtype) for _ in range(n_node)]
+    empty = np.empty(0, dtype=dtype)
 
     for i, path in enumerate(paths):
         if not path:
             continue  # unreachable: cost=inf, aggs=NaN (both preallocated)
 
         n_edges = len(path) - 1
-        edge_vals = np.empty((n_edge, n_edges), dtype=dtype)
-        cost_sum = 0.0
-        valid = True
-        for k in range(n_edges):
-            u, v = path[k], path[k + 1]
-            try:
-                edge = _get_edge(u, v)
-            except KeyError:
-                valid = False
-                break
-            cost_sum += float(edge.get(weight, np.inf))
-            for j, attr_fn in enumerate(edge_attr_fns):
-                edge_vals[j, k] = float(attr_fn(u, v, edge))
-        if not valid:
-            continue
+        if n_edges == 0:
+            # Self-pair: cost=0, edge aggs follow empty-array semantics.
+            costs[i] = 0.0
+            for j, agg_fn in enumerate(edge_agg_fns):
+                edge_out[j][i] = float(agg_fn(empty))
+        else:
+            # Resolve every (u, v) pair to its edge index; bail to
+            # "unreachable" if any edge is missing from the graph
+            # (defensive — paths from the router should always be valid).
+            edge_idx = np.empty(n_edges, dtype=np.int64)
+            valid = True
+            for k in range(n_edges):
+                e = edge_index.get((path[k], path[k + 1]))
+                if e is None:
+                    valid = False
+                    break
+                edge_idx[k] = e
+            if not valid:
+                continue
+            sub_weights = weight_arr[edge_idx]
+            costs[i] = float(sub_weights.sum())
+            for j, agg_fn in enumerate(edge_agg_fns):
+                edge_out[j][i] = float(agg_fn(feat_arrs[j][edge_idx]))
 
-        costs[i] = cost_sum
-        for j, agg_fn in enumerate(edge_agg_fns):
-            edge_out[j][i] = float(agg_fn(edge_vals[j]))
-        for j, attr_fn in enumerate(node_attr_fns):
-            nodes = path if node_include_endpoints[j] else path[1:-1]
-            if nodes:
-                node_vals = np.fromiter(
-                    (float(attr_fn(node, graph.nodes[node])) for node in nodes),
-                    dtype=dtype,
-                    count=len(nodes),
-                )
-            else:
-                node_vals = np.empty(0, dtype=dtype)
-            node_out[j][i] = float(node_agg_fns[j](node_vals))
+        if n_node:
+            for j in range(n_node):
+                nodes = path if node_include_endpoints[j] else path[1:-1]
+                if nodes:
+                    node_idx = np.fromiter(
+                        (node_index[n_] for n_ in nodes),
+                        dtype=np.int64, count=len(nodes),
+                    )
+                    node_vals = node_attr_arrs[j][node_idx]
+                else:
+                    node_vals = empty
+                node_out[j][i] = float(node_agg_fns[j](node_vals))
 
     aggs: dict[str, np.ndarray] = {}
     for edge_spec, arr in zip(edge_aggregations, edge_out):
@@ -768,6 +863,15 @@ def tiered_path_aggregate(
     zero_edge = csr.nnz == 0
     limit = cutoff if cutoff is not None else np.inf
 
+    # Precompute per-edge / per-node feature arrays ONCE — they're invariant
+    # across origins. Per-origin path walking then becomes numpy
+    # fancy-indexing instead of a Python loop over edges. For path-first
+    # workloads (utility, logsum, road stress) this is the dominant
+    # speed-up vs the pre-vectorisation per-origin path walker.
+    edge_cache = _precompute_edge_arrays(graph, weight, edge_aggregations, dtype)
+    node_cache = (_precompute_node_arrays(graph, node_aggregations, dtype)
+                  if node_aggregations else None)
+
     def _paths(orig, sub_dests):
         if zero_edge:
             return [[orig] if d == orig else [] for d in sub_dests]
@@ -798,13 +902,9 @@ def tiered_path_aggregate(
             active_dests = dests[active_idx]
 
         paths = _paths(orig, active_dests)
-        sub_costs, sub_aggs = aggregate_along_paths(
-            paths,
-            graph,
-            weight,
-            edge_aggregations=edge_aggregations,
-            node_aggregations=node_aggregations,
-            dtype=dtype,
+        sub_costs, sub_aggs = _walk_paths_with_arrays(
+            paths, edge_cache, node_cache,
+            edge_aggregations, node_aggregations, dtype,
         )
         cost_arr[active_idx] = sub_costs
         for name in names:
