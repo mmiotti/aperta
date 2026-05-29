@@ -5,7 +5,7 @@
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![license](https://img.shields.io/github/license/mmiotti/aperta.svg)](LICENSE)
 
-A Python toolkit for **cross-modal accessibility analysis on transport networks** — routing, distance/time computation, and gravity-/utility-/logsum-based accessibility metrics on `networkx` graphs (routed via `scipy.sparse.csgraph`).
+A Python toolkit for **cross-modal accessibility analysis on transport networks** — routing, distance/time computation, utility-based travel costs, and gravity- and logsum-based accessibility metrics on `networkx` graphs (routed via `scipy.sparse.csgraph`).
 
 The name is Latin/Italian for *open* — the condition that accessibility, at root, measures.
 
@@ -38,27 +38,16 @@ python -m unittest discover -s tests -t .
 
 ## Workflow
 
-aperta is organised around a six-phase workflow. Every module slots into one of these phases.
+aperta is organised around a six-phase workflow. Phases 4 and 5's calibration sub-step are optional; the rest is the minimum end-to-end pipeline.
 
-1. **Load and prepare data** — networks (per mode), land-use rasters and points.
-2. **Map data to units + compute shared features** — build the `cells → zones` aggregation hierarchy; snap geo units to network nodes via `network_processing.snap_to_network_nodes` / `assign_to_eligible_centroid`; sample topography rasters (`topography.fetch_copernicus_dem` + `geo_processing.sample_raster_at_points`); compute per-node density via `geo_processing.cross_sum_within_radius`.
-3. **Build sparse OD pairs** — `od_pairs.get_pairs` returns a `TieredODNodePairs` with three tiers (`cells_to_cells` / `cells_to_zones` / `zones_to_zones`, node-keyed) — the middle tier preserves per-cell origin precision at zone-aggregated dest cost. Lift to `TieredODGeoPairs` (cell/zone-keyed) via `od_pairs.reindex_by_geo_unit` for cross-modal alignment.
-4. **Estimate traffic flows** — `traffic_flows.nested_node_sample` + betweenness via `network_processing.get_*_betweenness*`. Optional calibration against observed counters via `calibration.snap_counters_to_edges` + `calibration.evaluate_against_counters`.
-5. **Estimate travel costs** — `routing.tiered_path_costs` / `routing.tiered_path_aggregate` (Dijkstra on any networkx graph) + `overhead.add_node_overheads` / `add_geo_overheads` / `add_origin_cell_overhead`. Optional calibration of per-edge weights against observed travel times via `calibration.calibrate_edge_weights`. Plus `utility.route_utility` / `add_endpoint_utility` for utility-based costs.
-6. **Calculate accessibilities** — `accessibility.cumulative_opportunities`, `accessibility.gravity`, `accessibility.nearest_k`. Cross-modal: `od_pairs.aggregate_across_modes` on per-mode `TieredODGeoPairs`, then any accessibility primitive on the combined ODM.
+1. **Load and prepare data** — networks (one per mode), land use, topography, optional ground-truth data (traffic counters, travel-survey times).
+2. **Map data to units** — aggregate source data into the `cells → zones` hierarchy; snap geo units to network nodes.
+3. **Build sparse OD pairs** — the tiered OD structure (three distance tiers) with per-cell origins at near range and zone-aggregated destinations at far range, keeping per-origin compute bounded independently of network extent.
+4. **(Optional) Estimate traffic flows** — sampled betweenness centrality; optionally calibrate against observed counter data.
+5. **Estimate travel costs** — shortest paths on the routing graph plus per-cell trip overheads. Optionally: utility-based generalised costs and edge-weight calibration against observed travel times.
+6. **Calculate accessibilities** — cumulative-opportunity, gravity, nearest-k, logsum (and cross-modal aggregation across per-mode results).
 
-### Where to see each phase in the examples
-
-The extended example splits its prep across five notebooks and its analysis across three; each analysis notebook stands alone (no cross-dependencies). The minimal and walkthrough examples each do the whole workflow in one notebook (at different depths).
-
-| Phase | In `examples/extended/` |
-|---|---|
-| 1. Load and prepare data | [prep/1_download.ipynb](examples/extended/prepare/1_download.ipynb), [prep/2_dasymetric_employment.ipynb](examples/extended/prepare/2_dasymetric_employment.ipynb) |
-| 2. Map data to units + features | [prep/3_unit_mapping.ipynb](examples/extended/prepare/3_unit_mapping.ipynb), [prep/4_topography.ipynb](examples/extended/prepare/4_topography.ipynb), [prep/5_density.ipynb](examples/extended/prepare/5_density.ipynb) |
-| 3. Build sparse OD pairs | first cells of [accessibility.ipynb](examples/extended/accessibility.ipynb) and [traffic_flows.ipynb](examples/extended/traffic_flows.ipynb) — each builds for its own use |
-| 4. Estimate traffic flows | [traffic_flows.ipynb](examples/extended/traffic_flows.ipynb) |
-| 5. Estimate travel costs | [calibrate_edge_weights.ipynb](examples/extended/calibrate_edge_weights.ipynb) (calibrates the model); each analysis notebook applies edge times inline |
-| 6. Calculate accessibilities | [accessibility.ipynb](examples/extended/accessibility.ipynb) |
+See the [Modules](#modules) table below for which module covers each phase, and the [API reference](https://aperta.readthedocs.io/) for the specific functions.
 
 Runnable examples, in increasing depth:
 
@@ -139,7 +128,7 @@ Runnable end-to-end version (with plotting): [examples/minimal/accessibility.ipy
 
 What aperta is:
 
-- **Path-first.** Every routing call returns the realised route alongside the OD travel cost as a single primitive — so any per-edge or per-node attribute (gradient, perceived safety, surface type, air-pollution exposure, road stress, ...) can be aggregated along each route in the same pass. This is the architectural prerequisite for utility-based travel costs, logsum accessibility, joint accessibility-and-exposure assessment, route-aware infrastructure-quality metrics, and any other analysis that depends on what happens *along* the route, not just at its endpoints.
+- **Path-first.** Every routing call returns the realised route alongside the OD travel cost as a single primitive — so any per-edge or per-node attribute (gradient, perceived safety, surface type, air-pollution exposure, road stress, ...) can be aggregated along each route in the same pass. This is the architectural prerequisite for utility-based travel costs, joint accessibility-and-exposure assessment, route-aware infrastructure-quality metrics, and any other analysis that depends on what happens *along* the route, not just at its endpoints.
 - **Cross-modal.** Mode and network are orthogonal: one network per mode, where "mode" generalises to any independently-varying network — walking vs cycling vs driving, but also day-time vs night-time street access, congested vs free-flow edge weights, with vs without a proposed bike-lane scenario. Cross-mode aggregation (`min`, `logsum`) over per-network cost ODMs is a first-class operation. Logsum aggregation closes the utility loop — discrete-choice-consistent accessibility across modes from per-mode utilities.
 - **Multi-scale by construction.** The tiered cells / zones / three-distance-tier OD structure bounds per-origin computation independently of the network's geographic extent. Country-scale reach without country-scale destination counts; intermediate cost matrices stay small enough to persist to disk and share.
 - **Live-graph routing.** Shortest paths run on the graph directly via `scipy.sparse.csgraph.dijkstra` — no precomputed routing index. Per-query routing is slower than contraction-hierarchy-based tools (OSRM, Pandana/pandarm), but edge-weight changes are immediate, which is what makes iterative calibration, traffic-flow estimation, and scenario comparison practical. Edge weights are written by plain Python callables; no Lua / YAML / JSON profile format to learn.
@@ -155,6 +144,16 @@ Aperta deliberately doesn't try to do everything in-house. Two interoperability 
 
 - **Public transit via R5.** Aperta has no native public-transit support right now (no GTFS reader, no RAPTOR-style time-dependent routing). Anything that can be expressed as a `networkx` graph with appropriate edge weights — including simplified transit-as-graph models — will route in aperta like any other network. For full GTFS-based transit routing (calendars, transfers, frequency-based services), the pragmatic pattern is to compute the transit OD cost matrix with [R5](https://github.com/conveyal/r5) (via [r5py](https://r5py.readthedocs.io/)), align its origins/destinations to the same cell layer aperta uses, and feed the resulting per-mode cost ODM into `od_pairs.aggregate_across_modes` alongside the walk / cycle / car ODMs computed by aperta. The cross-modal aggregation proceeds identically whether each per-mode ODM came from aperta's router or elsewhere.
 - **Faster cost-only routing via Pandana/pandarm.** Aperta's live-graph routing is the right trade-off for path-first, iterative, and scenario-comparative workloads, but for one-shot cost-only accessibility on a large fixed network, contraction-hierarchy backends like [Pandana](https://udst.github.io/pandana/) (and its recent modernized fork pandarm) route faster per query. The calibrated edge weights produced by `calibration.calibrate_edge_weights` are plain per-edge attributes on the `networkx` graph and transfer cleanly to a Pandana/pandarm network built from the same OSM extract — i.e., you can calibrate edge weights in aperta and then route with them in Pandana/pandarm.
+
+## Engineering
+
+- **CI**: full test suite runs on Python 3.11 / 3.12 / 3.13 (every push + PR), alongside [Ruff](https://github.com/astral-sh/ruff) (lint + format) and mypy (type checking).
+- **Tests**: ~310 test methods across 13 files. The end-to-end integration test ([tests/test_workflow.py](tests/test_workflow.py)) doubles as a runnable minimal example (~150 lines).
+- **API**: small, parsimonious surface; functions take the minimum arguments needed with sensible defaults. Most of the codebase is type-annotated.
+- **Layout**: `src/` layout prevents accidental local-source imports and catches "works on my machine" bugs early.
+- **License**: MIT.
+- **Dependencies**: core install pulls in only the standard scientific-Python stack; domain extras (`aperta[osm]`, `aperta[topo]`, `aperta[h3]`) keep the core lightweight.
+- **Docs**: Sphinx-based API reference hosted on [ReadTheDocs](https://aperta.readthedocs.io/).
 
 ## Contributing
 
