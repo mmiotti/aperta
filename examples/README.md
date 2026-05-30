@@ -1,4 +1,4 @@
-# Aperta examples
+# aperta examples
 
 Three tiers, in increasing depth.
 

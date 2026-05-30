@@ -1,6 +1,6 @@
 # API reference
 
-Aperta is organised as a flat collection of algorithm modules. Each module
+Aperta is organized as a flat collection of algorithm modules. Each module
 focuses on one phase of the six-phase accessibility workflow and operates
 on plain `numpy` / `pandas` / `networkx` inputs without any framework
 scaffold.

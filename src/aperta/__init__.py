@@ -36,10 +36,10 @@ The library is organized around a six-phase workflow:
 All algorithm modules (`od_pairs`, `routing`, `overhead`, `accessibility`,
 `utility`, `traffic_flows`, `geo_processing`, `geo_mapping`,
 `network_processing`, `visualization`, `osm_helpers`, `calibration`,
-`topography`) operate on plain numpy / pandas / networkx inputs — no
+`topography`, `errors`) operate on plain numpy / pandas / networkx inputs — no
 filesystem assumptions, no opinionated project structure.
 See `tests/test_workflow.py` for the ~150-line end-to-end toy-world
-example, `examples/minimal/accessibility.ipynb` for a ~40-line OSM
+example, `examples/minimal/accessibility.ipynb` for a ~50-line OSM
 quickstart, `examples/walkthrough/accessibility.ipynb` for the full
 guided tour, and `examples/extended/` for a multi-notebook showcase
 with published-paper calibration (Bern + 40 km).
@@ -58,3 +58,13 @@ Key types:
   - `utility.Utility`         — linear utility spec (constant + cost + route
                                 + origin + destination feature coefficients).
 """
+
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
+
+try:
+    __version__ = _pkg_version("aperta")
+except PackageNotFoundError:  # running from a source tree without install
+    __version__ = "0.0.0+unknown"
+
+__all__ = ["__version__"]

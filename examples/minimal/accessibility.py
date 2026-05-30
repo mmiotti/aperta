@@ -16,7 +16,7 @@
 # %% [markdown]
 # # Aperta minimal example
 #
-# Walkable supermarkets in Cambridge, MA — end-to-end in ~40 lines using
+# Walkable supermarkets in Cambridge, MA — end-to-end in ~50 lines using
 # only OpenStreetMap. Runs in ~10–15 s on a laptop.
 #
 # Every aperta primitive is exercised exactly once, with no commentary.

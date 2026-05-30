@@ -10,7 +10,7 @@ A Python library for routing, distance/time computation, and gravity- /
 utility- / logsum-based accessibility metrics on
 [NetworkX](https://networkx.org/) graphs (routed via
 [`scipy.sparse.csgraph`](https://docs.scipy.org/doc/scipy/reference/sparse.csgraph.html)).
-Designed around a path-first routing primitive that returns the realised
+Designed around a path-first routing primitive that returns the realized
 route alongside the OD travel cost, enabling utility-based accessibility,
 cross-modal logsum, and per-route feature aggregation as first-class
 operations.
