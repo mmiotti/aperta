@@ -166,6 +166,7 @@ print(result.iter_log.round(4).to_string())
 # ## 5. Observed vs predicted
 
 # %%
+import _figures as figures   # noqa: E402
 fig, axes = plt.subplots(1, 2, figsize=(13, 6))
 
 # Scatter
@@ -191,6 +192,7 @@ ax.set_ylabel('Predicted − observed (s)')
 ax.set_title('Residual vs distance')
 
 plt.tight_layout()
+figures.save_figure(fig, 'calibration_scatter', ext='pdf')
 plt.show()
 
 
@@ -212,6 +214,66 @@ edges_gdf[['length', 'speed_kph', result.edge_duration_attr, 'geometry']].to_fil
     PREPARED_DIR / 'car_edges_calibrated.gpkg', driver='GPKG',
 )
 print(f"Wrote calibrated graph + edge layer to {PREPARED_DIR}/.")
+
+
+# %% [markdown]
+# ## 7. Visualise — per-edge effective speed (calibrated)
+#
+# Duration is what the calibration fit and what downstream routing
+# consumes, but **speed** (km/h) is the more intuitive visual: it
+# spreads roads across a familiar 5–120 km/h scale and the colours
+# read as "fast highway" vs "slow congested intersection". For each
+# edge:
+#
+# ```
+# speed_kph = length_m / duration_calibrated_s × 3.6
+# ```
+#
+# So intersections and signalised crossings (where calibration added
+# additive seconds) appear as locally slower edges even on a road that
+# OSM tags as a fast through-route — exactly the effect that makes
+# `duration_calibrated` more realistic than the OSM-`maxspeed` baseline.
+#
+# The same numbers live on `car_graph_calibrated.graphml` (see §6) —
+# downstream consumers can read them per edge from the file directly.
+# Inline computation here so the formula is visible.
+
+# %%
+# Project-local figure helpers (network map + standardised paper-figure
+# crop). Same centre + 20×20 km extent as the other paper figures.
+import _figures as figures   # noqa: E402
+
+PAPER_CROP_CENTER_XY = (2_599_000, 1_200_500)
+PAPER_CROP_HALF_M    = 15_000
+
+speed_calibrated_kph = {
+    (u, v, k): float(d['length']) / float(d[result.edge_duration_attr]) * 3.6
+    for u, v, k, d in car_graph.edges(keys=True, data=True)
+    if float(d[result.edge_duration_attr]) > 0
+}
+_speeds = np.array(list(speed_calibrated_kph.values()))
+print(f"Calibrated edge speeds (km/h): "
+      f"median {np.median(_speeds):.1f}, "
+      f"P5–P95 [{np.quantile(_speeds, 0.05):.1f}, "
+      f"{np.quantile(_speeds, 0.95):.1f}], "
+      f"max {_speeds.max():.0f}")
+
+fig, ax = plt.subplots(figsize=(7, 6.5))
+figures.plot_network_map(
+    ax, car_graph, speed_calibrated_kph,
+    cmap='YlGnBu',                  # low = slow, high = fast
+    vmin=10, vmax=90,
+    cbar_label='effective speed (km/h, including intersections)',
+    title='Calibrated per-edge average effective speed (peak hours)',
+    xlim=(PAPER_CROP_CENTER_XY[0] - PAPER_CROP_HALF_M,
+          PAPER_CROP_CENTER_XY[0] + PAPER_CROP_HALF_M),
+    ylim=(PAPER_CROP_CENTER_XY[1] - PAPER_CROP_HALF_M,
+          PAPER_CROP_CENTER_XY[1] + PAPER_CROP_HALF_M),
+    basemap=True, crs=CRS_METRIC,
+)
+plt.tight_layout()
+figures.save_figure(fig, 'calibrated_edge_speed_map')
+plt.show()
 
 
 # %% [markdown]

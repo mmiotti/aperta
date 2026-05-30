@@ -218,6 +218,7 @@ def run_aperta_tiered(graph, time_attr, cells, zones, node_col,
     pairs_geo, costs_geo = od_pairs.reindex_by_geo_unit(
         pairs, costs, cells,
         cell_node_column=node_col, zones=zones, zone_node_column=node_col,
+        r_cells=r_cells_m, r_medium=r_medium_m, r_zones=r_zones_m,
     )
     w_geo = od_pairs.dest_values_geo(WEIGHT_COL, pairs_geo, cells, zones=zones)
     accessibility.cumulative_opportunities(

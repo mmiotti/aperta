@@ -8,7 +8,7 @@
 #       format_name: percent
 #       format_version: '1.3'
 #   kernelspec:
-#     display_name: Python 3 (ipykernel)
+#     display_name: aperta
 #     language: python
 #     name: python3
 # ---
@@ -73,7 +73,6 @@ from aperta import (
     od_pairs,
     overhead,
     routing,
-    utility,
     visualization as viz,
 )
 
@@ -85,10 +84,132 @@ CRS_METRIC = 'EPSG:2056'
 
 # === Plot retargeting knobs =================================================
 # Keep in sync with `SEED_LOCATION` / `LOCATION_LABEL` in `prepare/1_download.py`.
-# The crop is used by the per-mode / cross-modal map sections at the end.
+#   - CITY_NAME: source of the city-shape outline in §9/12/13, fetched
+#     unsmoothed from OSM (preserves the actual municipal boundary).
+#   - CITY_CROP_*: square crop window each results panel renders into —
+#     centred on `CITY_CROP_CENTER_XY`, `CITY_CROP_HALF_M` wide on each
+#     side. The polygon extends beyond the crop on the western side;
+#     that's fine, the crop trims it visually at the panel edge.
+#   - NEIGHBORHOOD_*: building-level deep-zoom in §14.
 LOCATION_LABEL = 'Bern'
-MAP_CROP_CENTER_XY = (2_600_000, 1_199_000)   # LV95; centred on Bern
-MAP_CROP_HALF_M = 3_500                        # 7 × 7 km window
+CITY_NAME = 'Bern, Switzerland'
+# Viewport east + north of station so the city silhouette sits in the
+# lower-left of the panel (Bern extends NE → SW; this framing keeps
+# the silhouette centred visually while showing more open countryside
+# to the NE).
+CITY_CROP_CENTER_XY = (2_600_800, 1_200_400)
+CITY_CROP_HALF_M = 3_750                           # approx. 7.5x7.5 km square window
+NEIGHBORHOOD_CENTER_XY = (2_600_000, 1_199_600)   # LV95; central Bern (Bundeshaus)
+NEIGHBORHOOD_HALF_M = 700                          # 1.4 × 1.4 km window
+# ============================================================================
+
+
+# %% [markdown]
+# ## Model coefficients and parameters
+#
+# Lifted here for one-stop tuning. Display labels (mode / destination
+# names) and figure-specific layout knobs stay near the sections that
+# use them.
+
+# %%
+# === Routing ================================================================
+# Per-mode OD-tier radii (CRS-units, metres). Faster modes reach further
+# → larger `r_zones`. cells_to_cells handles close pairs at full cell
+# resolution; zones aggregate far destinations.
+TIER_CUTOFFS = {
+    'walk': dict(r_cells=1_000.0, r_medium=2_000.0,  r_zones=5_000.0),
+    'bike': dict(r_cells=1_000.0, r_medium=5_000.0,  r_zones=25_000.0),
+    'car':  dict(r_cells=1_000.0, r_medium=10_000.0, r_zones=100_000.0),
+}
+# Per-mode route-time floor applied BEFORE overhead is added — both
+# in §7 (for §8 nearest-k) and §12 (for utility logsum). Reflects the
+# minimum sensible node-to-node trip cost, a trade-off accepted because
+# consolidated networks lack nodes mid-edge: cells whose centroid snaps
+# to the same network node have route(snap_A, snap_B) = 0, regardless
+# of how far apart the centroids actually are. Without this floor,
+# gravity-based metrics (logsum) get visible "islands" at high-multi-cell
+# snap-nodes where weight aggregates and exp(-β·0) maxes out.
+#
+# Per-mode values reflect network density: walk is dense (~1.5 cells/
+# snap-node avg → 60 s floor catches the rare snap-coincidence cases);
+# bike is intermediate but residential streets still share snap-nodes;
+# car is sparsest (~4.8 cells/snap-node avg, max 352 cells at one node
+# in Bern, 2k+ aggregated jobs) so a more aggressive floor is needed.
+# Cars also rarely make sub-2-min trips in practice — the floor matches
+# behavioural reality.
+MIN_ROUTE_S = {
+    'walk':         60.0,
+    'bike_regular': 300.0,
+    'car_offpeak':  300.0,
+}
+
+# === Trip overhead (first/last-mile, per mode) ==============================
+# overhead_s = constant + density × density_norm + snap_dist_<mode> / speed
+# `constant` + `density` from Miotti et al. (Transportation, 20XX);
+# `snap_dist_s_per_m` added to penalise cells far from the network
+# (avoids artificial bright spots from cells right ON the network).
+WALK_SPEED_MS     = 1.4    # ~5 km/h
+BIKE_SPEED_MS     = 5.0    # ~18 km/h, matches the bike-graph base speed
+CAR_FIRST_MILE_MS = 5.0    # parking-zone speed, NOT the driving speed
+OVERHEAD_COEF = {
+    'walk':         {'const': 50, 'density':   0, 'snap_dist_s_per_m': 1 / WALK_SPEED_MS},
+    'bike_regular': {'const': 70, 'density':  60, 'snap_dist_s_per_m': 1 / BIKE_SPEED_MS},
+    'car_offpeak':  {'const': 50, 'density': 120, 'snap_dist_s_per_m': 1 / CAR_FIRST_MILE_MS},
+}
+
+# === Utility coefficients (per-mode discrete-choice spec) ===================
+# U_ijm = β_asc
+#       + β_time      · t_min                       (linear time, per min)
+#       + β_time_log  · ln(t_min)                   (diminishing marginal cost)
+#       + β_density   · mean(density_norm) along route
+#       + β_bike_score· mean(bike_score)   along route
+# `t_min` is the total cell-to-cell time including per-cell overhead
+# (computed in §12 from route cost + 2 × `overhead.linear_per_cell_overhead`),
+# so it's always > 0 — `ln(t_min)` doesn't need a floor here.
+# Approximations informed by an ongoing project; placeholders pending a
+# public reference.
+# UTILITY_COEF = {
+#     'walk':         {'asc':  0.0, 'time': -0.03, 'time_log': -2.5,
+#                      'density':  0.0,  'bike_score': 0.5},
+#     'bike_regular': {'asc': -4.0, 'time': -0.05, 'time_log': -1.5,
+#                      'density': -0.2, 'bike_score': 1.5},
+#     'car_offpeak':  {'asc': -6.1, 'time': -0.07, 'time_log': -0.9,
+#                      'density': -0.5,  'bike_score': 0.0},
+# }
+UTILITY_COEF = {
+    'walk':         {'asc':  0.0, 'time': -0.30, 'time_log': -0.0,
+                     'density':  0.0,  'bike_score': 0.0},
+    'bike_regular': {'asc': -4.0, 'time': -0.20, 'time_log': -0.0,
+                     'density': -0.0, 'bike_score': 0.0},
+    'car_offpeak':  {'asc': -6.0, 'time': -0.10, 'time_log': -0.0,
+                     'density': -0.0,  'bike_score': 0.0},
+}
+
+# === Accessibility metrics ==================================================
+# Per-destination K for time-based nearest-k (§8). Destination-type
+# specific (not mode-specific): groceries are picked from the nearest
+# few stores, employment from a much broader effective choice set.
+# Output: mean travel time over the first K weight-units.
+DEST_K = {
+    'employment_total':      2500,
+    'poi_errands_groceries':    3,
+    'poi_leisure_hiking':      10,
+}
+# Per-destination nest scale θ for utility logsum (§12/§13). Larger θ →
+# broader decay (many destinations contribute); smaller θ → sharper
+# decay (nearest dominate). Logsum = θ · ln Σ_j exp(U_ij/θ).
+DEST_NEST_SCALE = {
+    'employment_total':      5.0,
+    'poi_errands_groceries': 1.0,
+    'poi_leisure_hiking':    3.0,
+}
+
+# === Example route knobs (§11 path-aggregation showcase) ====================
+# §11 picks the cell whose centroid is nearest to EXAMPLE_ORIGIN_XY as
+# the example origin, then renders the K nearest grocery routes from
+# it on top of the per-cell aggregation map.
+EXAMPLE_ORIGIN_XY = (2_600_800, 1_199_800)   # in old town
+EXAMPLE_K_ROUTES  = 25
 # ============================================================================
 
 
@@ -142,6 +263,21 @@ ORIG_MASK = cells.geometry.centroid.within(aoi_polygon)
 print(f"\nOrigin cells: {ORIG_MASK.sum():,} of {len(cells):,} "
       f"({100 * ORIG_MASK.mean():.1f}%) inside AOI; "
       f"all {len(cells):,} remain valid destinations.")
+
+# %%
+# City polygon (for the silhouette outline in §9/12/13) and POI points
+# (for overlays on supermarket / hiking-POI panels). The polygon comes
+# from OSM via `osmnx.geocode_to_gdf`, unsmoothed — the actual municipal
+# boundary. The square crop window (see `CITY_CROP_*` above) trims the
+# polygon visually at panel edges; the western strip is cut off there.
+import _figures as figures   # noqa: E402  — project-local plot helpers
+
+CITY_POLYGON = figures.fetch_city_polygon(
+    CITY_NAME, target_crs=CRS_METRIC, smooth=False,
+)
+pois = gpd.read_file(PREPARED_DIR / 'pois.gpkg')
+print(f"{CITY_NAME}: polygon area {CITY_POLYGON.area / 1e6:.1f} km²; "
+      f"{len(pois):,} POIs loaded.")
 
 
 # %% [markdown]
@@ -260,12 +396,7 @@ for label, graph, attr in [('walk', walk_graph, 'walk_time_s'),
 # the bottom of this notebook.
 
 # %%
-TIER_CUTOFFS = {
-    'walk': dict(r_cells=1_000.0, r_medium=2_000.0,  r_zones=5_000.0),
-    'bike': dict(r_cells=1_000.0, r_medium=5_000.0,  r_zones=25_000.0),
-    'car':  dict(r_cells=1_000.0, r_medium=10_000.0, r_zones=100_000.0),
-}
-
+# `TIER_CUTOFFS` defined at the top of this notebook.
 PAIRS = {}
 for label, graph in [('walk', walk_graph),
                      ('bike', bike_graph),
@@ -381,6 +512,7 @@ for net_label in ('walk', 'bike', 'car'):
         PAIRS[net_label], PAIRS[net_label], cells,
         cell_node_column=node_col,
         zones=zones, zone_node_column=node_col,
+        **TIER_CUTOFFS[net_label],
     )
     dest_vals = {
         d: od_pairs.dest_values_geo(d, pairs_geo, cells, zones=zones)
@@ -398,6 +530,7 @@ for label, _, pairs, _, _, _ in ROUTING_PLAN:
         pairs, COSTS[label], cells,
         cell_node_column=node_col,
         zones=zones, zone_node_column=node_col,
+        **TIER_CUTOFFS[net_label],
     )
     GEO_PAIRS[label] = pairs_geo
     GEO_COSTS[label] = cost_geo
@@ -446,37 +579,47 @@ print(f"Per-cell density_norm: median {cells['density_norm'].median():.3f}, "
       f"max {cells['density_norm'].max():.3f}")
 
 # %%
-# Published overhead coefficients (Miotti et al., Transportation, 20XX).
-# One representative variant per mode for this showcase — see ROUTING_PLAN.
-OVERHEAD_COEF = {
-    # mode           const(orig)  const(dest)  density(orig)  density(dest)
-    'walk':         {'const': 49, 'density':   0},
-    'bike_regular': {'const': 74, 'density':  66},   # orig & dest density both 66 for bike
-    'car_offpeak':  {'const': 52, 'density': 128},   # orig & dest density differ in paper
-}
-# Per-paper dest_density values differ slightly from orig_density for some
-# modes (e.g. car_offpeak: orig 128, dest 153). Showcase uses one value per
-# mode for symmetry; production uses the full split.
+# `OVERHEAD_COEF` (incl. per-mode `snap_dist_s_per_m`) is defined at
+# the top of this notebook. Per-paper dest_density values differ
+# slightly from orig_density for some modes (e.g. car_offpeak: orig
+# 128, dest 153). Showcase uses one value per mode for symmetry;
+# production uses the full split.
 
 # %%
 # Bake the per-mode cell-tier overheads into each cost ODM.
 GEO_COSTS_WITH_OVERHEAD = {}
 for label, _, _, _, _, _ in ROUTING_PLAN:
     coef = OVERHEAD_COEF[label]
+    net_label = NETWORK_OF[label]   # 'walk' / 'bike' / 'car'
 
-    # Per-cell origin & destination overhead = constant + density * density_norm.
-    # No `snap_dist` term: cells are small, the contribution is minor, and the
-    # published-paper value isn't pinned down for our updated coefficient table.
+    # Per-cell origin & destination overhead = constant
+    #  + density × density_norm + snap_dist_s_per_m × snap_dist_<mode>.
     overhead_per_cell = overhead.linear_per_cell_overhead(
         cells, constant=coef['const'],
-        feature_coefficients={'density_norm': coef['density']},
+        feature_coefficients={
+            'density_norm':            coef['density'],
+            f'snap_dist_{net_label}':  coef['snap_dist_s_per_m'],
+        },
     )
 
     # Cell-tier overheads only. Middle / far tiers get nothing added
     # (the showcase doesn't aggregate dest overhead at coarser tiers —
     # see footer for what production does differently).
+    #
+    # Route time floored at 60 s BEFORE adding overhead — kills the
+    # snap-node-cluster boost (cell at snap node X gets near-zero cost
+    # to other cells at X; cells one node over get a tiny route cost +
+    # overhead; without flooring those two see very different totals
+    # and the in-cluster cells appear as artificial bright islands).
+    # After flooring, all sub-1-min routes look like 1-min routes,
+    # then overhead is added uniformly per origin/dest cell. The §8
+    # gravity floor that operated on cost+overhead never activated for
+    # bike/car (overheads alone exceed 120 s) — this earlier-stage
+    # floor handles all three modes.
+    cost_floored = routing.floor_intrazonal_costs(
+        GEO_COSTS[label], min_cost=MIN_ROUTE_S[label])
     GEO_COSTS_WITH_OVERHEAD[label] = overhead.add_geo_overheads(
-        GEO_COSTS[label], GEO_PAIRS[label],
+        cost_floored, GEO_PAIRS[label],
         origin_cell=overhead_per_cell,
         dest_cell=overhead_per_cell,
     )
@@ -485,59 +628,114 @@ for label, _, _, _, _, _ in ROUTING_PLAN:
 
 
 # %% [markdown]
-# ## 8. Per-mode gravity accessibility
+# ## 8. Per-mode nearest-k accessibility (travel time, in minutes)
 #
-# Exponential decay, one β per mode (rougher than per-mode × per-
-# destination but enough to compare modes side-by-side). Cost ODM
-# floored at 30 s so intrazonal self-pairs don't dominate.
+# `nearest_k` answers: *"how many minutes does it typically take to
+# reach the K nearest opportunities of type X from this cell?"* Direct,
+# intuitive units (minutes); destination-type-specific K reflects how
+# many opportunities of that type a typical traveller would consider
+# substitutable.
+#
+# K values are destination-type-specific (not mode-specific):
+#
+# | Destination          |    K | Rationale                                |
+# |----------------------|-----:|------------------------------------------|
+# | Groceries (POIs)     |    3 | People go to the nearest few              |
+# | Hiking POIs          |   10 | Some interchangeability, not too many     |
+# | Employment (jobs)    | 5000 | Many jobs are realistic options           |
+#
+# Output: mean travel time (in minutes) over the first K weight-units.
+# NaN where total reachable weight at an origin < K (e.g. walking can't
+# reach 5000 jobs from a peripheral cell — those cells show as missing
+# on the map, an honest "out of range" answer).
+#
+# Time floor on the route is set in §7 (60 s), so intrazonal /
+# snap-node-coincidence pairs don't get a free arbitrarily-fast
+# contribution.
 
 # %%
-# Per-mode decay parameters — half-decay around (walk 2.3 min, bike 3.9 min,
-# car 5.8 min). Quick first pass; per-destination tuning comes later.
-DECAYS = {
-    'walk':         accessibility.exp_decay('walk',         0.005),
-    'bike_regular': accessibility.exp_decay('bike_regular', 0.003),
-    'car_offpeak':  accessibility.exp_decay('car_offpeak',  0.002),
-}
-
-ACC = {}  # (variant_label, destination) -> per-cell pd.Series
+# `DEST_K` defined at the top of this notebook.
+ACC = {}  # (variant_label, destination) -> per-cell pd.Series (minutes)
 for label, _, _, _, _, _ in ROUTING_PLAN:
     net_label = NETWORK_OF[label]
     _, dest_vals = REINDEXED[net_label]
-    cost_floored = routing.floor_intrazonal_costs(
-        GEO_COSTS_WITH_OVERHEAD[label], min_cost=30.0)
-    result = accessibility.gravity(
-        cost_floored, dest_vals, CELL_TO_ZONE, [DECAYS[label]],
-    )
     for d in DESTINATIONS:
-        ACC[(label, d)] = result[(label, d)]
-        s = ACC[(label, d)]
-        print(f"  {label:14s} × {d:24s}: "
-              f"median {s.median():>10,.1f}  "
-              f"P95 {s.quantile(0.95):>10,.1f}")
+        k = DEST_K[d]
+        # `cost_mean` aggregator: mean cost over the first K weight-units.
+        result = accessibility.nearest_k(
+            GEO_COSTS_WITH_OVERHEAD[label], {d: dest_vals[d]},
+            CELL_TO_ZONE, ks=[k],
+        )
+        # Cost is in seconds; convert to minutes for display.
+        ACC[(label, d)] = result[(k, d)] / 60.0
+        s = ACC[(label, d)].loc[ORIG_MASK].dropna()
+        n_total = ORIG_MASK.sum()
+        n_finite = len(s)
+        print(f"  {label:14s} × {d:24s} (k={k:>4d}): "
+              f"median {s.median():>5.1f} min  "
+              f"P95 {s.quantile(0.95):>5.1f} min  "
+              f"({n_finite:,}/{n_total:,} origins have ≥k reachable)")
 
 
 # %% [markdown]
-# ## 9. Per-mode maps (3 modes × 3 destinations)
+# ## 9. Per-mode maps (3 modes × 3 destinations) — nearest-k mean time
 #
-# Plot only origin cells (destination-only cells have no accessibility
-# value and would otherwise show as a grey halo). All maps are square,
-# framed, with a height-matched colour bar, and cropped to a square
-# window centred on `MAP_CROP_CENTER_XY` (set at the top of this notebook).
+# Each panel: mean travel time (minutes) to the nearest K opportunities
+# of that destination type, where K is the destination-type-specific
+# value from `DEST_K`. Colormap `viridis_r` so bright = short time =
+# good access; dark = long time = poor access. Missing cells (white)
+# are origins that can't reach K of that destination type with this mode.
 
 # %%
-import _figures as figures   # noqa: E402  — project-local plot helpers
-
 ORIG_CELLS = cells.loc[ORIG_MASK]
 
-fig, axes = plt.subplots(3, 3, figsize=(18, 18))
+
+def pois_overlay_for(destination: str):
+    """POI overlay dict for `plot_city_focus`, keyed so default styling
+    picks the right colour. None for non-POI destinations."""
+    if destination == 'poi_errands_groceries':
+        return {'groceries': pois[pois['poi_errands_groceries'] > 0]}
+    if destination == 'poi_leisure_hiking':
+        return {'hiking': pois[pois['poi_leisure_hiking'] > 0]}
+    return None
+
+
+# Display labels — used for shared row (mode) / column (destination)
+# headers across §9, §12, §13. Per-panel titles are suppressed so the
+# grid reads like a matrix.
+MODE_LABELS = {
+    'walk':         'Walk',
+    'bike_regular': 'Bike (regular)',
+    'car_offpeak':  'Car (off-peak)',
+}
+DEST_LABELS = {
+    'employment_total':      f"Employment  (k={DEST_K['employment_total']:,})",
+    'poi_errands_groceries': f"Groceries  (k={DEST_K['poi_errands_groceries']})",
+    'poi_leisure_hiking':    f"Hiking POIs  (k={DEST_K['poi_leisure_hiking']})",
+}
+
+
+fig, axes = plt.subplots(3, 3, figsize=(18.5, 16))
 for row, (label, _, _, _, _, _) in enumerate(ROUTING_PLAN):
     for col, d in enumerate(DESTINATIONS):
-        figures.plot_cell_map_cropped(
-            axes[row, col], ORIG_CELLS, ACC[(label, d)].loc[ORIG_MASK],
-            crop_center_xy=MAP_CROP_CENTER_XY, crop_half_m=MAP_CROP_HALF_M,
-            title=f'{label} × {d}')
-plt.tight_layout()
+        figures.plot_city_focus(
+            axes[row, col], CITY_POLYGON, cells, ACC[(label, d)],
+            pois=pois_overlay_for(d),
+            crop_center_xy=CITY_CROP_CENTER_XY, crop_half_m=CITY_CROP_HALF_M,
+            cmap='viridis_r',   # bright = short time = better access
+            title='',
+            label='min',
+        )
+        if row == 0:
+            axes[row, col].set_title(DEST_LABELS[d], pad=8)
+plt.subplots_adjust(wspace=0.13, hspace=0.04)
+# Row labels via fig.text — using set_ylabel doesn't survive the
+# divider-colorbar pattern reliably; figure-coord text always renders.
+for row, (label, _, _, _, _, _) in enumerate(ROUTING_PLAN):
+    pos = axes[row, 0].get_position()
+    fig.text(pos.x0 - 0.012, (pos.y0 + pos.y1) / 2, MODE_LABELS[label],
+             rotation=90, va='center', ha='center', fontsize=figures.LABEL_SIZE)
+figures.save_figure(fig, 'accessibility_nearest_k_time')
 plt.show()
 
 
@@ -555,11 +753,18 @@ plt.show()
 #
 # ```
 # U_ijm = β_asc
-#       + β_time      · t_ijm / 60                       (linear time, in min)
-#       + β_time_log  · ln(t_ijm / 60)                   (diminishing marginal cost)
-#       + β_density   · mean(density_norm)  along route  (per-edge density)
-#       + β_bike_score· mean(bike_score)    along route  (per-edge quietness)
+#       + β_time      · t_min                           (linear time, in min)
+#       + β_time_log  · ln(t_min)                       (diminishing marginal cost)
+#       + β_density   · mean(density_norm)  along route (per-edge density)
+#       + β_bike_score· mean(bike_score)    along route (per-edge quietness)
 # ```
+#
+# `t_min` is the **total cell-to-cell travel time** in minutes —
+# `(route_time + origin_overhead + dest_overhead) / 60`, where overheads
+# are the per-cell first/last-mile from §7. §12 computes it explicitly
+# before plugging into the utility formula. Because overhead is always
+# positive (≥ 49 s walk, ≥ 74 s bike, ≥ 52 s car, plus snap-distance),
+# `t_min > 0` always — the `ln(t_min)` term doesn't need a floor.
 #
 # `bike_score` is a per-edge quietness score from 1 (busy primary) to 5
 # (cycleway / pedestrian / quiet path), computed inline below from
@@ -612,166 +817,395 @@ def edge_bike_score(u, v, data) -> float:
     return float(min(5, base + bonus))
 
 
-# Time coefficients are per minute, but edge times (`*_time_s`) are in
-# seconds — convert here so the rest of the pipeline reads naturally.
-# Both linear and log time enter as route features (no `cost_coefficient`
-# shortcut), so the per-minute unit is explicit in both aggregators.
-def time_minutes(arr: np.ndarray) -> float:
-    """Sum of per-edge times in minutes."""
-    return float(arr.sum() / 60.0) if arr.size else 0.0
+# `UTILITY_COEF` and `OVERHEAD_COEF` defined at the top of this notebook.
 
-def time_log_minutes(arr: np.ndarray) -> float:
-    """log of total path time in minutes. 0 for empty / zero paths so
-    intrazonal self-pairs don't blow up to log(0) = -inf."""
-    if arr.size == 0:
-        return 0.0
-    s = float(arr.sum())
-    return float(np.log(s / 60.0)) if s > 0 else 0.0
+def floor_all_tiers(costs, min_cost: float):
+    """Floor every finite cost in EVERY tier (cells_to_cells +
+    cells_to_zones + zones_to_zones) at `min_cost`. Stricter than
+    `routing.floor_intrazonal_costs`, which only touches cells_to_cells.
+
+    Why we need this for §12 utility: an origin cell whose snap node
+    coincides with a zone's snap node gets a 0-cost route to that
+    zone's aggregated weight (potentially thousands of jobs). The
+    library helper would leave that pair unfloored — and for car
+    networks (sparse) the cells_to_zones + zones_to_zones tiers carry
+    ~95% of the destination pairs, so flooring only cells_to_cells
+    makes barely a dent in the gravity sum."""
+    def _floor(tier):
+        if tier is None:
+            return None
+        out = {}
+        for origin, arr in tier.items():
+            new = np.asarray(arr).copy()
+            finite = np.isfinite(new)
+            new[finite] = np.maximum(new[finite], min_cost)
+            out[origin] = new
+        return out
+    return type(costs)(
+        cells_to_cells=_floor(costs.cells_to_cells),
+        cells_to_zones=_floor(costs.cells_to_zones),
+        zones_to_zones=_floor(costs.zones_to_zones),
+    )
 
 
-UTILITY_COEF = {
-    # mode          asc    time(/min) time_log  density   bike_score
-    'walk':         {'asc':  0.0, 'time': -0.01, 'time_log': -3.3,
-                     'density':  0.0,  'bike_score': 0.4},
-    'bike_regular': {'asc': -4.0, 'time': -0.02, 'time_log': -2.3,
-                     'density': -0.25, 'bike_score': 1.1},
-    'car_offpeak':  {'asc': -6.1, 'time': -0.07, 'time_log': -0.9,
-                     'density': -0.6,  'bike_score': 0.0},
-}
+def assemble_utility_from_total_time(
+    total_cost_geo, density_geo, bike_geo, coef,
+):
+    """Per-tier utility ODM from total cell-to-cell time + per-edge
+    route-feature aggregations along the realised path.
 
+    For each origin-destination cell pair::
 
-def build_utility_spec(label: str, time_attr: str) -> utility.Utility:
-    """Translate the per-mode coefficient dict into a `Utility` spec.
+        U = β_asc + β_time × t_min + β_time_log × ln(t_min)
+              + β_density × mean(density_norm) + β_bike_score × mean(bike_score)
 
-    Both time terms (linear and log) enter as `RouteFeature`s whose
-    aggregators return minutes — so the coefficients in `UTILITY_COEF`
-    are applied directly in their natural per-minute units.
+    where `t_min = total_cost_geo / 60` — total time in minutes including
+    network route + per-cell origin/dest first-mile overhead. Overhead
+    keeps `t_min > 0` always, so the `ln` term never explodes — no floor.
+
+    NaN convention:
+        - Unreachable destinations (cost = inf) → NaN utility.
+        - NaN per-edge feature aggregation at a reachable pair (e.g.
+          self-pair = empty path → mean of empty = NaN) → contributes 0,
+          matching `utility.route_utility`'s convention.
     """
-    c = UTILITY_COEF[label]
-    return utility.Utility(
-        constant=c['asc'],
-        route_features=[
-            utility.RouteFeature(
-                name='time_min', attribute=time_attr,
-                coefficient=c['time'], aggregator=time_minutes,
-            ),
-            utility.RouteFeature(
-                name='time_log_min', attribute=time_attr,
-                coefficient=c['time_log'], aggregator=time_log_minutes,
-            ),
-            utility.RouteFeature(
-                name='density_norm', attribute='density_norm',
-                coefficient=c['density'], aggregator='mean',
-            ),
-            utility.RouteFeature(
-                name='bike_score', attribute=edge_bike_score,
-                coefficient=c['bike_score'], aggregator='mean',
-            ),
-        ],
+    def _assemble_tier(tier_name):
+        cost_tier = getattr(total_cost_geo, tier_name)
+        if cost_tier is None:
+            return None
+        density_tier = getattr(density_geo, tier_name)
+        bike_tier    = getattr(bike_geo,    tier_name)
+        out = {}
+        for origin, cost_arr in cost_tier.items():
+            reachable = np.isfinite(cost_arr)
+            t_min = np.where(reachable, cost_arr / 60.0, np.nan)
+            density_arr = density_tier[origin]
+            bike_arr    = bike_tier[origin]
+            density_clean = np.where(reachable & np.isnan(density_arr), 0.0, density_arr)
+            bike_clean    = np.where(reachable & np.isnan(bike_arr),    0.0, bike_arr)
+            with np.errstate(invalid='ignore'):
+                u = (coef['asc']
+                     + coef['time']       * t_min
+                     + coef['time_log']   * np.log(t_min)
+                     + coef['density']    * density_clean
+                     + coef['bike_score'] * bike_clean)
+            out[origin] = u.astype(np.float32, copy=False)
+        return out
+
+    return od_pairs.TieredODGeoPairs(
+        cells_to_cells=_assemble_tier('cells_to_cells'),
+        cells_to_zones=_assemble_tier('cells_to_zones'),
+        zones_to_zones=_assemble_tier('zones_to_zones'),
     )
 
 
 # %% [markdown]
-# ## 11. Per-mode utility ODMs + logsums
+# ## 11. Per-edge features aggregated along realised routes
 #
-# Three steps per mode:
+# Path-first showcase, run BEFORE plugging into the utility
+# computation in §12. In a single routing pass,
+# `routing.tiered_path_aggregate` returns both the cost ODM and one
+# custom aggregation per registered `PathAggregation` — letting any
+# per-edge attribute be aggregated along the realised path with no
+# extra Dijkstra calls. The same machinery powers the `RouteFeature`s
+# in the utility spec (§10): §12 multiplies these aggregations by
+# `β_density` and `β_bike_score` to get utility contributions. Here
+# we plot the raw aggregations directly so the building blocks are
+# visible before they're weighted into utility units.
 #
-# 1. `utility.route_utility` — one routing pass returns the cost + all
-#    route-feature aggregations along realised paths, combined into
-#    per-OD route utility.
-# 2. `utility.add_endpoint_utility` — adds the ASC constant (no origin
-#    / destination features in this spec).
-# 3. Lift to geo-keyed form and bake in cell-tier overhead, converted
-#    to utility units via the linear time coefficient.
+# Two features, both averaged along bike routes from each origin cell
+# to grocery destinations:
+#
+# - **`bike_score`** — per-edge quietness (1 busy primary → 5 cycleway /
+#   pedestrian path). Tells you whether the typical bike trip from this
+#   origin uses pleasant infrastructure or fights traffic.
+# - **`density_norm`** — per-edge urban density. Tells you whether the
+#   typical bike trip goes through dense centres or quieter periphery.
+#
+# Per-origin aggregator: destination-weighted mean (weight = number of
+# groceries at each destination cell), so origins with one nearby
+# grocery + 50 far ones aren't dragged towards the far ones' route
+# characteristics. Restricted to the `cells_to_cells` tier — closer,
+# higher-resolution trips are the ones grocery-trip viewers actually
+# care about.
+
+# %%
+bike_pairs = PAIRS['bike']
+_, feat_aggs = routing.tiered_path_aggregate(
+    bike_pairs, bike_graph, weight='bike_time_s',
+    edge_aggregations=[
+        routing.PathAggregation('bike_score',   edge_bike_score,  'mean'),
+        routing.PathAggregation('density_norm', 'density_norm',   'mean'),
+    ],
+    mask=MASKS['bike'], cutoff=60 * 60,
+)
+
+
+def dest_weighted_mean_cells_tier(feat_odm, pairs, cells_df, value_column, node_column):
+    """Per-origin destination-weighted mean of a per-pair feature, using
+    the cells_to_cells tier only.
+
+    `value_column`: cells column whose value weights each destination
+    (e.g. POI counts). Multiple cells per snap-node are summed.
+    Returns a Series keyed by snap-node ID."""
+    node_to_val = cells_df.groupby(node_column)[value_column].sum().to_dict()
+    out = {}
+    for origin, dest_nodes in pairs.cells_to_cells.items():
+        f = feat_odm.cells_to_cells[origin]
+        w = np.fromiter((node_to_val.get(d, 0.0) for d in dest_nodes),
+                        dtype=float, count=len(dest_nodes))
+        valid = np.isfinite(f) & (w > 0)
+        if valid.any():
+            out[origin] = float((f[valid] * w[valid]).sum() / w[valid].sum())
+    return pd.Series(out, name='mean_along_routes')
+
+
+bike_score_by_node = dest_weighted_mean_cells_tier(
+    feat_aggs['bike_score'],   bike_pairs, cells, 'poi_errands_groceries', 'node_id_bike')
+density_by_node    = dest_weighted_mean_cells_tier(
+    feat_aggs['density_norm'], bike_pairs, cells, 'poi_errands_groceries', 'node_id_bike')
+# Snap-node → cell: multiple cells per node all inherit the same scalar.
+bike_score_per_cell = cells['node_id_bike'].map(bike_score_by_node.to_dict())
+density_per_cell    = cells['node_id_bike'].map(density_by_node.to_dict())
+print(f"bike_score (1–5) along routes: median {bike_score_per_cell.median():.2f}, "
+      f"P5–P95 [{bike_score_per_cell.quantile(0.05):.2f}, "
+      f"{bike_score_per_cell.quantile(0.95):.2f}]")
+print(f"density_norm   along routes: median {density_per_cell.median():.2f}, "
+      f"P5–P95 [{density_per_cell.quantile(0.05):.2f}, "
+      f"{density_per_cell.quantile(0.95):.2f}]")
+
+# %%
+# Pick a representative origin (somewhere in the central city) and K
+# RANDOM grocery destinations within the displayed crop box. Random
+# sampling — rather than nearest-K — spreads routes across the panel
+# so per-edge `bike_score` colouring is actually visible (nearest-K
+# would cluster all routes within a few blocks of the origin).
+import networkx as nx_for_paths
+from shapely.geometry import Point, box  # noqa: E402 — local imports
+# `EXAMPLE_ORIGIN_XY` and `EXAMPLE_K_ROUTES` defined at the top of this notebook.
+
+# Origin = the cell whose centroid is nearest to EXAMPLE_ORIGIN_XY.
+_origin_pt = Point(*EXAMPLE_ORIGIN_XY)
+_origin_cell_id = cells.geometry.centroid.distance(_origin_pt).idxmin()
+_origin_node = cells.loc[_origin_cell_id, 'node_id_bike']
+_origin_xy = (cells.loc[_origin_cell_id].geometry.centroid.x,
+              cells.loc[_origin_cell_id].geometry.centroid.y)
+
+# Reachability filter — Dijkstra from origin (cutoff matches §3).
+_costs_from_origin = nx_for_paths.single_source_dijkstra_path_length(
+    bike_graph, _origin_node, weight='bike_time_s', cutoff=15 * 60,
+)
+# Grocery cells inside the displayed crop AND reachable from the origin.
+_crop_box = box(
+    CITY_CROP_CENTER_XY[0] - CITY_CROP_HALF_M,
+    CITY_CROP_CENTER_XY[1] - CITY_CROP_HALF_M,
+    CITY_CROP_CENTER_XY[0] + CITY_CROP_HALF_M,
+    CITY_CROP_CENTER_XY[1] + CITY_CROP_HALF_M,
+)
+_reachable_nodes = set(_costs_from_origin)
+_groc_in_crop = cells[
+    (cells['poi_errands_groceries'] > 0)
+    & cells.geometry.centroid.within(_crop_box)
+    & cells['node_id_bike'].isin(_reachable_nodes)
+    & (cells['node_id_bike'] != _origin_node)
+]
+# Random K — deterministic via seeded sampling so the figure is reproducible.
+_n = min(EXAMPLE_K_ROUTES, len(_groc_in_crop))
+_sampled = _groc_in_crop.sample(n=_n, random_state=42)
+_dest_nodes = _sampled['node_id_bike'].tolist()
+_dest_xys = [(bike_graph.nodes[n]['x'], bike_graph.nodes[n]['y'])
+             for n in _dest_nodes]
+_paths = [nx_for_paths.shortest_path(bike_graph, _origin_node, d,
+                                     weight='bike_time_s')
+          for d in _dest_nodes]
+print(f"Example origin: cell {_origin_cell_id} (node {_origin_node}); "
+      f"{len(_paths)} random routes to groceries within the crop "
+      f"(of {len(_groc_in_crop):,} reachable grocery cells in-crop).")
+
+# %%
+# 1×3 — route example (left) | mean bike_score (middle) | mean density (right).
+fig, axes = plt.subplots(1, 3, figsize=(21, 6))
+figures.plot_routes_on_basemap(
+    axes[0], bike_graph, _paths, edge_bike_score,
+    cmap='RdYlGn', vmin=1, vmax=5,
+    crop_center_xy=CITY_CROP_CENTER_XY, crop_half_m=CITY_CROP_HALF_M,
+    origin_xy=_origin_xy, dest_xys=_dest_xys,
+    city_polygon=CITY_POLYGON, crs=cells.crs,
+    title=f'{EXAMPLE_K_ROUTES} bike routes from one cell to random groceries',
+    label='1 (busy primary) → 5 (cycleway)',
+)
+figures.plot_city_focus(
+    axes[1], CITY_POLYGON, cells, bike_score_per_cell,
+    cmap='RdYlGn', vmin=1, vmax=5,
+    crop_center_xy=CITY_CROP_CENTER_XY, crop_half_m=CITY_CROP_HALF_M,
+    title='Mean bike-score along bike routes to nearby groceries',
+    label='1 (busy primary) → 5 (cycleway)',
+)
+figures.plot_city_focus(
+    axes[2], CITY_POLYGON, cells, density_per_cell,
+    cmap='plasma',
+    crop_center_xy=CITY_CROP_CENTER_XY, crop_half_m=CITY_CROP_HALF_M,
+    title='Mean density along bike routes to nearby groceries',
+    label='Density (square root, normalized, 1 = 10,000/km²)',
+)
+plt.subplots_adjust(wspace=0.10)
+figures.save_figure(fig, 'accessibility_path_aggregation')
+plt.show()
+
+
+# %% [markdown]
+# ## 12. Per-mode utility ODMs + logsums
+#
+# Pipeline per mode:
+#
+# 1. **Route + per-edge feature aggregations** (`tiered_path_aggregate`):
+#    one routing pass yields the node-to-node cost ODM plus the per-pair
+#    `mean(density_norm)` and `mean(bike_score)` along the realised path.
+# 2. **Lift to geo** (`reindex_by_geo_unit`): cost + features become
+#    cell-keyed.
+# 3. **Total cell-to-cell time** (`overhead.add_geo_overheads`): add
+#    per-cell origin + destination overheads (in seconds) to the
+#    network route time. Result is the realistic door-to-door duration.
+# 4. **Assemble utility** (`assemble_utility_from_total_time`): apply
+#    the per-mode β coefficients to total time + route features. Both
+#    the linear and log time terms see the same total `t_min`, so
+#    overhead is handled consistently across all utility components
+#    (no separate "overhead-as-utility-penalty" step).
 #
 # **Per-mode logsum** = `ln Σ_j W_j · exp(U_ij)`, implemented as
 # gravity with a custom decay `Decay('exp_u', np.exp)` then `log` of
 # the result. Units are utils; less negative = better access.
-#
-# **Overhead caveat.** Per-cell overhead enters utility through the
-# linear `β_time` coefficient only — the `β_time_log` and per-edge
-# (`density`, `bike_score`) terms see the routed path only. For
-# typical tens-of-seconds overheads this is a small distortion; a
-# fully consistent treatment would add overhead to total time before
-# applying log.
 
 # %%
+# `DEST_NEST_SCALE` defined at the top of this notebook.
+
+def make_exp_u_decay(theta: float) -> accessibility.Decay:
+    """`Decay` that applies `exp(U / θ)` to per-OD utility values."""
+    return accessibility.Decay(
+        f'exp_u_theta{theta:.1f}',
+        lambda u, _t=theta: np.exp(u / _t),
+    )
+
+
 UTIL_GEO_PAIRS = {}     # label -> TieredODGeoPairs
 UTIL_GEO = {}           # label -> TieredODGeoPairs (utility values)
 LOGSUM_PER_MODE = {}    # (label, destination) -> per-cell pd.Series (utils)
 
-exp_utility_decay = accessibility.Decay('exp_u', np.exp)
-
 for label, graph, pairs, mask, time_attr, cutoff_s in ROUTING_PLAN:
     net_label = NETWORK_OF[label]
     node_col = f'node_id_{net_label}'
-    spec = build_utility_spec(label, time_attr)
+    ucoef  = UTILITY_COEF[label]
+    ohcoef = OVERHEAD_COEF[label]
 
-    # 1. Route + combine route-dependent utility components.
-    route_u = utility.route_utility(
-        pairs, graph, weight=time_attr, utility=spec,
+    # 1. Route + per-edge route-feature aggregations (density + bike_score).
+    costs, aggs = routing.tiered_path_aggregate(
+        pairs, graph, weight=time_attr,
+        edge_aggregations=[
+            routing.PathAggregation('density_norm', 'density_norm',  'mean'),
+            routing.PathAggregation('bike_score',   edge_bike_score, 'mean'),
+        ],
         mask=mask, cutoff=cutoff_s,
     )
-    # 2. Add the ASC constant.
-    full_u = utility.add_endpoint_utility(route_u, pairs, spec, cells=cells)
+    # 1a. Per-mode floor on route time, BEFORE overhead, across ALL
+    #     tiers — eliminates snap-node-coincidence "islands". The
+    #     library helper `floor_intrazonal_costs` only touches
+    #     cells_to_cells; for the utility logsum we need to floor
+    #     cells_to_zones + zones_to_zones too, since those tiers carry
+    #     most of the destination weight (and a cell-origin whose snap
+    #     node happens to equal a zone's snap node gets a 0-cost route
+    #     to that zone's aggregated weight — same artifact as cell-tier
+    #     snap-coincidence, just at a different tier).
+    costs = floor_all_tiers(costs, min_cost=MIN_ROUTE_S[label])
 
-    # 3. Lift to geo + bake per-cell overhead (in utils) at both endpoints.
-    pairs_geo, full_u_geo = od_pairs.reindex_by_geo_unit(
-        pairs, full_u, cells,
-        cell_node_column=node_col,
-        zones=zones, zone_node_column=node_col,
+    # 2. Lift cost + features to geo-keyed form.
+    pairs_geo, costs_geo = od_pairs.reindex_by_geo_unit(
+        pairs, costs, cells,
+        cell_node_column=node_col, zones=zones, zone_node_column=node_col,
+        **TIER_CUTOFFS[net_label],
     )
-    coef = OVERHEAD_COEF[label]
+    _, density_geo = od_pairs.reindex_by_geo_unit(
+        pairs, aggs['density_norm'], cells,
+        cell_node_column=node_col, zones=zones, zone_node_column=node_col,
+        **TIER_CUTOFFS[net_label],
+    )
+    _, bike_geo = od_pairs.reindex_by_geo_unit(
+        pairs, aggs['bike_score'], cells,
+        cell_node_column=node_col, zones=zones, zone_node_column=node_col,
+        **TIER_CUTOFFS[net_label],
+    )
+
+    # 3. Add per-cell origin + destination overhead (seconds) → total
+    #    cell-to-cell time. Keep `costs_geo` (node-to-node) around for any
+    #    downstream consumer; `total_costs_geo` is what utility sees.
     overhead_per_cell_s = overhead.linear_per_cell_overhead(
-        cells, constant=coef['const'],
-        feature_coefficients={'density_norm': coef['density']},
+        cells, constant=ohcoef['const'],
+        feature_coefficients={
+            'density_norm':            ohcoef['density'],
+            f'snap_dist_{net_label}':  ohcoef['snap_dist_s_per_m'],
+        },
     )
-    # Convert overhead seconds → utility units via `β_time` (per minute).
-    overhead_per_cell_u = UTILITY_COEF[label]['time'] * overhead_per_cell_s / 60.0
-    full_u_geo = overhead.add_geo_overheads(
-        full_u_geo, pairs_geo,
-        origin_cell=overhead_per_cell_u,
-        dest_cell=overhead_per_cell_u,
+    total_costs_geo = overhead.add_geo_overheads(
+        costs_geo, pairs_geo,
+        origin_cell=overhead_per_cell_s,
+        dest_cell=overhead_per_cell_s,
+    )
+
+    # 4. Assemble utility from total time + route features.
+    full_u_geo = assemble_utility_from_total_time(
+        total_costs_geo, density_geo, bike_geo, ucoef,
     )
     UTIL_GEO_PAIRS[label] = pairs_geo
     UTIL_GEO[label] = full_u_geo
 
-    # Per-mode logsum per destination.
+    # Per-mode logsum per destination. Each destination uses its own
+    # nest scale θ — sharp for groceries, broad for employment.
     _, dest_vals = REINDEXED[net_label]
-    grav = accessibility.gravity(
-        full_u_geo, dest_vals, CELL_TO_ZONE, [exp_utility_decay],
-    )
     for d in DESTINATIONS:
+        theta = DEST_NEST_SCALE[d]
+        decay = make_exp_u_decay(theta)
+        grav = accessibility.gravity(
+            full_u_geo, {d: dest_vals[d]}, CELL_TO_ZONE, [decay],
+        )
         with np.errstate(divide='ignore'):
-            ls = np.log(grav[('exp_u', d)])
-        # No-destination-reachable origins → log(0) = −∞; surface as NaN so
-        # downstream plot bounds aren't dragged to -inf.
+            ls = np.log(grav[(decay.name, d)]) * theta
+        # No-destination-reachable origins → log(0) = −∞; surface as NaN
+        # so downstream plot bounds aren't dragged to -inf.
         LOGSUM_PER_MODE[(label, d)] = ls.replace([-np.inf, np.inf], np.nan)
         s = LOGSUM_PER_MODE[(label, d)].loc[ORIG_MASK].dropna()
         if len(s):
-            print(f"  {label:14s} × {d:24s}: "
+            print(f"  {label:14s} × {d:24s} (θ={theta:.1f}): "
                   f"logsum median {s.median():>7.2f}  "
                   f"P95 {s.quantile(0.95):>7.2f}")
 
 
 # %% [markdown]
-# Per-mode logsum maps (3 modes × 3 destinations), same crop as §9.
+# Per-mode logsum maps (3 modes × 3 destinations), same city-shaped
+# clip as §9.
 
 # %%
-fig, axes = plt.subplots(3, 3, figsize=(18, 18))
+fig, axes = plt.subplots(3, 3, figsize=(18.5, 16))
 for row, (label, _, _, _, _, _) in enumerate(ROUTING_PLAN):
     for col, d in enumerate(DESTINATIONS):
-        figures.plot_cell_map_cropped(
-            axes[row, col], ORIG_CELLS,
-            LOGSUM_PER_MODE[(label, d)].loc[ORIG_MASK],
-            crop_center_xy=MAP_CROP_CENTER_XY, crop_half_m=MAP_CROP_HALF_M,
-            title=f'{label} × {d} — logsum')
-plt.tight_layout()
+        figures.plot_city_focus(
+            axes[row, col], CITY_POLYGON, cells,
+            LOGSUM_PER_MODE[(label, d)],
+            pois=pois_overlay_for(d),
+            crop_center_xy=CITY_CROP_CENTER_XY, crop_half_m=CITY_CROP_HALF_M,
+            title='',
+        )
+        if row == 0:
+            axes[row, col].set_title(DEST_LABELS[d], pad=8)
+plt.subplots_adjust(wspace=0.10, hspace=0.05)
+for row, (label, _, _, _, _, _) in enumerate(ROUTING_PLAN):
+    pos = axes[row, 0].get_position()
+    fig.text(pos.x0 - 0.012, (pos.y0 + pos.y1) / 2, MODE_LABELS[label],
+             rotation=90, va='center', ha='center', fontsize=figures.LABEL_SIZE)
+figures.save_figure(fig, 'accessibility_per_mode_logsum')
 plt.show()
 
 
 # %% [markdown]
-# ## 12. Cross-modal logsum
+# ## 13. Cross-modal logsum
 #
 # Combine the three per-mode utility ODMs via a utility-domain logsum
 # aggregator (`ln Σ_m exp(U_ijm)` per OD pair), then apply
@@ -810,22 +1244,77 @@ combined_dest_vals = {
     d: od_pairs.dest_values_geo(d, combined_pairs, cells, zones=zones)
     for d in DESTINATIONS
 }
-combined_grav = accessibility.gravity(
-    combined_u, combined_dest_vals, CELL_TO_ZONE, [exp_utility_decay],
-)
+# Per-destination nest scale on the destination logsum — same θ as in
+# §12 so the per-mode and cross-modal results are on the same scale.
 CROSS_LOGSUM = {}
 for d in DESTINATIONS:
+    theta = DEST_NEST_SCALE[d]
+    decay = make_exp_u_decay(theta)
+    grav = accessibility.gravity(
+        combined_u, {d: combined_dest_vals[d]}, CELL_TO_ZONE, [decay],
+    )
     with np.errstate(divide='ignore'):
-        ls = np.log(combined_grav[('exp_u', d)])
+        ls = np.log(grav[(decay.name, d)]) * theta
     CROSS_LOGSUM[d] = ls.replace([-np.inf, np.inf], np.nan)
 
 fig, axes = plt.subplots(1, 3, figsize=(18, 6))
 for col, d in enumerate(DESTINATIONS):
-    figures.plot_cell_map_cropped(
-        axes[col], ORIG_CELLS, CROSS_LOGSUM[d].loc[ORIG_MASK],
-        crop_center_xy=MAP_CROP_CENTER_XY, crop_half_m=MAP_CROP_HALF_M,
-        title=f'Cross-modal logsum (walk + bike + car) × {d}')
+    figures.plot_city_focus(
+        axes[col], CITY_POLYGON, cells,
+        CROSS_LOGSUM[d],
+        pois=pois_overlay_for(d),
+        crop_center_xy=CITY_CROP_CENTER_XY, crop_half_m=CITY_CROP_HALF_M,
+        title='',
+    )
+    axes[col].set_title(DEST_LABELS[d], pad=8)
+plt.subplots_adjust(wspace=0.10)
+pos = axes[0].get_position()
+fig.text(pos.x0 - 0.012, (pos.y0 + pos.y1) / 2,
+         'Cross-modal logsum\n(walk + bike + car)',
+         rotation=90, va='center', ha='center', fontsize=figures.LABEL_SIZE)
+figures.save_figure(fig, 'accessibility_cross_modal_logsum')
+plt.show()
+
+
+# %% [markdown]
+# ## 14. Neighborhood zoom — accessibility per building
+#
+# Cells are H3 res 10 (~130 m), so each cell aggregates a handful of
+# buildings. Joining the per-cell logsum back to the underlying building
+# layer (via `prepare/`'s `building_to_cell` mapping) lets us colour
+# every building by its cell's cross-modal accessibility — the same
+# numbers as §13 above, projected onto the unit of analysis that
+# downstream consumers usually care about.
+#
+# Below: a ~1.4 × 1.4 km window over central Bern, every building
+# coloured by its cell's cross-modal logsum to groceries, with the
+# car-network edges (white) and supermarket POIs (red) on top.
+
+# %%
+buildings = gpd.read_file(PREPARED_DIR / 'buildings.gpkg')
+b2c = pd.read_csv(PREPARED_DIR / 'building_to_cell.csv', index_col=0)
+# buildings.gpkg and building_to_cell.csv are row-aligned (one row per
+# building, in the same order they were emitted in prep).
+buildings['cell_id'] = b2c['cell_id'].values
+buildings['logsum_groceries'] = buildings['cell_id'].map(
+    CROSS_LOGSUM['poi_errands_groceries'])
+
+fig, ax = plt.subplots(figsize=(10, 10))
+figures.plot_neighborhood_zoom(
+    ax, buildings,
+    center_xy=NEIGHBORHOOD_CENTER_XY, half_m=NEIGHBORHOOD_HALF_M,
+    values=buildings['logsum_groceries'],
+    network=car_graph,
+    title=f'Cross-modal logsum to groceries — {LOCATION_LABEL} centre, per building',
+    label='logsum (utils)',
+)
+# POI overlay on top of buildings + network — supermarkets visible
+# within the crop window only.
+sm = pois[pois['poi_errands_groceries'] > 0]
+ax.scatter(sm.geometry.x, sm.geometry.y,
+           s=22, color='red', edgecolor='black', linewidth=0.5, zorder=6)
 plt.tight_layout()
+figures.save_figure(fig, 'accessibility_neighborhood_buildings')
 plt.show()
 
 

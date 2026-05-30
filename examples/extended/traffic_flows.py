@@ -354,6 +354,7 @@ ev = calibration.evaluate_against_counters(flows, counters)
 print(f"Fit at counters: R²={ev['r2']:.3f}, slope={ev['slope']:.3f}, "
       f"RMSE={ev['rmse']:.0f}, n={ev['n_matched']:,}")
 
+import _figures as figures   # noqa: E402  — project-local plot helpers
 m = ev['merged']
 fig, ax = plt.subplots(figsize=(7, 7))
 ax.scatter(m['observed'], m['modeled'], s=10, alpha=0.4, color='tab:blue')
@@ -366,44 +367,46 @@ ax.set_ylabel('Modeled AADT (flows, veh/day)')
 ax.set_title(f'Modeled vs observed — R²={ev["r2"]:.3f}, '
              f'slope={ev["slope"]:.2f}, RMSE={ev["rmse"]:.0f}')
 ax.set_aspect('equal'); ax.legend()
-plt.tight_layout(); plt.show()
+plt.tight_layout()
+figures.save_figure(fig, 'flow_baseline_evaluation_scatter', ext='pdf')
+plt.show()
 
 
 # %%
-import _figures as figures   # noqa: E402  — project-local plot helpers
-
 stress_arr = np.array([float(d.get('flow_estimate', 0.0))
                        for _, _, d in car_graph.edges(data=True)])
 
-# Crop to the inner (calibration) polygon + a small pad so per-edge
-# values stay legible.
-_minx, _miny, _maxx, _maxy = inner_polygon.bounds
-_pad_x, _pad_y = 0.10 * (_maxx - _minx), 0.10 * (_maxy - _miny)
-xlim = (_minx - _pad_x, _maxx + _pad_x)
-ylim = (_miny - _pad_y, _maxy + _pad_y)
+# Standardised paper-figure crop: 20 × 20 km square centred on Bern
+# (same centre as the accessibility figures so the four paper figures
+# show the same area at the same scale).
+PAPER_CROP_CENTER_XY = (2_599_000, 1_200_500)
+PAPER_CROP_HALF_M    = 15_000
+xlim = (PAPER_CROP_CENTER_XY[0] - PAPER_CROP_HALF_M,
+        PAPER_CROP_CENTER_XY[0] + PAPER_CROP_HALF_M)
+ylim = (PAPER_CROP_CENTER_XY[1] - PAPER_CROP_HALF_M,
+        PAPER_CROP_CENTER_XY[1] + PAPER_CROP_HALF_M)
 
-FLOW_VMAX = 30_000   # AADT cap for the colour scale
+FLOW_VMAX = 50_000   # AADT cap for the colour scale
 
-fig, ax = plt.subplots(figsize=(12, 11))
+fig, ax = plt.subplots(figsize=(7, 6.5))
 figures.plot_network_map(
     ax, car_graph, flows,
     cbar_label=f'flows (veh/day, clipped at {FLOW_VMAX:,})',
-    title=(f'flows — {LOCATION_LABEL} area '
-           f'(median {np.median(stress_arr):.0f}, '
-           f'P99 {np.quantile(stress_arr, 0.99):.0f}, '
-           f'max {stress_arr.max():.0f} veh/day)'),
+    title=('One-shot traffic volume estimation'),
     xlim=xlim, ylim=ylim,
     vmax=FLOW_VMAX,
 )
-ax.plot(*inner_polygon.exterior.xy,
-        color='black', linewidth=1.0, linestyle='--',
-        label='inner polygon (calibration region)', zorder=5)
-ax.scatter(counters_all.geometry.x, counters_all.geometry.y,
-           s=18, facecolor='white', edgecolor='black', linewidth=0.6,
-           label=f'counters (n={len(counters_all):,})', zorder=6)
-_legend = ax.legend(loc='upper right', framealpha=0.9, fontsize=9)
-_legend.set_zorder(20)   # above the counter dots
-plt.tight_layout(); plt.show()
+# ax.plot(*inner_polygon.exterior.xy,
+#         color='black', linewidth=1.0, linestyle='--',
+#         label='inner polygon (calibration region)', zorder=5)
+# ax.scatter(counters_all.geometry.x, counters_all.geometry.y,
+#            s=18, facecolor='white', edgecolor='black', linewidth=0.6,
+#            label=f'counters', zorder=6)
+# _legend = ax.legend(loc='upper right', framealpha=0.9, fontsize=9)
+# _legend.set_zorder(20)   # above the counter dots
+plt.tight_layout()
+figures.save_figure(fig, 'flow_estimate_map')
+plt.show()
 
 
 # %% [markdown]

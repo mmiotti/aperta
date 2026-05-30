@@ -52,6 +52,7 @@ See memory `aperta-flat-refactor-plan` for the design discussion.
 """
 
 import logging
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable
@@ -60,6 +61,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 from numba import njit
+from scipy.spatial import cKDTree
 from shapely.geometry import Point
 
 
@@ -816,6 +818,9 @@ def _reindex_tier(
     dest_units: pd.DataFrame,
     origin_node_column: str,
     dest_node_column: str,
+    *,
+    origin_allowed_dest_zones: dict | None = None,
+    dest_unit_to_zone: dict | None = None,
 ) -> tuple[dict | None, dict | None]:
     """Reindex one tier from node-keyed to geo-unit-keyed.
 
@@ -833,6 +838,16 @@ def _reindex_tier(
         dest_units: DataFrame indexed by dest unit ID, with `dest_node_column`
             giving each dest unit's network node. (Same as `origin_units` for
             same-tier reindexing.)
+        origin_allowed_dest_zones: optional `{origin_unit_id -> frozenset of
+            allowed dest zone IDs}`. When provided, dest units whose parent
+            zone is NOT in the allowed set are dropped from the fan-out. Used
+            by `reindex_by_geo_unit` to apply per-origin zone-pair tier
+            filtering and eliminate the multi-zone-snap-node union artifact.
+        dest_unit_to_zone: optional `{dest_unit_id -> zone_id}` lookup. Only
+            needed when the dest unit ID is *not* a zone ID — i.e. for the
+            cell-tier (`cells_to_cells`). For tiers where the dest is already
+            a zone (`cells_to_zones`, `zones_to_zones`), pass `None` and the
+            filter uses the dest unit ID directly.
 
     Returns:
         `(new_pairs, new_odm)` — geo-keyed dicts of dest-unit-ID arrays and
@@ -851,6 +866,11 @@ def _reindex_tier(
         dest_node_arr = tier_pairs[origin_node]
         if tier_odm is not None:
             value_arr = np.asarray(tier_odm[origin_node])
+        allowed = (
+            origin_allowed_dest_zones.get(origin_unit)
+            if origin_allowed_dest_zones is not None
+            else None
+        )
         # Fan out: for each dest_node, emit one row per dest_unit sharing that node.
         out_dest_units: list = []
         out_values: list = []
@@ -859,6 +879,10 @@ def _reindex_tier(
             if not units_at_node:
                 continue
             for du in units_at_node:
+                if allowed is not None:
+                    dz = dest_unit_to_zone.get(du) if dest_unit_to_zone is not None else du
+                    if dz not in allowed:
+                        continue
                 out_dest_units.append(du)
                 if tier_odm is not None:
                     out_values.append(value_arr[i])
@@ -874,6 +898,58 @@ def _reindex_tier(
     return new_pairs, new_odm
 
 
+def _build_per_zone_tier_sets(
+    zones: pd.DataFrame,
+    r_cells: float,
+    r_medium: float,
+    r_zones: float | None,
+    zones_centroids: gpd.GeoSeries | None = None,
+) -> tuple[dict, dict, dict | None]:
+    """Build per-origin-zone tier-classification zone-ID sets via KDTree.
+
+    Mirrors the per-zone-pair tier classification done inside `get_pairs`
+    (`od_pairs.py` cell-tier / c2z-tier / z2z-tier masks), but indexed by
+    zone-ID rather than positional. Used by `reindex_by_geo_unit` to apply
+    a per-cell tier filter that eliminates the multi-zone-snap-node union
+    artifact.
+
+    Returns three dicts, each `{zone_id -> frozenset of allowed dest zone IDs}`:
+      - cell-tier set (includes self-zone, like `get_pairs`)
+      - c2z set (excludes self-zone)
+      - z2z set (excludes self-zone) — `None` iff `r_zones is None`.
+    """
+    if zones_centroids is None:
+        zones_centroids = zones.geometry.centroid
+    zone_ids = list(zones.index)
+    zone_xy = np.column_stack(
+        [zones_centroids.x.to_numpy(), zones_centroids.y.to_numpy()]
+    )
+    tree = cKDTree(zone_xy)
+    upper_r = r_zones if r_zones is not None else r_medium
+    per_zone_cell: dict = {}
+    per_zone_c2z: dict = {}
+    per_zone_z2z: dict | None = {} if r_zones is not None else None
+    for i, zid in enumerate(zone_ids):
+        idxs = np.asarray(tree.query_ball_point(zone_xy[i], upper_r), dtype=int)
+        if idxs.size == 0:
+            per_zone_cell[zid] = frozenset({zid})
+            per_zone_c2z[zid] = frozenset()
+            if per_zone_z2z is not None:
+                per_zone_z2z[zid] = frozenset()
+            continue
+        d = np.hypot(zone_xy[idxs, 0] - zone_xy[i, 0], zone_xy[idxs, 1] - zone_xy[i, 1])
+        cell_mask = d < r_cells
+        c2z_mask = (d >= r_cells) & (d < r_medium)
+        # Same-zone carve-out matches `get_pairs`: always in cell-tier,
+        # excluded from c2z and z2z.
+        per_zone_cell[zid] = frozenset(zone_ids[j] for j in idxs[cell_mask]) | {zid}
+        per_zone_c2z[zid] = frozenset(zone_ids[j] for j in idxs[c2z_mask]) - {zid}
+        if per_zone_z2z is not None:
+            z2z_mask = (d >= r_medium) & (d < r_zones)
+            per_zone_z2z[zid] = frozenset(zone_ids[j] for j in idxs[z2z_mask]) - {zid}
+    return per_zone_cell, per_zone_c2z, per_zone_z2z
+
+
 def reindex_by_geo_unit(
     pairs: TieredODNodePairs,
     odm: TieredODNodePairs | None,
@@ -882,6 +958,10 @@ def reindex_by_geo_unit(
     cell_node_column: str,
     zones: pd.DataFrame | None = None,
     zone_node_column: str | None = None,
+    r_cells: float | None = None,
+    r_medium: float | None = None,
+    r_zones: float | None = None,
+    zones_centroids: gpd.GeoSeries | None = None,
 ) -> tuple[TieredODGeoPairs, TieredODGeoPairs | None]:
     """Convert a node-keyed (pairs, odm) pair into geo-unit-keyed form.
 
@@ -899,18 +979,45 @@ def reindex_by_geo_unit(
     `|cells at origin_node| × |cells at dest_node|` entries at cell tier (same
     pattern at zone tier). Memory cost scales with average units-per-node.
 
+    Per-cell tier filtering (strongly recommended when `zones` is given):
+        Pass `r_cells`, `r_medium`, and (for z2z) `r_zones` to apply each
+        origin cell's own zone-pair tier classification at reindex time.
+
+        Without this filter, a snap node N that serves cells across multiple
+        zones inherits the **union** of those zones' tier dest-sets in the
+        node-keyed pairs (see `get_pairs`). At reindex, every cell on N
+        receives that union — so the same destination zone can end up in
+        both c2c (as individual cells) and c2z (as aggregated zone) for the
+        same origin cell, double-counting it in cell-level logsums. The
+        filter restricts each cell's output to its own zone's tier sets;
+        nothing is lost (every kept destination was routed) and the
+        c2c/c2z/z2z tiers become mutually disjoint per cell.
+
     Args:
         pairs: node-keyed destination-ID table from `get_pairs`.
         odm: node-keyed cost / utility / value ODM aligned to `pairs`. `None`
             to reindex only `pairs` (returns `(new_pairs, None)`).
         cells: cell-level DataFrame, indexed by `cell_id`. Must have
-            `cell_node_column`.
+            `cell_node_column`. When the per-cell tier filter is active
+            (`r_cells`/`r_medium` given), must also have `zone_id`.
         cell_node_column: column on `cells` carrying the cell-tier network
             node ID.
         zones: optional zones DataFrame indexed by `zone_id`. Required iff
             `pairs.cells_to_zones` or `pairs.zones_to_zones` is set.
         zone_node_column: column on `zones` carrying the zone-tier network
             node ID. Required iff `zones` is given.
+        r_cells: per-zone-pair cell-tier radius (CRS units). Pass the same
+            value used in `get_pairs`. Enables per-cell tier filtering when
+            given alongside `r_medium`.
+        r_medium: per-zone-pair c2z outer radius (CRS units). Same value as
+            in `get_pairs`. Required iff `r_cells` is given.
+        r_zones: per-zone-pair z2z outer radius (CRS units). Same value as
+            in `get_pairs`. Required to filter the z2z tier; if omitted while
+            z2z is present, a warning is issued and z2z is reindexed
+            unfiltered.
+        zones_centroids: optional custom zone centroids (e.g. population-
+            weighted). Falls back to `zones.geometry.centroid`. Only used
+            when the per-cell tier filter is active.
 
     Returns:
         `(new_pairs, new_odm)` — both `TieredODGeoPairs` (or
@@ -928,6 +1035,58 @@ def reindex_by_geo_unit(
         if zone_node_column not in zones.columns:
             raise ValueError(f"`zones` is missing column {zone_node_column!r}.")
 
+    # --- Optionally build per-cell zone-tier filter sets ---
+    if (r_cells is None) != (r_medium is None):
+        raise ValueError("`r_cells` and `r_medium` must both be provided or both omitted.")
+    do_filter = zones is not None and r_cells is not None and r_medium is not None
+    if zones is not None and not do_filter:
+        warnings.warn(
+            "reindex_by_geo_unit called with `zones` but without `r_cells`/`r_medium`; "
+            "output may double-count destinations where a snap node serves cells in "
+            "multiple zones (the c2c / c2z tiers overlap in this case). Pass "
+            "`r_cells` and `r_medium` (and `r_zones` for z2z) to apply per-cell tier "
+            "filtering.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    cell_allowed_c2c: dict | None = None
+    cell_allowed_c2z: dict | None = None
+    zone_allowed_z2z: dict | None = None
+    cell_id_to_zone: dict | None = None
+    if do_filter:
+        assert zones is not None and r_cells is not None and r_medium is not None
+        if "zone_id" not in cells.columns:
+            raise ValueError(
+                "`cells` is missing column 'zone_id', which is required for per-cell "
+                "tier filtering (cell→zone mapping)."
+            )
+        if pairs.zones_to_zones is not None and r_zones is None:
+            warnings.warn(
+                "reindex_by_geo_unit: `zones_to_zones` is present in `pairs` but `r_zones` "
+                "was not provided; z2z will be reindexed without per-zone tier filtering. "
+                "Pass `r_zones` to remove any z2z multi-zone-snap-node artifacts.",
+                UserWarning,
+                stacklevel=2,
+            )
+        per_zone_cell, per_zone_c2z, per_zone_z2z = _build_per_zone_tier_sets(
+            zones, r_cells, r_medium, r_zones, zones_centroids=zones_centroids,
+        )
+        cell_id_to_zone = {
+            cid: zid for cid, zid in zip(cells.index, cells["zone_id"]) if pd.notna(zid)
+        }
+        cell_allowed_c2c = {
+            cid: per_zone_cell.get(zid, frozenset({zid}))
+            for cid, zid in cell_id_to_zone.items()
+        }
+        cell_allowed_c2z = {
+            cid: per_zone_c2z.get(zid, frozenset())
+            for cid, zid in cell_id_to_zone.items()
+        }
+        # z2z is keyed by zone_id directly — the per-zone z2z set IS the
+        # per-origin filter dict.
+        zone_allowed_z2z = per_zone_z2z
+
     cells_pairs, cells_odm = _reindex_tier(
         pairs.cells_to_cells,
         odm.cells_to_cells if odm is not None else None,
@@ -935,6 +1094,8 @@ def reindex_by_geo_unit(
         cells,
         cell_node_column,
         cell_node_column,
+        origin_allowed_dest_zones=cell_allowed_c2c,
+        dest_unit_to_zone=cell_id_to_zone,
     )
     c2z_pairs: dict | None = None
     c2z_odm: dict | None = None
@@ -947,6 +1108,8 @@ def reindex_by_geo_unit(
             zones,
             cell_node_column,
             zone_node_column,
+            origin_allowed_dest_zones=cell_allowed_c2z,
+            dest_unit_to_zone=None,   # dest IS a zone — du == zone_id
         )
     zones_pairs: dict | None = None
     zones_odm: dict | None = None
@@ -959,6 +1122,8 @@ def reindex_by_geo_unit(
             zones,
             zone_node_column,
             zone_node_column,
+            origin_allowed_dest_zones=zone_allowed_z2z,
+            dest_unit_to_zone=None,   # dest IS a zone — du == zone_id
         )
 
     new_pairs = TieredODGeoPairs(

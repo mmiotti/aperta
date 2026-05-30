@@ -392,17 +392,18 @@ _center = boundary.to_crs(boundary_proj_crs).geometry.iloc[0].centroid
 demo_cell_id = cells.geometry.centroid.distance(_center).idxmin()
 
 # %%
-viz.plot_tiered_destinations(
+ax = viz.plot_tiered_destinations(
     cells, zones, pairs,
     origin_cell_id=demo_cell_id,
     graph=graph,
     boundary=boundary.to_crs(boundary_proj_crs),
-    title=('Tiered destinations from one origin cell\n'
-           'red = origin · gold = cells_to_cells · '
-           'teal = cells_to_zones (middle) · '
-           'blue = zones_to_zones (far)'),
 )
+_legend = ax.get_legend()
+if _legend is not None:
+    for _txt in _legend.get_texts():
+        _txt.set_fontsize(14)
 plt.tight_layout()
+ax.figure.savefig('results/tiered_destinations.pdf', bbox_inches='tight')
 plt.show()
 
 
@@ -459,6 +460,7 @@ pairs_geo, times_geo = od_pairs.reindex_by_geo_unit(
     pairs, times, cells,
     cell_node_column='node_id',
     zones=zones, zone_node_column='node_id',
+    r_cells=R_CELLS, r_medium=R_MEDIUM, r_zones=R_ZONES,
 )
 times_geo = overhead.add_origin_cell_overhead(
     times_geo, pairs_geo, cells, 'walk_overhead_s',
@@ -721,6 +723,7 @@ bike_pairs_geo, bike_times_geo = od_pairs.reindex_by_geo_unit(
     bike_pairs, bike_times, cells,
     cell_node_column='bike_node_id',
     zones=zones, zone_node_column='bike_node_id',
+    r_cells=R_CELLS, r_medium=R_MEDIUM, r_zones=R_ZONES,
 )
 bike_times_geo = overhead.add_origin_cell_overhead(
     bike_times_geo, bike_pairs_geo, cells, 'bike_overhead_s',
@@ -976,6 +979,7 @@ _, bike_full_u_geo = od_pairs.reindex_by_geo_unit(
     bike_pairs, bike_full_u, cells,
     cell_node_column='bike_node_id',
     zones=zones, zone_node_column='bike_node_id',
+    r_cells=R_CELLS, r_medium=R_MEDIUM, r_zones=R_ZONES,
 )
 cells['bike_util_overhead'] = bike_utility.cost_coefficient * cells['bike_overhead_s']
 bike_full_u_geo = overhead.add_origin_cell_overhead(
@@ -1005,6 +1009,7 @@ _, full_u_geo = od_pairs.reindex_by_geo_unit(
     pairs, full_u, cells,
     cell_node_column='node_id',
     zones=zones, zone_node_column='node_id',
+    r_cells=R_CELLS, r_medium=R_MEDIUM, r_zones=R_ZONES,
 )
 cells['util_overhead'] = walking_utility.cost_coefficient * cells['walk_overhead_s']
 full_u_geo = overhead.add_origin_cell_overhead(

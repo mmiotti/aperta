@@ -11,9 +11,12 @@ Run with:
 """
 
 import unittest
+import warnings
 
+import geopandas as gpd
 import numpy as np
 import pandas as pd
+from shapely.geometry import Point
 
 from aperta.od_pairs import (
     TieredODGeoPairs,
@@ -397,6 +400,268 @@ class AddOriginCellOverheadTestCase(unittest.TestCase):
         np.testing.assert_array_equal(
             out.cells_to_cells["C0"], self.costs.cells_to_cells["C0"] + 30.0
         )
+
+
+class ReindexPerCellTierFilterTestCase(unittest.TestCase):
+    """Per-cell zone-pair tier filtering at reindex — eliminates the
+    multi-zone-snap-node union artifact where a destination ends up in
+    BOTH c2c (as individual cells) and c2z (as aggregated zone) for the
+    same origin cell.
+
+    Scenario: zones on a line at y=0 — ZA(x=0), ZB(x=900), ZC(x=1700),
+    ZD(x=3000) — with r_cells=1000, r_medium=4000, r_zones=10000:
+
+        zone | cell-tier  | c2z         | z2z
+        ZA   | {ZA,ZB}    | {ZC,ZD}     | {}
+        ZB   | {ZA,ZB,ZC} | {ZD}        | {}
+        ZC   | {ZB,ZC}    | {ZA,ZD}     | {}
+        ZD   | {ZD}       | {ZA,ZB,ZC}  | {}
+
+    Cells: C_A1∈ZA and C_B1∈ZB both snap to `Nshared` (the multi-zone
+    node — the source of the artifact). C_C1, C_C2 in ZC snap to N_C,
+    N_C2 respectively; C_D1 in ZD snaps to N_D.
+
+    Because cells in ZA and ZB share `Nshared`, the node-keyed pair-builder
+    unions their tier-dest sets at that node. The asymmetry between ZA's
+    cell-tier ({ZA,ZB}) and ZB's ({ZA,ZB,ZC}) means `Nshared`'s c2c at the
+    node level pulls in ZC's cells. At reindex (without filter), every cell
+    on `Nshared` inherits the union — so C_A1 ends up with ZC cells in c2c
+    *and* ZN_C in c2z. That's the double-count bug; the per-cell filter
+    eliminates it.
+    """
+
+    R_CELLS = 1000.0
+    R_MEDIUM = 4000.0
+    R_ZONES = 10000.0
+
+    @staticmethod
+    def _fixture():
+        cells = pd.DataFrame(
+            {
+                "node_id": ["Nshared", "Nshared", "N_C", "N_C2", "N_D"],
+                "zone_id": ["ZA", "ZB", "ZC", "ZC", "ZD"],
+            },
+            index=pd.Index(["C_A1", "C_B1", "C_C1", "C_C2", "C_D1"], name="cell_id"),
+        )
+        zones = gpd.GeoDataFrame(
+            {"node_id": ["ZN_A", "ZN_B", "ZN_C", "ZN_D"]},
+            geometry=[Point(0, 0), Point(900, 0), Point(1700, 0), Point(3000, 0)],
+            index=pd.Index(["ZA", "ZB", "ZC", "ZD"], name="zone_id"),
+            crs="EPSG:2056",
+        )
+        return cells, zones
+
+    @staticmethod
+    def _node_keyed_pairs():
+        """Hand-built `TieredODNodePairs` matching what `get_pairs` would emit
+        on the fixture above. `Nshared` entries embody the union artifact.
+        """
+        return TieredODNodePairs(
+            cells_to_cells={
+                # Union of ZA's & ZB's cell-tier dest nodes — includes ZC's nodes
+                # because ZB's cell-tier reaches ZC, even though ZA's doesn't.
+                "Nshared": np.array(["N_C", "N_C2", "Nshared"]),
+                "N_C": np.array(["N_C", "N_C2", "Nshared"]),
+                "N_C2": np.array(["N_C", "N_C2", "Nshared"]),
+                "N_D": np.array(["N_D"]),
+            },
+            cells_to_zones={
+                # Union of ZA's c2z ({ZN_C,ZN_D}) and ZB's c2z ({ZN_D}).
+                "Nshared": np.array(["ZN_C", "ZN_D"]),
+                "N_C": np.array(["ZN_A", "ZN_D"]),
+                "N_C2": np.array(["ZN_A", "ZN_D"]),
+                "N_D": np.array(["ZN_A", "ZN_B", "ZN_C"]),
+            },
+            zones_to_zones={},  # empty under these radii (no zone pair >= r_medium)
+        )
+
+    EXPECTED_CELL_TIER = {
+        "ZA": frozenset({"ZA", "ZB"}),
+        "ZB": frozenset({"ZA", "ZB", "ZC"}),
+        "ZC": frozenset({"ZB", "ZC"}),
+        "ZD": frozenset({"ZD"}),
+    }
+    EXPECTED_C2Z = {
+        "ZA": frozenset({"ZC", "ZD"}),
+        "ZB": frozenset({"ZD"}),
+        "ZC": frozenset({"ZA", "ZD"}),
+        "ZD": frozenset({"ZA", "ZB", "ZC"}),
+    }
+
+    def setUp(self):
+        self.cells, self.zones = self._fixture()
+        self.pairs = self._node_keyed_pairs()
+
+    def _filtered(self):
+        return reindex_by_geo_unit(
+            self.pairs, None, self.cells,
+            cell_node_column="node_id",
+            zones=self.zones, zone_node_column="node_id",
+            r_cells=self.R_CELLS, r_medium=self.R_MEDIUM, r_zones=self.R_ZONES,
+        )[0]
+
+    def _unfiltered(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            return reindex_by_geo_unit(
+                self.pairs, None, self.cells,
+                cell_node_column="node_id",
+                zones=self.zones, zone_node_column="node_id",
+            )[0]
+
+    def test_unfiltered_reindex_reproduces_bug(self):
+        """Documents the bug: without the per-cell tier filter, ZC ends up
+        in BOTH c2c (as ZC cells C_C1/C_C2) and c2z (as ZN_C) for C_A1.
+        This test PASSES only as long as the unfiltered path stays buggy —
+        flagging if someone ever changes the legacy behavior."""
+        out = self._unfiltered()
+        c2c_dest_zones_for_A1 = {
+            self.cells.loc[c, "zone_id"] for c in out.cells_to_cells["C_A1"]
+        }
+        c2z_dest_zones_for_A1 = set(out.cells_to_zones["C_A1"])
+        overlap = c2c_dest_zones_for_A1 & c2z_dest_zones_for_A1
+        self.assertIn(
+            "ZC", overlap,
+            msg="expected the multi-zone-snap-node union artifact to place "
+                "ZC in both c2c and c2z for C_A1 when filter is OFF",
+        )
+
+    def test_filter_eliminates_double_counting(self):
+        out = self._filtered()
+        for cell_id in self.cells.index:
+            c2c_dest_zones = {
+                self.cells.loc[c, "zone_id"]
+                for c in out.cells_to_cells.get(cell_id, [])
+            }
+            c2z_dest_zones = set(out.cells_to_zones.get(cell_id, []))
+            overlap = c2c_dest_zones & c2z_dest_zones
+            self.assertEqual(
+                overlap, set(),
+                msg=f"{cell_id}: c2c parent zones {c2c_dest_zones} and c2z zones "
+                    f"{c2z_dest_zones} must be disjoint (overlap={overlap})",
+            )
+
+    def test_filter_assigns_correct_tier_per_cell(self):
+        """c2c dest cells' parent zones must lie in the origin cell's cell-tier
+        zone set; c2z dest zones must lie in the origin cell's c2z zone set."""
+        out = self._filtered()
+        for cell_id in self.cells.index:
+            origin_zone = self.cells.loc[cell_id, "zone_id"]
+            allowed_cell = self.EXPECTED_CELL_TIER[origin_zone]
+            allowed_c2z = self.EXPECTED_C2Z[origin_zone]
+            c2c_dest_zones = {
+                self.cells.loc[c, "zone_id"]
+                for c in out.cells_to_cells.get(cell_id, [])
+            }
+            c2z_dest_zones = set(out.cells_to_zones.get(cell_id, []))
+            self.assertTrue(
+                c2c_dest_zones.issubset(allowed_cell),
+                msg=f"{cell_id} ({origin_zone}): c2c dest zones {c2c_dest_zones} "
+                    f"not within cell-tier {set(allowed_cell)}",
+            )
+            self.assertTrue(
+                c2z_dest_zones.issubset(allowed_c2z),
+                msg=f"{cell_id} ({origin_zone}): c2z dest zones {c2z_dest_zones} "
+                    f"not within c2z {set(allowed_c2z)}",
+            )
+
+    def test_filter_is_lossless_for_tier_correct_dests(self):
+        """Filter only drops tier-incorrect dests; every dest in the unfiltered
+        output that *belongs* to the origin's tier (per the zone-pair classification)
+        survives the filter."""
+        unfiltered = self._unfiltered()
+        filtered = self._filtered()
+        for cell_id in self.cells.index:
+            origin_zone = self.cells.loc[cell_id, "zone_id"]
+            allowed_cell = self.EXPECTED_CELL_TIER[origin_zone]
+            allowed_c2z = self.EXPECTED_C2Z[origin_zone]
+            # c2c: every unfiltered dest whose parent zone is in allowed_cell
+            # should be present in filtered output.
+            uf_c2c_kept = {
+                c for c in unfiltered.cells_to_cells.get(cell_id, [])
+                if self.cells.loc[c, "zone_id"] in allowed_cell
+            }
+            f_c2c = set(filtered.cells_to_cells.get(cell_id, []))
+            self.assertEqual(
+                uf_c2c_kept, f_c2c,
+                msg=f"{cell_id}: filter dropped tier-correct c2c dests "
+                    f"(expected {uf_c2c_kept}, got {f_c2c})",
+            )
+            # c2z: same check.
+            uf_c2z_kept = {
+                z for z in unfiltered.cells_to_zones.get(cell_id, [])
+                if z in allowed_c2z
+            }
+            f_c2z = set(filtered.cells_to_zones.get(cell_id, []))
+            self.assertEqual(
+                uf_c2z_kept, f_c2z,
+                msg=f"{cell_id}: filter dropped tier-correct c2z dests "
+                    f"(expected {uf_c2z_kept}, got {f_c2z})",
+            )
+
+    def test_costs_aligned_after_filter(self):
+        """When an ODM is reindexed alongside pairs, filtered cost arrays must
+        stay aligned with filtered dest arrays (same length, same drops applied)."""
+        # Build a parallel cost ODM with sentinel values to track which entries
+        # survive: encode the cost as `node_hash + dest_index`, so misalignment
+        # would be immediately visible.
+        odm = TieredODNodePairs(
+            cells_to_cells={
+                k: np.arange(len(v), dtype=float) + 1000.0
+                for k, v in self.pairs.cells_to_cells.items()
+            },
+            cells_to_zones={
+                k: np.arange(len(v), dtype=float) + 2000.0
+                for k, v in self.pairs.cells_to_zones.items()
+            },
+        )
+        new_pairs, new_odm = reindex_by_geo_unit(
+            self.pairs, odm, self.cells,
+            cell_node_column="node_id",
+            zones=self.zones, zone_node_column="node_id",
+            r_cells=self.R_CELLS, r_medium=self.R_MEDIUM, r_zones=self.R_ZONES,
+        )
+        for cell_id in self.cells.index:
+            for tier_name in ("cells_to_cells", "cells_to_zones"):
+                p = getattr(new_pairs, tier_name).get(cell_id)
+                v = getattr(new_odm, tier_name).get(cell_id)
+                if p is None and v is None:
+                    continue
+                self.assertEqual(
+                    len(p), len(v),
+                    msg=f"{cell_id} {tier_name}: pair/odm length mismatch",
+                )
+
+    def test_warning_emitted_without_radii(self):
+        """When `zones` is given but the radii are not, a UserWarning fires so
+        callers know they're getting the legacy unfiltered (buggy) path."""
+        with self.assertWarns(UserWarning):
+            reindex_by_geo_unit(
+                self.pairs, None, self.cells,
+                cell_node_column="node_id",
+                zones=self.zones, zone_node_column="node_id",
+            )
+
+    def test_partial_radii_raises(self):
+        """Passing one of (r_cells, r_medium) without the other is a user
+        error — better to fail fast than silently disable the filter."""
+        with self.assertRaises(ValueError):
+            reindex_by_geo_unit(
+                self.pairs, None, self.cells,
+                cell_node_column="node_id",
+                zones=self.zones, zone_node_column="node_id",
+                r_cells=self.R_CELLS,  # r_medium missing
+            )
+
+    def test_filter_requires_zone_id_column(self):
+        cells_no_zone = self.cells.drop(columns="zone_id")
+        with self.assertRaises(ValueError):
+            reindex_by_geo_unit(
+                self.pairs, None, cells_no_zone,
+                cell_node_column="node_id",
+                zones=self.zones, zone_node_column="node_id",
+                r_cells=self.R_CELLS, r_medium=self.R_MEDIUM,
+            )
 
 
 if __name__ == "__main__":
