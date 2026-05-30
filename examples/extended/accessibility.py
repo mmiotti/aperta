@@ -54,7 +54,7 @@
 # |----------------|----------------------|---------------|
 # | walk           | `walk_time_s`        | < 5 km        |
 # | bike (regular) | `bike_time_s`        | < 25 km       |
-# | car (off-peak) | `car_time_s_offpeak` | none          |
+# | car (peak)     | `car_time_s_peak`    | none          |
 
 # %%
 import warnings
@@ -117,9 +117,9 @@ NEIGHBORHOOD_HALF_M = 700                          # 1.4 × 1.4 km window
 # → larger `r_zones`. cells_to_cells handles close pairs at full cell
 # resolution; zones aggregate far destinations.
 TIER_CUTOFFS = {
-    'walk': dict(r_cells=1_000.0, r_medium=2_000.0,  r_zones=5_000.0),
-    'bike': dict(r_cells=1_000.0, r_medium=5_000.0,  r_zones=25_000.0),
-    'car':  dict(r_cells=1_000.0, r_medium=10_000.0, r_zones=100_000.0),
+    'walk': dict(r_cells=1_500.0, r_medium=2_500.0,  r_zones=5_000.0),
+    'bike': dict(r_cells=1_500.0, r_medium=7_500.0,  r_zones=25_000.0),
+    'car':  dict(r_cells=1_500.0, r_medium=10_000.0, r_zones=100_000.0),
 }
 # Per-mode route-time floor applied BEFORE overhead is added — both
 # in §7 (for §8 nearest-k) and §12 (for utility logsum). Reflects the
@@ -139,8 +139,8 @@ TIER_CUTOFFS = {
 # behavioural reality.
 MIN_ROUTE_S = {
     'walk':         60.0,
-    'bike_regular': 300.0,
-    'car_offpeak':  300.0,
+    'bike_regular': 60.0,
+    'car_peak':  60.0,
 }
 
 # === Trip overhead (first/last-mile, per mode) ==============================
@@ -154,7 +154,7 @@ CAR_FIRST_MILE_MS = 5.0    # parking-zone speed, NOT the driving speed
 OVERHEAD_COEF = {
     'walk':         {'const': 50, 'density':   0, 'snap_dist_s_per_m': 1 / WALK_SPEED_MS},
     'bike_regular': {'const': 70, 'density':  60, 'snap_dist_s_per_m': 1 / BIKE_SPEED_MS},
-    'car_offpeak':  {'const': 50, 'density': 120, 'snap_dist_s_per_m': 1 / CAR_FIRST_MILE_MS},
+    'car_peak':  {'const': 50, 'density': 120, 'snap_dist_s_per_m': 1 / CAR_FIRST_MILE_MS},
 }
 
 # === Utility coefficients (per-mode discrete-choice spec) ===================
@@ -173,7 +173,7 @@ OVERHEAD_COEF = {
 #                      'density':  0.0,  'bike_score': 0.5},
 #     'bike_regular': {'asc': -4.0, 'time': -0.05, 'time_log': -1.5,
 #                      'density': -0.2, 'bike_score': 1.5},
-#     'car_offpeak':  {'asc': -6.1, 'time': -0.07, 'time_log': -0.9,
+#     'car_peak':  {'asc': -6.1, 'time': -0.07, 'time_log': -0.9,
 #                      'density': -0.5,  'bike_score': 0.0},
 # }
 UTILITY_COEF = {
@@ -181,7 +181,7 @@ UTILITY_COEF = {
                      'density':  0.0,  'bike_score': 0.0},
     'bike_regular': {'asc': -4.0, 'time': -0.20, 'time_log': -0.0,
                      'density': -0.0, 'bike_score': 0.0},
-    'car_offpeak':  {'asc': -6.0, 'time': -0.10, 'time_log': -0.0,
+    'car_peak':  {'asc': -6.0, 'time': -0.10, 'time_log': -0.0,
                      'density': -0.0,  'bike_score': 0.0},
 }
 
@@ -191,7 +191,7 @@ UTILITY_COEF = {
 # few stores, employment from a much broader effective choice set.
 # Output: mean travel time over the first K weight-units.
 DEST_K = {
-    'employment_total':      2500,
+    'employment_total':      5000,
     'poi_errands_groceries':    3,
     'poi_leisure_hiking':      10,
 }
@@ -199,7 +199,7 @@ DEST_K = {
 # broader decay (many destinations contribute); smaller θ → sharper
 # decay (nearest dominate). Logsum = θ · ln Σ_j exp(U_ij/θ).
 DEST_NEST_SCALE = {
-    'employment_total':      5.0,
+    'employment_total':      6.0,
     'poi_errands_groceries': 1.0,
     'poi_leisure_hiking':    3.0,
 }
@@ -285,7 +285,7 @@ print(f"{CITY_NAME}: polygon area {CITY_POLYGON.area / 1e6:.1f} km²; "
 #
 # **Coefficients from Miotti et al., *Transportation*, 20XX**, hardcoded
 # inline for visibility. One representative variant per mode (walk,
-# regular bike, off-peak car).
+# regular bike, peak car).
 #
 # **Formula** — per directed edge `u → v` of length `L` m:
 #
@@ -354,9 +354,9 @@ apply_edge_times(bike_graph, 'bike_time_s',
                  beta_intersection_4=7.0, beta_traffic_signal=1.0,
                  max_downhill_kph=50.0)
 
-# Car (off-peak) — per-edge baseline from OSM `maxspeed`, density
+# Car (peak) — per-edge baseline from OSM `maxspeed`, density
 # slowdown (urban friction), intersection + signal penalties.
-apply_edge_times(car_graph, 'car_time_s_offpeak',
+apply_edge_times(car_graph, 'car_time_s_peak',
                  base_speed_kph=None,
                  alpha_up=0.0, alpha_down=0.0, beta_density=-0.20,
                  beta_intersection_4=6.0, beta_traffic_signal=10.0,
@@ -364,7 +364,7 @@ apply_edge_times(car_graph, 'car_time_s_offpeak',
 
 for label, graph, attr in [('walk', walk_graph, 'walk_time_s'),
                             ('bike', bike_graph, 'bike_time_s'),
-                            ('car',  car_graph,  'car_time_s_offpeak')]:
+                            ('car',  car_graph,  'car_time_s_peak')]:
     times = np.array([d[attr] for _, _, d in graph.edges(data=True)])
     lengths = np.array([d['length'] for _, _, d in graph.edges(data=True)])
     implied_kph = (lengths / times) * 3.6
@@ -467,7 +467,7 @@ ROUTING_PLAN = [
     # (label,             graph,      pairs,         mask,           edge attr,            cutoff_s)
     ('walk',              walk_graph, PAIRS['walk'], MASKS['walk'],  'walk_time_s',         60 * 60),
     ('bike_regular',      bike_graph, PAIRS['bike'], MASKS['bike'],  'bike_time_s',         60 * 60),
-    ('car_offpeak',       car_graph,  PAIRS['car'],  None,           'car_time_s_offpeak', 120 * 60),
+    ('car_peak',       car_graph,  PAIRS['car'],  None,           'car_time_s_peak', 120 * 60),
 ]
 # This showcase uses one representative variant per mode. The published
 # paper has more (e-bike 25/45, car peak/night) — see projects/lumos/ for
@@ -499,7 +499,7 @@ print(f"\nTotal routing time: {sum(ROUTING_TIMES.values()):.1f} s")
 
 # %%
 NETWORK_OF = {
-    'walk': 'walk', 'bike_regular': 'bike', 'car_offpeak': 'car',
+    'walk': 'walk', 'bike_regular': 'bike', 'car_peak': 'car',
 }
 
 # Per-network: reindex once, build destination-value ODMs once. Variants
@@ -581,7 +581,7 @@ print(f"Per-cell density_norm: median {cells['density_norm'].median():.3f}, "
 # %%
 # `OVERHEAD_COEF` (incl. per-mode `snap_dist_s_per_m`) is defined at
 # the top of this notebook. Per-paper dest_density values differ
-# slightly from orig_density for some modes (e.g. car_offpeak: orig
+# slightly from orig_density for some modes (e.g. car_peak: orig
 # 128, dest 153). Showcase uses one value per mode for symmetry;
 # production uses the full split.
 
@@ -706,7 +706,7 @@ def pois_overlay_for(destination: str):
 MODE_LABELS = {
     'walk':         'Walk',
     'bike_regular': 'Bike (regular)',
-    'car_offpeak':  'Car (off-peak)',
+    'car_peak':  'Car (peak)',
 }
 DEST_LABELS = {
     'employment_total':      f"Employment  (k={DEST_K['employment_total']:,})",
@@ -776,7 +776,7 @@ plt.show()
 # **Coefficients** — approximations informed by an ongoing project;
 # placeholders pending a public reference:
 #
-# | Coefficient    |    Walk | Bike (regular) | Car (off-peak) |
+# | Coefficient    |    Walk | Bike (regular) | Car (peak)     |
 # |----------------|--------:|---------------:|---------------:|
 # | `β_asc`        |    0    |     −4         |    −6.1        |
 # | `β_time` (/min)|   −0.01 |     −0.02      |    −0.07       |
@@ -1326,8 +1326,8 @@ plt.show()
 # utility coefficients informed by an ongoing project. It deliberately
 # omits things production code would do:
 #
-# - **One variant per mode.** Walk + regular bike + car off-peak. The
-#   paper has more (e-bike 25/45, car peak/night) — see
+# - **One variant per mode.** Walk + regular bike + car peak. The
+#   paper has more (e-bike 25/45, car off-peak/night) — see
 #   [`projects/lumos/`](https://github.com/mmiotti/aperta-lab/tree/main/src/projects/lumos)
 #   for the full variant matrix with peak vs off-peak congestion deltas
 #   and bike vs e-bike comparisons.
