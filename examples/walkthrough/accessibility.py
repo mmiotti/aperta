@@ -400,8 +400,10 @@ ax = viz.plot_tiered_destinations(
 )
 _legend = ax.get_legend()
 if _legend is not None:
-    for _txt in _legend.get_texts():
-        _txt.set_fontsize(14)
+    _handles, _labels = ax.get_legend_handles_labels()
+    _legend.remove()
+    ax.legend(_handles, _labels,
+              loc='lower left', fontsize=21, markerscale=1.5, framealpha=0.9)
 plt.tight_layout()
 ax.figure.savefig('results/tiered_destinations.pdf', bbox_inches='tight')
 plt.show()

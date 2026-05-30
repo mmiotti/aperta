@@ -265,6 +265,62 @@ class TieredPathAggregateTestCase(unittest.TestCase):
         self.assertEqual(costs.cells_to_cells["a"][0], 1.0)
         self.assertEqual(aggs["attr_total"].cells_to_cells["a"][0], 99.0)
 
+    def test_undirected_multigraph_path_traverses_either_direction(self):
+        """Regression: undirected MultiGraph paths can traverse an edge in
+        either direction. The CSR (used by Dijkstra) emits both orientations,
+        so the reconstructed path may contain (v, u) for an edge added as
+        (u, v). The per-edge feature cache must accept both orientations,
+        otherwise the path is silently marked invalid → cost=inf, aggs=NaN.
+        Walkthrough §11 hit this on `bike_graph.to_undirected()`.
+        """
+        g = nx.MultiGraph()
+        for node in ("a", "b", "c"):
+            g.add_node(node, x=0.0, y=0.0)
+        # Add edges in canonical (u, v) order — graph iteration will emit
+        # them in that order; without the fix, a path c→a would try to look
+        # up (c, b) and (b, a), neither of which is stored.
+        g.add_edge("a", "b", w=1.0, attr=10.0)
+        g.add_edge("b", "c", w=2.0, attr=20.0)
+        # Route in BOTH directions: c→a is the one that previously failed.
+        pairs = TieredODNodePairs(
+            cells_to_cells={
+                "a": np.array(["c"]),
+                "c": np.array(["a"]),
+            }
+        )
+        agg = [PathAggregation("attr_sum", "attr", "sum"),
+               PathAggregation("attr_mean", "attr", "mean")]
+        costs, aggs = tiered_path_aggregate(pairs, g, weight="w", edge_aggregations=agg)
+        # a→c (forward): cost 3, attr_sum 30, attr_mean 15
+        self.assertEqual(costs.cells_to_cells["a"][0], 3.0)
+        self.assertEqual(aggs["attr_sum"].cells_to_cells["a"][0], 30.0)
+        self.assertEqual(aggs["attr_mean"].cells_to_cells["a"][0], 15.0)
+        # c→a (reverse): same path, should match exactly. Without the fix,
+        # cost=inf, aggs=NaN.
+        self.assertEqual(costs.cells_to_cells["c"][0], 3.0)
+        self.assertEqual(aggs["attr_sum"].cells_to_cells["c"][0], 30.0)
+        self.assertEqual(aggs["attr_mean"].cells_to_cells["c"][0], 15.0)
+
+    def test_undirected_simple_graph_path_traverses_either_direction(self):
+        """Same regression as above but for a non-Multi undirected graph."""
+        g = nx.Graph()
+        for node in ("a", "b", "c"):
+            g.add_node(node, x=0.0, y=0.0)
+        g.add_edge("a", "b", w=1.0, attr=10.0)
+        g.add_edge("b", "c", w=2.0, attr=20.0)
+        pairs = TieredODNodePairs(
+            cells_to_cells={
+                "a": np.array(["c"]),
+                "c": np.array(["a"]),
+            }
+        )
+        agg = [PathAggregation("attr_sum", "attr", "sum")]
+        costs, aggs = tiered_path_aggregate(pairs, g, weight="w", edge_aggregations=agg)
+        self.assertEqual(costs.cells_to_cells["a"][0], 3.0)
+        self.assertEqual(costs.cells_to_cells["c"][0], 3.0)
+        self.assertEqual(aggs["attr_sum"].cells_to_cells["a"][0], 30.0)
+        self.assertEqual(aggs["attr_sum"].cells_to_cells["c"][0], 30.0)
+
     def test_mask_skips_destinations(self):
         """Mask=False destinations get inf cost and NaN aggregations."""
         pairs = self._pairs()

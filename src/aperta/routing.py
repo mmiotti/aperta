@@ -660,12 +660,20 @@ def _precompute_edge_arrays(
     the min-`weight` edge per `(u, v)` — matches the router's choice in
     `_graph_to_csr`.
 
+    For undirected graphs, `edge_index` carries BOTH orientations of every
+    edge pointing at the same array slot, mirroring `_graph_to_csr`'s
+    symmetric emission. Without this, a reconstructed path that traverses
+    an edge v→u (originally iterated as u→v) would miss the index lookup
+    in `_walk_paths_with_arrays` and the whole path would be marked invalid
+    (cost=inf, aggregations=NaN) even though it routes fine.
+
     Each per-edge attribute extractor runs *once* here (per graph edge),
     not once per (path, edge) traversal. That's the optimisation that lets
     callable attributes (e.g. derived per-edge quietness scores) stop
     dominating the inner loop.
     """
     is_multi = isinstance(graph, (nx.MultiGraph, nx.MultiDiGraph))
+    is_directed = graph.is_directed()
     edge_attr_fns = [_resolve_attribute(a.attribute) for a in edge_aggregations]
 
     chosen: dict = {}  # (u, v) -> (weight, data)
@@ -685,6 +693,8 @@ def _precompute_edge_arrays(
     feat_arrs = [np.empty(n_edges, dtype=dtype) for _ in edge_aggregations]
     for i, ((u, v), (w, data)) in enumerate(chosen.items()):
         edge_index[(u, v)] = i
+        if not is_directed:
+            edge_index[(v, u)] = i   # both orientations → same edge slot
         weight_arr[i] = w
         for j, attr_fn in enumerate(edge_attr_fns):
             feat_arrs[j][i] = float(attr_fn(u, v, data))
