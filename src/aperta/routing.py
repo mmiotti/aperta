@@ -639,10 +639,16 @@ def aggregate_along_paths(
     # quietness scores) — the callable runs once per graph edge instead
     # of once per (path, edge) traversal.
     edge_cache = _precompute_edge_arrays(graph, weight, edge_aggregations, dtype)
-    node_cache = (_precompute_node_arrays(graph, node_aggregations, dtype)
-                  if node_aggregations else None)
+    node_cache = (
+        _precompute_node_arrays(graph, node_aggregations, dtype) if node_aggregations else None
+    )
     return _walk_paths_with_arrays(
-        paths, edge_cache, node_cache, edge_aggregations, node_aggregations, dtype,
+        paths,
+        edge_cache,
+        node_cache,
+        edge_aggregations,
+        node_aggregations,
+        dtype,
     )
 
 
@@ -694,7 +700,7 @@ def _precompute_edge_arrays(
     for i, ((u, v), (w, data)) in enumerate(chosen.items()):
         edge_index[(u, v)] = i
         if not is_directed:
-            edge_index[(v, u)] = i   # both orientations → same edge slot
+            edge_index[(v, u)] = i  # both orientations → same edge slot
         weight_arr[i] = w
         for j, attr_fn in enumerate(edge_attr_fns):
             feat_arrs[j][i] = float(attr_fn(u, v, data))
@@ -787,7 +793,8 @@ def _walk_paths_with_arrays(
                 if nodes:
                     node_idx = np.fromiter(
                         (node_index[n_] for n_ in nodes),
-                        dtype=np.int64, count=len(nodes),
+                        dtype=np.int64,
+                        count=len(nodes),
                     )
                     node_vals = node_attr_arrs[j][node_idx]
                 else:
@@ -879,8 +886,9 @@ def tiered_path_aggregate(
     # workloads (utility, logsum, road stress) this is the dominant
     # speed-up vs the pre-vectorisation per-origin path walker.
     edge_cache = _precompute_edge_arrays(graph, weight, edge_aggregations, dtype)
-    node_cache = (_precompute_node_arrays(graph, node_aggregations, dtype)
-                  if node_aggregations else None)
+    node_cache = (
+        _precompute_node_arrays(graph, node_aggregations, dtype) if node_aggregations else None
+    )
 
     def _paths(orig, sub_dests):
         if zero_edge:
@@ -913,8 +921,12 @@ def tiered_path_aggregate(
 
         paths = _paths(orig, active_dests)
         sub_costs, sub_aggs = _walk_paths_with_arrays(
-            paths, edge_cache, node_cache,
-            edge_aggregations, node_aggregations, dtype,
+            paths,
+            edge_cache,
+            node_cache,
+            edge_aggregations,
+            node_aggregations,
+            dtype,
         )
         cost_arr[active_idx] = sub_costs
         for name in names:

@@ -494,19 +494,27 @@ class ReindexPerCellTierFilterTestCase(unittest.TestCase):
 
     def _filtered(self):
         return reindex_by_geo_unit(
-            self.pairs, None, self.cells,
+            self.pairs,
+            None,
+            self.cells,
             cell_node_column="node_id",
-            zones=self.zones, zone_node_column="node_id",
-            r_cells=self.R_CELLS, r_medium=self.R_MEDIUM, r_zones=self.R_ZONES,
+            zones=self.zones,
+            zone_node_column="node_id",
+            r_cells=self.R_CELLS,
+            r_medium=self.R_MEDIUM,
+            r_zones=self.R_ZONES,
         )[0]
 
     def _unfiltered(self):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
             return reindex_by_geo_unit(
-                self.pairs, None, self.cells,
+                self.pairs,
+                None,
+                self.cells,
                 cell_node_column="node_id",
-                zones=self.zones, zone_node_column="node_id",
+                zones=self.zones,
+                zone_node_column="node_id",
             )[0]
 
     def test_unfiltered_reindex_reproduces_bug(self):
@@ -515,30 +523,29 @@ class ReindexPerCellTierFilterTestCase(unittest.TestCase):
         This test PASSES only as long as the unfiltered path stays buggy —
         flagging if someone ever changes the legacy behavior."""
         out = self._unfiltered()
-        c2c_dest_zones_for_A1 = {
-            self.cells.loc[c, "zone_id"] for c in out.cells_to_cells["C_A1"]
-        }
+        c2c_dest_zones_for_A1 = {self.cells.loc[c, "zone_id"] for c in out.cells_to_cells["C_A1"]}
         c2z_dest_zones_for_A1 = set(out.cells_to_zones["C_A1"])
         overlap = c2c_dest_zones_for_A1 & c2z_dest_zones_for_A1
         self.assertIn(
-            "ZC", overlap,
+            "ZC",
+            overlap,
             msg="expected the multi-zone-snap-node union artifact to place "
-                "ZC in both c2c and c2z for C_A1 when filter is OFF",
+            "ZC in both c2c and c2z for C_A1 when filter is OFF",
         )
 
     def test_filter_eliminates_double_counting(self):
         out = self._filtered()
         for cell_id in self.cells.index:
             c2c_dest_zones = {
-                self.cells.loc[c, "zone_id"]
-                for c in out.cells_to_cells.get(cell_id, [])
+                self.cells.loc[c, "zone_id"] for c in out.cells_to_cells.get(cell_id, [])
             }
             c2z_dest_zones = set(out.cells_to_zones.get(cell_id, []))
             overlap = c2c_dest_zones & c2z_dest_zones
             self.assertEqual(
-                overlap, set(),
+                overlap,
+                set(),
                 msg=f"{cell_id}: c2c parent zones {c2c_dest_zones} and c2z zones "
-                    f"{c2z_dest_zones} must be disjoint (overlap={overlap})",
+                f"{c2z_dest_zones} must be disjoint (overlap={overlap})",
             )
 
     def test_filter_assigns_correct_tier_per_cell(self):
@@ -550,19 +557,18 @@ class ReindexPerCellTierFilterTestCase(unittest.TestCase):
             allowed_cell = self.EXPECTED_CELL_TIER[origin_zone]
             allowed_c2z = self.EXPECTED_C2Z[origin_zone]
             c2c_dest_zones = {
-                self.cells.loc[c, "zone_id"]
-                for c in out.cells_to_cells.get(cell_id, [])
+                self.cells.loc[c, "zone_id"] for c in out.cells_to_cells.get(cell_id, [])
             }
             c2z_dest_zones = set(out.cells_to_zones.get(cell_id, []))
             self.assertTrue(
                 c2c_dest_zones.issubset(allowed_cell),
                 msg=f"{cell_id} ({origin_zone}): c2c dest zones {c2c_dest_zones} "
-                    f"not within cell-tier {set(allowed_cell)}",
+                f"not within cell-tier {set(allowed_cell)}",
             )
             self.assertTrue(
                 c2z_dest_zones.issubset(allowed_c2z),
                 msg=f"{cell_id} ({origin_zone}): c2z dest zones {c2z_dest_zones} "
-                    f"not within c2z {set(allowed_c2z)}",
+                f"not within c2z {set(allowed_c2z)}",
             )
 
     def test_filter_is_lossless_for_tier_correct_dests(self):
@@ -578,25 +584,27 @@ class ReindexPerCellTierFilterTestCase(unittest.TestCase):
             # c2c: every unfiltered dest whose parent zone is in allowed_cell
             # should be present in filtered output.
             uf_c2c_kept = {
-                c for c in unfiltered.cells_to_cells.get(cell_id, [])
+                c
+                for c in unfiltered.cells_to_cells.get(cell_id, [])
                 if self.cells.loc[c, "zone_id"] in allowed_cell
             }
             f_c2c = set(filtered.cells_to_cells.get(cell_id, []))
             self.assertEqual(
-                uf_c2c_kept, f_c2c,
+                uf_c2c_kept,
+                f_c2c,
                 msg=f"{cell_id}: filter dropped tier-correct c2c dests "
-                    f"(expected {uf_c2c_kept}, got {f_c2c})",
+                f"(expected {uf_c2c_kept}, got {f_c2c})",
             )
             # c2z: same check.
             uf_c2z_kept = {
-                z for z in unfiltered.cells_to_zones.get(cell_id, [])
-                if z in allowed_c2z
+                z for z in unfiltered.cells_to_zones.get(cell_id, []) if z in allowed_c2z
             }
             f_c2z = set(filtered.cells_to_zones.get(cell_id, []))
             self.assertEqual(
-                uf_c2z_kept, f_c2z,
+                uf_c2z_kept,
+                f_c2z,
                 msg=f"{cell_id}: filter dropped tier-correct c2z dests "
-                    f"(expected {uf_c2z_kept}, got {f_c2z})",
+                f"(expected {uf_c2z_kept}, got {f_c2z})",
             )
 
     def test_costs_aligned_after_filter(self):
@@ -616,10 +624,15 @@ class ReindexPerCellTierFilterTestCase(unittest.TestCase):
             },
         )
         new_pairs, new_odm = reindex_by_geo_unit(
-            self.pairs, odm, self.cells,
+            self.pairs,
+            odm,
+            self.cells,
             cell_node_column="node_id",
-            zones=self.zones, zone_node_column="node_id",
-            r_cells=self.R_CELLS, r_medium=self.R_MEDIUM, r_zones=self.R_ZONES,
+            zones=self.zones,
+            zone_node_column="node_id",
+            r_cells=self.R_CELLS,
+            r_medium=self.R_MEDIUM,
+            r_zones=self.R_ZONES,
         )
         for cell_id in self.cells.index:
             for tier_name in ("cells_to_cells", "cells_to_zones"):
@@ -628,7 +641,8 @@ class ReindexPerCellTierFilterTestCase(unittest.TestCase):
                 if p is None and v is None:
                     continue
                 self.assertEqual(
-                    len(p), len(v),
+                    len(p),
+                    len(v),
                     msg=f"{cell_id} {tier_name}: pair/odm length mismatch",
                 )
 
@@ -637,9 +651,12 @@ class ReindexPerCellTierFilterTestCase(unittest.TestCase):
         callers know they're getting the legacy unfiltered (buggy) path."""
         with self.assertWarns(UserWarning):
             reindex_by_geo_unit(
-                self.pairs, None, self.cells,
+                self.pairs,
+                None,
+                self.cells,
                 cell_node_column="node_id",
-                zones=self.zones, zone_node_column="node_id",
+                zones=self.zones,
+                zone_node_column="node_id",
             )
 
     def test_partial_radii_raises(self):
@@ -647,9 +664,12 @@ class ReindexPerCellTierFilterTestCase(unittest.TestCase):
         error — better to fail fast than silently disable the filter."""
         with self.assertRaises(ValueError):
             reindex_by_geo_unit(
-                self.pairs, None, self.cells,
+                self.pairs,
+                None,
+                self.cells,
                 cell_node_column="node_id",
-                zones=self.zones, zone_node_column="node_id",
+                zones=self.zones,
+                zone_node_column="node_id",
                 r_cells=self.R_CELLS,  # r_medium missing
             )
 
@@ -657,10 +677,14 @@ class ReindexPerCellTierFilterTestCase(unittest.TestCase):
         cells_no_zone = self.cells.drop(columns="zone_id")
         with self.assertRaises(ValueError):
             reindex_by_geo_unit(
-                self.pairs, None, cells_no_zone,
+                self.pairs,
+                None,
+                cells_no_zone,
                 cell_node_column="node_id",
-                zones=self.zones, zone_node_column="node_id",
-                r_cells=self.R_CELLS, r_medium=self.R_MEDIUM,
+                zones=self.zones,
+                zone_node_column="node_id",
+                r_cells=self.R_CELLS,
+                r_medium=self.R_MEDIUM,
             )
 
 

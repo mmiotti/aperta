@@ -288,8 +288,10 @@ class TieredPathAggregateTestCase(unittest.TestCase):
                 "c": np.array(["a"]),
             }
         )
-        agg = [PathAggregation("attr_sum", "attr", "sum"),
-               PathAggregation("attr_mean", "attr", "mean")]
+        agg = [
+            PathAggregation("attr_sum", "attr", "sum"),
+            PathAggregation("attr_mean", "attr", "mean"),
+        ]
         costs, aggs = tiered_path_aggregate(pairs, g, weight="w", edge_aggregations=agg)
         # a→c (forward): cost 3, attr_sum 30, attr_mean 15
         self.assertEqual(costs.cells_to_cells["a"][0], 3.0)

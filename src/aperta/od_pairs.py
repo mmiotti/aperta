@@ -921,9 +921,7 @@ def _build_per_zone_tier_sets(
     if zones_centroids is None:
         zones_centroids = zones.geometry.centroid
     zone_ids = list(zones.index)
-    zone_xy = np.column_stack(
-        [zones_centroids.x.to_numpy(), zones_centroids.y.to_numpy()]
-    )
+    zone_xy = np.column_stack([zones_centroids.x.to_numpy(), zones_centroids.y.to_numpy()])
     tree = cKDTree(zone_xy)
     upper_r = r_zones if r_zones is not None else r_medium
     per_zone_cell: dict = {}
@@ -1070,18 +1068,20 @@ def reindex_by_geo_unit(
                 stacklevel=2,
             )
         per_zone_cell, per_zone_c2z, per_zone_z2z = _build_per_zone_tier_sets(
-            zones, r_cells, r_medium, r_zones, zones_centroids=zones_centroids,
+            zones,
+            r_cells,
+            r_medium,
+            r_zones,
+            zones_centroids=zones_centroids,
         )
         cell_id_to_zone = {
             cid: zid for cid, zid in zip(cells.index, cells["zone_id"]) if pd.notna(zid)
         }
         cell_allowed_c2c = {
-            cid: per_zone_cell.get(zid, frozenset({zid}))
-            for cid, zid in cell_id_to_zone.items()
+            cid: per_zone_cell.get(zid, frozenset({zid})) for cid, zid in cell_id_to_zone.items()
         }
         cell_allowed_c2z = {
-            cid: per_zone_c2z.get(zid, frozenset())
-            for cid, zid in cell_id_to_zone.items()
+            cid: per_zone_c2z.get(zid, frozenset()) for cid, zid in cell_id_to_zone.items()
         }
         # z2z is keyed by zone_id directly — the per-zone z2z set IS the
         # per-origin filter dict.
@@ -1109,7 +1109,7 @@ def reindex_by_geo_unit(
             cell_node_column,
             zone_node_column,
             origin_allowed_dest_zones=cell_allowed_c2z,
-            dest_unit_to_zone=None,   # dest IS a zone — du == zone_id
+            dest_unit_to_zone=None,  # dest IS a zone — du == zone_id
         )
     zones_pairs: dict | None = None
     zones_odm: dict | None = None
@@ -1123,7 +1123,7 @@ def reindex_by_geo_unit(
             zone_node_column,
             zone_node_column,
             origin_allowed_dest_zones=zone_allowed_z2z,
-            dest_unit_to_zone=None,   # dest IS a zone — du == zone_id
+            dest_unit_to_zone=None,  # dest IS a zone — du == zone_id
         )
 
     new_pairs = TieredODGeoPairs(
