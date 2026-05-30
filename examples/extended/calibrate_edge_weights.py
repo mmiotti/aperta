@@ -16,6 +16,20 @@
 # %% [markdown]
 # # Calibrate car edge weights against observed trip times
 #
+# > ⚠️ **Data availability.** This notebook requires ground-truth car
+# > travel times derived from the Google Maps Directions API on
+# > origin coordinates from the protected Swiss MTMC mobility survey
+# > (`data/ground_truth/travel_times_car_peak.csv`). Aperta cannot
+# > redistribute this file under its source terms. The notebook is
+# > shipped as documentation of the calibration *method* — the model
+# > spec, fitting loop, diagnostics, and outputs are inspectable end-to-end
+# > — but cells past §4 will not run without the private inputs. The rest
+# > of the extended example (`prepare/`, `accessibility.ipynb`) runs
+# > entirely on public OSM data. A public-data version of this notebook
+# > is planned for a future release; any replacement data with the same
+# > schema (`orig_x, orig_y, dest_x, dest_y, time_measured, dist_measured,
+# > dist_line`) drops in directly.
+#
 # Iteratively calibrates the per-edge duration formula for cars against
 # Google-Maps-derived point-to-point travel times. All inputs come from
 # `prepare/`: the consolidated car graph (`prepare/1_download` for

@@ -16,6 +16,19 @@
 # %% [markdown]
 # # `flow_estimate` — per-edge AADT as a congestion proxy
 #
+# > ⚠️ **Data availability.** This notebook requires two ground-truth
+# > inputs that aperta cannot redistribute under their source terms:
+# > Swiss ASTRA traffic-counter readings (`data/ground_truth/
+# > traffic_counters.gpkg`) and Google-Maps-derived car travel times
+# > (`data/ground_truth/travel_times_car_peak.csv`, the same file used by
+# > `calibrate_edge_weights.ipynb`). The notebook is shipped as
+# > documentation of the flow-estimation *method* and the counter-fit
+# > diagnostics — the model spec, sampling logic, and evaluation are
+# > inspectable end-to-end — but cells that read the ground-truth files
+# > will not run without them. The rest of the extended example
+# > (`prepare/`, `accessibility.ipynb`) runs entirely on public OSM data.
+# > A public-data version is planned for a future release.
+#
 # Estimates per-edge AADT for the car network via cost-decay-weighted
 # nested-betweenness sampling. The output is a rough proxy for "traffic
 # pressure" on each edge, suitable as a feature in car edge-weight
