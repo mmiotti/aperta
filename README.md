@@ -54,7 +54,7 @@ Aperta is organized around a six-phase workflow. Phases 4 and 5's calibration su
 5. **Estimate travel costs** — shortest paths on the routing graph plus per-cell trip overheads. Optionally: utility-based generalized costs and edge-weight calibration against observed travel times.
 6. **Calculate accessibilities** — cumulative-opportunity, gravity, nearest-k, logsum (and cross-modal aggregation across per-mode results).
 
-See the [Modules](#modules) table below for which module covers each phase, and the [API reference](https://aperta.readthedocs.io/) for the specific functions.
+See the [API reference](https://aperta.readthedocs.io/en/latest/api/) for which module covers each phase and for the specific functions.
 
 Runnable examples, in increasing depth:
 
@@ -108,7 +108,7 @@ Aperta deliberately doesn't try to do everything in-house. Two interoperability 
 
 ## Benchmark vs Pandana
 
-Ultimate speed for the full accessibility stack was not aperta's goal. Nonetheless, aperta typically runs within 1–5× of Pandana on equivalent cumulative-opportunity workloads. When the area of interest (for which to calculate accessibilities) is substantially smaller than the buffer zone (destinations to consider), or when aiming to recalculate accessibilities for a select subset of locations after a graph topology or edge weight change, aperta can even be faster than Pandana. See the [benchmark](https://aperta.readthedocs.io/en/latest/benchmark/) for the full setup and numbers, or run [`examples/extended/benchmark.py`](examples/extended/benchmark.py) to reproduce.
+Ultimate speed for the full accessibility stack was not aperta's goal. Nonetheless, aperta typically runs within 1–5× of Pandana on equivalent cumulative-opportunity workloads. When the area of interest (for which to calculate accessibilities) is substantially smaller than the buffer zone (destinations to consider), or when aiming to recalculate accessibilities for a select subset of locations after a graph topology or edge weight change, aperta can even be faster than Pandana. See the [benchmark](https://aperta.readthedocs.io/en/latest/benchmark.html) for the full setup and numbers, or run [`examples/extended/benchmark.py`](examples/extended/benchmark.py) to reproduce.
 
 ## Acknowledgments
 
