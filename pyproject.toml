@@ -66,6 +66,13 @@ dependencies = [
 #
 # Install with `pip install 'aperta[osm]'` (or any other extra), or
 # `pip install 'aperta[examples]'` for the full notebook environment.
+[project.urls]
+Homepage      = "https://github.com/mmiotti/aperta"
+Documentation = "https://aperta.readthedocs.io/"
+Repository    = "https://github.com/mmiotti/aperta"
+Issues        = "https://github.com/mmiotti/aperta/issues"
+Changelog     = "https://github.com/mmiotti/aperta/blob/main/CHANGELOG.md"
+
 [project.optional-dependencies]
 osm = ["osmnx>=2.0"]
 topo = ["rasterio>=1.3", "requests>=2.28"]

@@ -1,0 +1,26 @@
+{
+  "title": "Aperta: Path-first, cross-modal accessibility analysis in Python",
+  "description": "Open-source Python library for cross-modal accessibility analysis on transport networks. Path-first routing returns the realized route alongside the travel cost as a single primitive; a tiered origin–destination structure keeps the approach tractable from city to country scale; mode and network are orthogonal, so walking, cycling, and car accessibilities on different networks combine natively. Includes integrated traffic-flow estimation and iterative edge-weight calibration.",
+  "license": "MIT",
+  "upload_type": "software",
+  "access_right": "open",
+  "creators": [
+    {
+      "name": "Miotti, Marco",
+      "affiliation": "ETH Zurich",
+      "orcid": "0000-0003-4458-6253"
+    }
+  ],
+  "keywords": [
+    "accessibility",
+    "transport networks",
+    "routing",
+    "cross-modal",
+    "path-first",
+    "utility-based accessibility",
+    "logsum",
+    "open-source",
+    "Python",
+    "GIS"
+  ]
+}

@@ -35,8 +35,7 @@ Requires Python ≥ 3.11.
 ## Get started
 
 - **Quickest read** — the [README](https://github.com/mmiotti/aperta/blob/main/README.md)
-  has a 30-line walking-accessibility example showing one aperta call per
-  workflow phase.
+  shows the three-line core of an aperta accessibility analysis.
 - **Runnable minimal example** —
   [`examples/minimal/accessibility.ipynb`](https://github.com/mmiotti/aperta/blob/main/examples/minimal/accessibility.ipynb)
   (Cambridge MA, ~10 s).
@@ -61,6 +60,7 @@ OSM / topography helpers.
 :caption: Reference
 
 api/index
+benchmark
 ```
 
 ```{toctree}
