@@ -106,7 +106,7 @@ Aperta deliberately doesn't try to do everything in-house. Two interoperability 
 
 ## Benchmark vs Pandana
 
-Aperta runs within 1–2× of Pandana on equivalent cumulative-opportunity workloads, depending on regime. Pandana wins on one-shot cost-only queries on a single fixed network (its design center); aperta wins when origins can be restricted relative to graph size or when the workload is path-aware, iterative, or cross-modal. See the [benchmark](https://aperta.readthedocs.io/en/latest/benchmark/) for the full setup and numbers, or run [`examples/extended/benchmark.py`](examples/extended/benchmark.py) to reproduce.
+Ultimate speed for the full accessibility stack was not aperta's goal. Nonetheless, aperta typically runs within 1–5× of Pandana on equivalent cumulative-opportunity workloads, especially when the area of interest (for which to calculate accessibilities) is substantially smaller than the buffer zone (destinations to consider). Aperta can be much faster than Pandana when aiming to recalculate accessibilities for a select subset of locations after a graph topology or edge weight change. See the [benchmark](https://aperta.readthedocs.io/en/latest/benchmark/) for the full setup and numbers, or run [`examples/extended/benchmark.py`](examples/extended/benchmark.py) to reproduce.
 
 ## Acknowledgments
 
