@@ -21,10 +21,9 @@
 # constants below to retarget plots; the underlying data is whatever
 # `prepare/1_download` produced (driven by `SEED_LOCATION` there).
 #
-# Tutorial-scope accessibility analysis across three modes (walk, bike,
-# car) on real OSM data, with published-paper edge-weight coefficients
-# applied inline (Miotti et al., *Transportation*). One representative
-# variant per mode for clarity. Ends with a cross-modal logsum that
+# Tutorial-scope accessibility analysis across three modes (walk, bike, car) on
+# real OSM data, with published-paper edge-weight coefficients applied inline. One
+# representative variant per mode for clarity. Ends with a cross-modal logsum that
 # combines all three modes into one accessibility surface.
 #
 # **Inputs** (all from `prepare/`):
@@ -168,14 +167,6 @@ OVERHEAD_COEF = {
 # so it's always > 0 — `ln(t_min)` doesn't need a floor here.
 # Approximations informed by an ongoing project; placeholders pending a
 # public reference.
-# UTILITY_COEF = {
-#     'walk':         {'asc':  0.0, 'time': -0.03, 'time_log': -2.5,
-#                      'density':  0.0,  'bike_score': 0.5},
-#     'bike_regular': {'asc': -4.0, 'time': -0.05, 'time_log': -1.5,
-#                      'density': -0.2, 'bike_score': 1.5},
-#     'car_peak':  {'asc': -6.1, 'time': -0.07, 'time_log': -0.9,
-#                      'density': -0.5,  'bike_score': 0.0},
-# }
 UTILITY_COEF = {
     'walk':         {'asc':  0.0, 'time': -0.30, 'time_log': -0.0,
                      'density':  0.0,  'bike_score': 0.0},

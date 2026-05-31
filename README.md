@@ -7,6 +7,8 @@
 
 A Python toolkit for **cross-modal accessibility analysis on transport networks** — routing, distance/time computation, utility-based travel costs, and gravity- and logsum-based accessibility metrics on `networkx` graphs (routed via `scipy.sparse.csgraph`).
 
+![Three families of aperta capabilities, illustrated on the Bern region: network preparation (estimated traffic volumes and calibrated edge speeds), path feature collection (bike-comfort scores along realized routes and aggregated per origin cell), and accessibility analysis (time-based access to hiking opportunities and cross-modal utility-based access to groceries).](docs/assets/hero.jpg)
+
 The name is Latin/Italian for *open* — the condition that accessibility, at root, measures.
 
 ## Status
@@ -87,14 +89,14 @@ See the [API reference](https://aperta.readthedocs.io/en/latest/api/) for module
 
 What aperta is:
 
-- **Path-first.** Every routing call returns the realized route alongside the OD travel cost as a single primitive — so any per-edge or per-node attribute (gradient, perceived safety, surface type, air-pollution exposure, road stress, ...) can be aggregated along each route in the same pass. This is the architectural prerequisite for utility-based travel costs, joint accessibility-and-exposure assessment, route-aware infrastructure-quality metrics, and any other analysis that depends on what happens *along* the route, not just at its endpoints.
-- **Cross-modal.** Mode and network are orthogonal: one network per mode, where "mode" generalises to any independently-varying network — walking vs cycling vs driving, but also day-time vs night-time street access, congested vs free-flow edge weights, with vs without a proposed bike-lane scenario. Cross-mode aggregation (`min`, `logsum`) over per-network cost ODMs is a first-class operation. Logsum aggregation closes the utility loop — discrete-choice-consistent accessibility across modes from per-mode utilities.
-- **Multi-scale by construction.** The tiered cells / zones / three-distance-tier OD structure bounds per-origin computation independently of the network's geographic extent. Country-scale reach without country-scale destination counts; intermediate cost matrices stay small enough to persist to disk and share.
-- **Live-graph routing.** Shortest paths run on the graph directly via `scipy.sparse.csgraph.dijkstra` — no precomputed routing index. Per-query routing is slower than contraction-hierarchy-based tools (OSRM, Pandana/pandarm), but edge-weight changes are immediate, which is what makes iterative calibration, traffic-flow estimation, and scenario comparison practical. Edge weights are written by plain Python callables; no Lua / YAML / JSON profile format to learn.
+- **Path-first.** Routing returns the realized route alongside the cost as a single primitive, so per-edge attributes (gradient, exposure, surface, perceived safety) aggregate along the path natively — the architectural prerequisite for utility-based and route-aware accessibility.
+- **Cross-modal.** Mode and network are orthogonal: one network per mode, with `min` / `logsum` aggregation across modes as a first-class operation. Generalizes to any axis of network variation — time-of-day, congestion regime, infrastructure scenario.
+- **Multi-scale.** A tiered cell / zone OD structure bounds per-origin computation independently of network extent — country-scale reach without country-scale destination counts.
+- **Live-graph routing.** Dijkstra on the graph directly, no precomputed index. Slower per query than contraction-hierarchy tools, but edge-weight changes are immediate — what makes iterative calibration and scenario comparison practical.
 
 What aperta is not:
 
-- **No filesystem assumptions.** Algorithm functions take plain `networkx` graphs, `pandas` / `geopandas` frames, and `numpy` arrays. They don't read or write files.
+- **No filesystem assumptions.** Algorithm functions take plain `networkx` graphs, `pandas` / `geopandas` frames, and `numpy` arrays — no file I/O.
 - **No DAG engine, no global state.** No caching, no dependency tracking, no orchestration. Every function takes its inputs explicitly. For DAG features, layer [DVC](https://dvc.org/) or [Snakemake](https://snakemake.readthedocs.io/) on top.
 
 ## Interoperability with other accessibility tools
@@ -106,7 +108,7 @@ Aperta deliberately doesn't try to do everything in-house. Two interoperability 
 
 ## Benchmark vs Pandana
 
-Ultimate speed for the full accessibility stack was not aperta's goal. Nonetheless, aperta typically runs within 1–5× of Pandana on equivalent cumulative-opportunity workloads, especially when the area of interest (for which to calculate accessibilities) is substantially smaller than the buffer zone (destinations to consider). Aperta can be much faster than Pandana when aiming to recalculate accessibilities for a select subset of locations after a graph topology or edge weight change. See the [benchmark](https://aperta.readthedocs.io/en/latest/benchmark/) for the full setup and numbers, or run [`examples/extended/benchmark.py`](examples/extended/benchmark.py) to reproduce.
+Ultimate speed for the full accessibility stack was not aperta's goal. Nonetheless, aperta typically runs within 1–5× of Pandana on equivalent cumulative-opportunity workloads. When the area of interest (for which to calculate accessibilities) is substantially smaller than the buffer zone (destinations to consider), or when aiming to recalculate accessibilities for a select subset of locations after a graph topology or edge weight change, aperta can even be faster than Pandana. See the [benchmark](https://aperta.readthedocs.io/en/latest/benchmark/) for the full setup and numbers, or run [`examples/extended/benchmark.py`](examples/extended/benchmark.py) to reproduce.
 
 ## Acknowledgments
 

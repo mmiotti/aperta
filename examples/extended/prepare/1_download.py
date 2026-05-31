@@ -28,16 +28,16 @@
 # a larger *destination polygon* where data must be available so the
 # accessibility at the AOI edge isn't clipped.
 #
-# As a result, the AOI area (~300 km²) is much smaller than the total area (~4,000
+# As a result, the AOI area (~750 km²) is much smaller than the total area (~6,000
 # km²), caused by the generous 30 km buffer that ensures driving accessibilities
 # are meaningful throughout the AOI. Our tiered, asymmetric origin-destination
 # matrices make use of this structure and can be used to limit routing
 # calculations to only those locations that are actually needed for the
 # accessibility analysis.
 #
-# At the default scope (~40 km radius around Bern) we are comfortably inside
-# Switzerland, so cross-border extrapolation of employment is not yet needed.
-# Notebook 2 is designed to accommodate it when the scope expands across borders.
+# At the default scope (~40 km radius around Bern) we are still inside Switzerland, so cross-border
+# extrapolation of employment is not yet needed. Notebook 2 is designed to accommodate it when the
+# scope expands across borders.
 #
 # **Running the example for a different scope:**
 #
