@@ -124,8 +124,8 @@ If you use aperta in a publication, please cite the archived release:
   title     = {{Aperta: Path-first, cross-modal accessibility analysis in Python}},
   year      = 2026,
   publisher = {Zenodo},
-  doi       = {10.5281/zenodo.XXXXXXX},
-  url       = {https://doi.org/10.5281/zenodo.XXXXXXX}
+  doi       = {10.5281/zenodo.20473787},
+  url       = {https://doi.org/10.5281/zenodo.20473787}
 }
 ```
 
