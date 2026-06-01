@@ -18,7 +18,7 @@ What each notebook covers:
 
 Each `.ipynb` is paired with a `.py` via [Jupytext](https://jupytext.readthedocs.io/) (one source of truth in git diffs; the `.ipynb` is rendered on ReadTheDocs and GitHub).
 
-> 💡 **GitHub's notebook renderer is unreliable** (intermittent "An error occurred" errors). The **View on RTD ↗** links above always work and are the recommended way to view rendered notebooks.
+> 💡 **Note:** GitHub's notebook renderer is currently experiencing an outage affecting many repositories (see [community discussion](https://github.com/orgs/community/discussions/197350)). The **View on RTD ↗** links above are the recommended way to view rendered notebooks; they work regardless of GitHub's renderer status.
 
 ### Data availability for the calibration notebooks
 
