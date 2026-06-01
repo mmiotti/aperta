@@ -18,7 +18,12 @@ import numpy as np
 import pandas as pd
 
 from aperta.od_pairs import TieredODNodePairs
-from aperta.traffic_flows import estimate_edge_flows, nested_node_sample
+from aperta.traffic_flows import (
+    bin_adjusted_dest_weights,
+    estimate_edge_flows,
+    nested_node_sample,
+    percentile_bin_edges,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -428,3 +433,237 @@ class NestedNodeSampleMiddleTierTestCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Bin-adjusted destination weights (sampling-bias fix helpers)
+# ---------------------------------------------------------------------------
+
+
+class PercentileBinEdgesTestCase(unittest.TestCase):
+    def test_uniform_input_yields_equal_spacing(self):
+        edges = percentile_bin_edges(np.linspace(0.0, 100.0, 1001), n_bins=10)
+        self.assertEqual(edges.shape, (11,))
+        np.testing.assert_allclose(np.diff(edges), 10.0, atol=0.1)
+
+    def test_skewed_input_yields_unequal_spacing(self):
+        """Each bin should still contain ~1/n of the data, so highly-skewed
+        input produces unequal-width bins concentrating where data is dense."""
+        rng = np.random.default_rng(0)
+        skewed = rng.exponential(scale=1.0, size=10_000)
+        edges = percentile_bin_edges(skewed, n_bins=20)
+        bin_counts, _ = np.histogram(skewed, bins=edges)
+        # Each bin should hold ~ 500 = 10_000/20 samples within 10%.
+        np.testing.assert_allclose(bin_counts, 500, rtol=0.10)
+
+    def test_drops_non_finite(self):
+        data = np.array([1.0, 2.0, np.nan, 3.0, np.inf, 4.0])
+        edges = percentile_bin_edges(data, n_bins=3)
+        # Should equal percentiles of [1, 2, 3, 4].
+        np.testing.assert_allclose(
+            edges, np.percentile([1.0, 2.0, 3.0, 4.0], [0, 33.3, 66.7, 100]), atol=0.1
+        )
+
+    def test_empty_after_drop_raises(self):
+        with self.assertRaisesRegex(ValueError, "empty"):
+            percentile_bin_edges(np.array([np.nan, np.inf]))
+
+
+class BinAdjustedDestWeightsTestCase(unittest.TestCase):
+    """Per-origin per-bin reweighting fixes the cost-distribution bias."""
+
+    def setUp(self):
+        # Two origins, each with 6 destinations at known costs.
+        # Origin "rich":   destinations spread across all 4 bins (cost 5, 15, 25, 35, 45, 55).
+        # Origin "sparse": destinations only in bins 0 and 3 (cost 5, 5, 55, 55, 55, 55).
+        self.bin_edges = np.array([0.0, 10.0, 20.0, 40.0, 60.0])  # 4 bins
+        self.pairs = TieredODNodePairs(
+            cells_to_cells={
+                "rich":   np.array(["d1", "d2", "d3", "d4", "d5", "d6"]),
+                "sparse": np.array(["d1", "d2", "d3", "d4", "d5", "d6"]),
+            },
+        )
+        self.costs = TieredODNodePairs(
+            cells_to_cells={
+                "rich":   np.array([5.0, 15.0, 25.0, 35.0, 45.0, 55.0]),
+                "sparse": np.array([5.0,  5.0, 55.0, 55.0, 55.0, 55.0]),
+            },
+        )
+        # Uniform W(D) = 1 for all destinations.
+        self.weights = TieredODNodePairs(
+            cells_to_cells={
+                "rich":   np.ones(6),
+                "sparse": np.ones(6),
+            },
+        )
+        self.n_bins = 4
+
+    def _bin_of(self, costs):
+        """Map costs back to bin indices the same way the helper does."""
+        return np.digitize(costs, self.bin_edges) - 1
+
+    def test_returns_same_subclass(self):
+        adj = bin_adjusted_dest_weights(
+            self.pairs, self.costs, self.weights, self.bin_edges
+        )
+        self.assertIsInstance(adj, TieredODNodePairs)
+
+    def test_per_bin_total_matches_target_for_rich_origin(self):
+        """Origin with destinations in every bin: each bin's adjusted weight
+        should equal target = 1/n_bins (before renormalize) or stay
+        proportional after."""
+        adj = bin_adjusted_dest_weights(
+            self.pairs, self.costs, self.weights, self.bin_edges,
+            renormalize_per_origin=False,
+        )
+        w_rich = adj.cells_to_cells["rich"]
+        bin_idx = self._bin_of(self.costs.cells_to_cells["rich"])
+        per_bin = np.bincount(bin_idx, weights=w_rich, minlength=self.n_bins)
+        # Each of the 4 bins is populated: each should sum to 1/4.
+        np.testing.assert_allclose(per_bin, 0.25, rtol=1e-12)
+
+    def test_per_bin_relative_proportions_match_target_for_sparse_origin(self):
+        """Origin with destinations only in 2 bins: with renormalize=True,
+        those bins should each hold the SAME fraction of total weight (since
+        target is uniform 1/n_bins), regardless of how many destinations
+        each bin holds."""
+        adj = bin_adjusted_dest_weights(
+            self.pairs, self.costs, self.weights, self.bin_edges,
+            renormalize_per_origin=True,
+        )
+        w_sparse = adj.cells_to_cells["sparse"]
+        bin_idx = self._bin_of(self.costs.cells_to_cells["sparse"])
+        per_bin = np.bincount(bin_idx, weights=w_sparse, minlength=self.n_bins)
+        # Bin 0 (2 dests at cost=5) and bin 3 (4 dests at cost=55) are populated.
+        # After renormalisation, each of those bins should hold 50% of weight.
+        np.testing.assert_allclose(per_bin[0], 0.5, rtol=1e-12)
+        np.testing.assert_allclose(per_bin[3], 0.5, rtol=1e-12)
+        np.testing.assert_allclose(per_bin[1], 0.0, atol=1e-12)
+        np.testing.assert_allclose(per_bin[2], 0.0, atol=1e-12)
+
+    def test_within_bin_proportions_follow_input_weights(self):
+        """When two destinations share a bin, the within-bin allocation
+        should be proportional to their input W(D)."""
+        pairs = TieredODNodePairs(
+            cells_to_cells={"o": np.array(["a", "b"])},
+        )
+        costs = TieredODNodePairs(
+            cells_to_cells={"o": np.array([5.0, 5.0])},  # both in bin 0
+        )
+        weights = TieredODNodePairs(
+            cells_to_cells={"o": np.array([3.0, 1.0])},  # a:b = 3:1
+        )
+        adj = bin_adjusted_dest_weights(
+            pairs, costs, weights, self.bin_edges, renormalize_per_origin=True
+        )
+        w = adj.cells_to_cells["o"]
+        # Total = 1, ratio 3:1 -> 0.75, 0.25.
+        np.testing.assert_allclose(w, [0.75, 0.25], rtol=1e-12)
+
+    def test_renormalize_makes_sparse_and_rich_have_same_total(self):
+        adj = bin_adjusted_dest_weights(
+            self.pairs, self.costs, self.weights, self.bin_edges,
+            renormalize_per_origin=True,
+        )
+        np.testing.assert_allclose(adj.cells_to_cells["rich"].sum(), 1.0, rtol=1e-12)
+        np.testing.assert_allclose(adj.cells_to_cells["sparse"].sum(), 1.0, rtol=1e-12)
+
+    def test_no_renormalize_makes_sparse_total_less_than_rich(self):
+        adj = bin_adjusted_dest_weights(
+            self.pairs, self.costs, self.weights, self.bin_edges,
+            renormalize_per_origin=False,
+        )
+        # rich: 4 populated bins × 0.25 = 1.0;
+        # sparse: 2 populated bins × 0.25 = 0.5.
+        np.testing.assert_allclose(adj.cells_to_cells["rich"].sum(), 1.0, rtol=1e-12)
+        np.testing.assert_allclose(adj.cells_to_cells["sparse"].sum(), 0.5, rtol=1e-12)
+
+    def test_out_of_range_destinations_get_zero_weight(self):
+        """Destinations whose cost is outside [bin_edges[0], bin_edges[-1]]
+        should be excluded."""
+        pairs = TieredODNodePairs(
+            cells_to_cells={"o": np.array(["below", "in", "above"])},
+        )
+        costs = TieredODNodePairs(
+            cells_to_cells={"o": np.array([-5.0, 30.0, 100.0])},  # below 0 / in / above 60
+        )
+        weights = TieredODNodePairs(
+            cells_to_cells={"o": np.array([1.0, 1.0, 1.0])},
+        )
+        adj = bin_adjusted_dest_weights(
+            pairs, costs, weights, self.bin_edges, renormalize_per_origin=True
+        )
+        w = adj.cells_to_cells["o"]
+        # Only "in" should be non-zero.
+        self.assertEqual(w[0], 0.0)
+        self.assertGreater(w[1], 0.0)
+        self.assertEqual(w[2], 0.0)
+        # And the in-range one carries all the renormalised weight.
+        np.testing.assert_allclose(w[1], 1.0, rtol=1e-12)
+
+    def test_origin_with_no_in_range_destinations_yields_zeros(self):
+        """If every destination is out of range, adjusted weights are all 0;
+        renormalisation must not divide by zero."""
+        pairs = TieredODNodePairs(
+            cells_to_cells={"o": np.array(["x", "y"])},
+        )
+        costs = TieredODNodePairs(
+            cells_to_cells={"o": np.array([100.0, 200.0])},  # both above max edge
+        )
+        weights = TieredODNodePairs(
+            cells_to_cells={"o": np.array([1.0, 1.0])},
+        )
+        adj = bin_adjusted_dest_weights(
+            pairs, costs, weights, self.bin_edges, renormalize_per_origin=True
+        )
+        np.testing.assert_array_equal(adj.cells_to_cells["o"], [0.0, 0.0])
+
+    def test_all_tiers_processed_when_present(self):
+        """When zones_to_zones is populated, it should be adjusted too."""
+        pairs = TieredODNodePairs(
+            cells_to_cells={"c1": np.array(["c1"])},
+            zones_to_zones={"z1": np.array(["z2"])},
+        )
+        costs = TieredODNodePairs(
+            cells_to_cells={"c1": np.array([5.0])},
+            zones_to_zones={"z1": np.array([55.0])},
+        )
+        weights = TieredODNodePairs(
+            cells_to_cells={"c1": np.array([1.0])},
+            zones_to_zones={"z1": np.array([1.0])},
+        )
+        adj = bin_adjusted_dest_weights(
+            pairs, costs, weights, self.bin_edges, renormalize_per_origin=True
+        )
+        self.assertIsNotNone(adj.cells_to_cells)
+        self.assertIsNotNone(adj.zones_to_zones)
+        np.testing.assert_allclose(adj.cells_to_cells["c1"], [1.0])
+        np.testing.assert_allclose(adj.zones_to_zones["z1"], [1.0])
+
+    def test_absent_tier_stays_none(self):
+        """When cells_to_zones is None in the input, it stays None in output."""
+        pairs = TieredODNodePairs(
+            cells_to_cells={"c1": np.array(["c1"])},
+        )
+        costs = TieredODNodePairs(
+            cells_to_cells={"c1": np.array([5.0])},
+        )
+        weights = TieredODNodePairs(
+            cells_to_cells={"c1": np.array([1.0])},
+        )
+        adj = bin_adjusted_dest_weights(
+            pairs, costs, weights, self.bin_edges
+        )
+        self.assertIsNone(adj.cells_to_zones)
+        self.assertIsNone(adj.zones_to_zones)
+
+    def test_invalid_bin_edges_raises(self):
+        with self.assertRaisesRegex(ValueError, "non-decreasing"):
+            bin_adjusted_dest_weights(
+                self.pairs, self.costs, self.weights,
+                np.array([0.0, 10.0, 5.0, 20.0]),  # not monotone
+            )
+        with self.assertRaisesRegex(ValueError, "length >= 2"):
+            bin_adjusted_dest_weights(
+                self.pairs, self.costs, self.weights, np.array([0.0])
+            )

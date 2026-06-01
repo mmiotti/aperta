@@ -258,3 +258,144 @@ def nested_node_sample(
             indices = _weighted_sample_indices(all_score, rvals)
             out[c] = all_dests[indices]
     return out
+
+
+# ---------------------------------------------------------------------------
+# Bin-adjusted destination weights — fix for the cost-weighted sampling bias
+# at sparse-periphery origins. See memory `aperta-traffic-flow-sampling-bias-fix`
+# for the design and motivation.
+# ---------------------------------------------------------------------------
+
+
+def percentile_bin_edges(
+    survey_costs: np.ndarray | pd.Series,
+    n_bins: int = 20,
+) -> np.ndarray:
+    """Equal-probability cost-bin edges from observed trip-cost data.
+
+    Returns ``n_bins + 1`` edges such that each bin contains roughly ``1 / n_bins``
+    of the survey data by count. Suitable as the ``bin_edges`` input to
+    `bin_adjusted_dest_weights` for sampling that targets the empirical cost
+    distribution non-parametrically (no need to fit a log-normal or similar).
+
+    Args:
+        survey_costs: observed trip costs (e.g. observed travel times). NaNs
+            and non-finite values are dropped before percentile estimation.
+        n_bins: number of equal-probability bins. Default 20 balances
+            granularity vs. per-origin sample-budget headroom; 10–30 are
+            reasonable choices.
+
+    Returns:
+        Sorted 1-D array of length ``n_bins + 1`` giving bin edges.
+    """
+    arr = np.asarray(survey_costs, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        raise ValueError("`survey_costs` is empty after dropping non-finite values.")
+    return np.percentile(arr, np.linspace(0.0, 100.0, n_bins + 1))
+
+
+def bin_adjusted_dest_weights(
+    pairs: TieredODPairs,
+    costs: TieredODPairs,
+    dest_weights: TieredODPairs,
+    bin_edges: np.ndarray,
+    *,
+    renormalize_per_origin: bool = True,
+) -> TieredODPairs:
+    """Per-origin per-bin reweight of destination weights, fixing the
+    cost-weighted sampling bias at sparse-periphery origins.
+
+    For each origin and each cost bin, the bin's target probability mass
+    (``1 / n_bins``) is divided among the destinations that fall in that bin
+    in proportion to their existing weight ``W(D)``. Bins with no destinations
+    contribute nothing. The result is a per-origin adjusted weight array of
+    the same shape as ``dest_weights``, which can be passed to
+    `nested_node_sample` (or any weighted sampler) in place of the raw
+    weights — replacing the ``cost_to_weight`` callable entirely.
+
+    Destinations whose cost falls outside ``[bin_edges[0], bin_edges[-1]]``
+    receive zero weight (treated as too rare to be informative).
+
+    Args:
+        pairs: destination IDs per tier (any of the three may be ``None``).
+        costs: per-pair costs, same shape as ``pairs`` (e.g. travel times).
+        dest_weights: base destination weights ``W(D)`` per pair, same shape
+            as ``pairs`` (e.g. populations, employment counts).
+        bin_edges: ``n_bins + 1`` sorted values, typically from
+            `percentile_bin_edges` applied to a travel-survey cost column.
+        renormalize_per_origin: when ``True`` (default), the adjusted weights
+            for each origin are normalised to sum to 1, so each origin has
+            the same total sampling weight regardless of how many cost bins
+            its destinations populate. When ``False``, sparse-periphery
+            origins end up with a smaller total weight (the empty bins'
+            target mass is not redistributed) — this naturally reduces their
+            effective trip count, useful when the bin adjustment is the only
+            mechanism reducing trips from sparse origins. The default
+            ``True`` matches the recommended decoupling: bin-adjustment fixes
+            the cost distribution only; trip-generation count stays
+            controlled separately at the ``orig_weights`` stage.
+
+    Returns:
+        Same ``TieredODPairs`` subclass as ``pairs`` with per-origin adjusted
+        weight arrays. Origins whose destinations are entirely out of range
+        (or whose ``dest_weights`` sum to zero) receive an all-zero array.
+    """
+    bin_edges = np.asarray(bin_edges, dtype=float)
+    if bin_edges.ndim != 1 or bin_edges.size < 2:
+        raise ValueError(
+            f"`bin_edges` must be a 1-D array of length >= 2; got shape {bin_edges.shape}."
+        )
+    if np.any(np.diff(bin_edges) < 0):
+        raise ValueError("`bin_edges` must be non-decreasing.")
+    n_bins = bin_edges.size - 1
+    target_mass_per_bin = 1.0 / n_bins
+
+    def _adjust_tier(
+        pair_tier: dict | None,
+        cost_tier: dict | None,
+        weight_tier: dict | None,
+    ) -> dict | None:
+        if pair_tier is None or cost_tier is None or weight_tier is None:
+            return None
+        out: dict = {}
+        for origin, dest_arr in pair_tier.items():
+            cost_arr = np.asarray(cost_tier[origin], dtype=float)
+            w_arr = np.asarray(weight_tier[origin], dtype=float)
+            adjusted = np.zeros_like(w_arr, dtype=float)
+            # Bin assignment: np.digitize(x, edges) returns 0 for x < edges[0],
+            # n_bins+1 for x >= edges[-1], and i in 1..n_bins otherwise.
+            # Subtract 1 to get 0..n_bins-1 for in-range, -1/n_bins for out.
+            bin_idx = np.digitize(cost_arr, bin_edges) - 1
+            in_range = (bin_idx >= 0) & (bin_idx < n_bins) & np.isfinite(cost_arr)
+            if not in_range.any():
+                out[origin] = adjusted
+                continue
+            # Per-bin total weight (vectorised with bincount).
+            bin_idx_safe = np.where(in_range, bin_idx, 0)
+            bin_sums = np.bincount(
+                bin_idx_safe, weights=w_arr * in_range, minlength=n_bins
+            )
+            # Per-bin scaling factor: target_mass / available_mass, 0 for empty bins.
+            scale = np.zeros(n_bins, dtype=float)
+            populated = bin_sums > 0
+            scale[populated] = target_mass_per_bin / bin_sums[populated]
+            adjusted = w_arr * scale[bin_idx_safe] * in_range
+            if renormalize_per_origin:
+                total = adjusted.sum()
+                if total > 0:
+                    adjusted = adjusted / total
+            out[origin] = adjusted
+        return out
+
+    return type(pairs)(
+        cells_to_cells=_adjust_tier(
+            pairs.cells_to_cells, costs.cells_to_cells, dest_weights.cells_to_cells
+        ),
+        cells_to_zones=_adjust_tier(
+            pairs.cells_to_zones, costs.cells_to_zones, dest_weights.cells_to_zones
+        ),
+        zones_to_zones=_adjust_tier(
+            pairs.zones_to_zones, costs.zones_to_zones, dest_weights.zones_to_zones
+        ),
+    )

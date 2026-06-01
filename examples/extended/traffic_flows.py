@@ -49,19 +49,25 @@
 # `aperta-lab/projects/lumos/`) fits BPR multipliers against observed
 # counters to compensate on the way to typical edge speeds.
 #
-# **Three calibration knobs**, exposed but not optimised here:
+# **Cost-distribution target.** Each origin's sampled trip costs are
+# reweighted to match a target P(C) read directly from the ground-truth
+# Google-Maps trip times — equal-probability percentile bins over
+# `[MIN_COST_S, MAX_COST_S]`. This corrects the sparse-periphery bias
+# of plain cost-weighted destination sampling, where each periphery
+# origin would otherwise carry too much weight on its few in-range
+# neighbours. `bin_adjusted_dest_weights` does the reweighting;
+# `nested_node_sample` then draws destinations proportional to the
+# adjusted weights with no separate cost-decay factor.
 #
-# 1. `LOGNORM_SHAPE` (σ) — width of the trip-time distribution used as
-#    the cost-decay weight in `nested_node_sample`.
-# 2. `LOGNORM_SCALE` (μ) — location of the same distribution.
-# 3. `TRIPS_PER_PERSON_PER_DAY` — overall scaling to vehicles/day.
+# **Tunable knobs** (priors here, fitted in production):
 #
-# `LOGNORM_SHAPE` and `LOGNORM_SCALE` are fitted at runtime from
-# ground-truth Google-Maps trip times; `TRIPS_PER_PERSON_PER_DAY` is a
-# constant prior of 1.5. The known sampling bias (cost-weighted dest
-# draw under-normalises sparse-periphery origins, see §4) makes
-# single-parameter scans against counters unreliable, so this notebook
-# just runs once at the prior values and shows the resulting fit.
+# 1. `N_BINS` — granularity of the percentile-binned target P(C).
+# 2. `MIN_COST_S`, `MAX_COST_S` — survey-trim window. Trips outside it
+#    are excluded from the target; destinations whose realised cost
+#    falls outside get zero sampling weight, so OD pairs beyond
+#    `MAX_COST_S` (or implausibly below `MIN_COST_S`) don't contribute.
+# 3. `TRIPS_PER_PERSON_PER_DAY` — overall scaling to vehicles/day,
+#    constant prior of 1.5.
 #
 # ## Design choices
 #
@@ -85,7 +91,6 @@ import geopandas as gpd
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import scipy.stats
 
 from aperta import (
     calibration,
@@ -129,21 +134,34 @@ INITIAL_ADD = {'is_degree_4': 3.0, 'is_traffic_signal': 7.0}
 R_CELLS_M = 1_500
 R_MEDIUM_M = 10_000
 R_ZONES_M = 100_000
+# Cutoff at 30 min: since they area does not systematically allow for longer trips than
+# that, results become biased if the cutoff is set higher.
 CAR_TIME_CUTOFF_S = 1800
 
 # Inner-core polygon for counter filtering (AOI shrunk by this buffer)
 # to avoid boundary effects on the evaluation set.
-INNER_BUFFER_M = 5_000.0
+INNER_BUFFER_M = 15_000.0
 
 # Sampling. Origins drawn population-weighted (with replacement, then
-# deduped); destinations drawn per-origin via the cost-decay weight.
-N_ORIG = 50_000
+# deduped); destinations drawn per-origin proportional to the
+# bin-adjusted weights (§3).
+N_ORIG = 10_000
 N_DEST = 10
 RNG_SEED = 42
 
+# Cost-distribution target P(C). `N_BINS` is the granularity of the
+# percentile-binned target (20 ≙ 5%-bins). `MIN_COST_S` / `MAX_COST_S`
+# trim the survey to a plausible trip-time window — they become the 0th
+# and 100th percentiles of the target distribution, so destinations
+# with realised cost below `MIN_COST_S` or above `MAX_COST_S` get zero
+# sampling weight and are excluded from the flow estimate.
+N_BINS = 20
+MIN_COST_S = 0.0
+MAX_COST_S = 7200.0   # 2 h — well above the survey's 99th percentile
+
 # Volume scaling — vehicles per person per day. Reasonable prior;
 # production calibration fits this against observed counters.
-TRIPS_PER_PERSON_PER_DAY = 1.5
+TRIPS_PER_PERSON_PER_DAY = 1.8
 
 
 # %% [markdown]
@@ -256,8 +274,8 @@ print(f"  matched edges by OSM highway rank: {_rank_counts.to_dict()}")
 # ## 3. Build the routing inputs
 #
 # Per-edge initial durations, OD pairs across the three tiers, costs
-# along each pair, sampling weights, and the cost-decay prior fitted
-# from ground-truth trip times.
+# along each pair, sampling weights, and the survey-derived
+# cost-distribution target used to bin-adjust those weights.
 
 # %%
 # Per-edge initial durations.
@@ -286,20 +304,34 @@ dest_weights = od_pairs.dest_values(
 cell_to_zone_node = od_pairs.build_cell_to_zone_node_map(
     cells, zones, node_column='node_id')
 
-# Lognormal cost-decay prior, fitted from ground-truth trip times.
-_pos_times = legs.loc[legs['time_measured'] > 0, 'time_measured']
-LOGNORM_SHAPE, LOGNORM_LOC, LOGNORM_SCALE = scipy.stats.lognorm.fit(
-    _pos_times, loc=0)
-print(f"Lognormal prior (fitted from ground-truth times): "
-      f"shape={LOGNORM_SHAPE:.3f}, loc={LOGNORM_LOC:.3f}, "
-      f"scale={LOGNORM_SCALE:.1f}")
+# Cost-distribution target P(C). Survey trip times are trimmed to
+# [MIN_COST_S, MAX_COST_S]; equal-probability percentile bins over the
+# in-range subset become the target each origin is rescaled to match.
+# The endpoint percentiles are then forced to (MIN_COST_S, MAX_COST_S)
+# so the helper's in-range mask matches the user's clip window exactly.
+_survey_costs = legs.loc[
+    (legs['time_measured'] >= MIN_COST_S)
+    & (legs['time_measured'] <= MAX_COST_S),
+    'time_measured',
+].to_numpy()
+bin_edges = traffic_flows.percentile_bin_edges(_survey_costs, n_bins=N_BINS)
+bin_edges[0] = MIN_COST_S
+bin_edges[-1] = MAX_COST_S
+print(f"Cost-bin edges ({N_BINS} bins, clipped to "
+      f"[{MIN_COST_S:.0f}, {MAX_COST_S:.0f}] s; "
+      f"n_survey={len(_survey_costs):,}):")
+print(f"  {[f'{e:.0f}' for e in bin_edges]}")
+
+adjusted_dest_weights = traffic_flows.bin_adjusted_dest_weights(
+    pairs, costs, dest_weights, bin_edges,
+)
 
 
 # %% [markdown]
 # ## 4. Run the flow estimation
 #
 # Sample population-weighted origins; for each origin sample
-# destinations weighted by `dest_weight × cost_to_weight(travel_time)`;
+# destinations proportional to the bin-adjusted weights from §3;
 # accumulate shortest-path betweenness; scale counts to AADT.
 #
 # **AADT scaling.** `nested_node_sample` dedupes the with-replacement
@@ -308,26 +340,21 @@ print(f"Lognormal prior (fitted from ground-truth times): "
 # Scaling by the actual count keeps results invariant to the
 # `N_ORIG / N_DEST` split.
 #
-# **Known sampling bias (deferred fix).** Cost-weighted destination
-# sampling under-normalises sparse-periphery origins — each of their
-# samples ends up carrying relatively more weight, which can inflate
-# flows on through-corridors as the analysis area grows. A per-origin
-# reweighting (under consideration in the library) would handle this
-# at source. Because the bias trades off against the routing knobs in
-# unpredictable ways, this notebook deliberately does NOT try to scan
-# `(LOGNORM_SHAPE, LOGNORM_SCALE, TRIPS_PER_PERSON_PER_DAY)` against
-# counters; the production calibration in
-# `aperta-lab/projects/lumos/` does this once the bias is corrected.
+# **Cost-distribution correction.** Sampling weights are pre-adjusted
+# per origin per percentile bin in §3 so the realised trip-cost
+# distribution from each origin matches the survey-derived target
+# P(C). Replaces the lognormal cost-decay prior used in earlier
+# versions, which under-normalised sparse-periphery origins and
+# inflated through-corridor flows as the analysis area grew. With the
+# correction in place, `cost_to_weight` becomes the identity (the
+# cost-dependence is already baked into `adjusted_dest_weights`).
 
 # %%
-def cost_to_weight(c):
-    return scipy.stats.lognorm.pdf(c, LOGNORM_SHAPE, -10, LOGNORM_SCALE)
-
 rng = np.random.RandomState(RNG_SEED)
 nested_sample = traffic_flows.nested_node_sample(
-    pairs=pairs, weights=dest_weights, costs=costs,
+    pairs=pairs, weights=adjusted_dest_weights, costs=costs,
     cell_to_zone_node=cell_to_zone_node, orig_weights=orig_weights,
-    cost_to_weight=cost_to_weight, n_orig=N_ORIG, n_dest=N_DEST,
+    cost_to_weight=np.ones_like, n_orig=N_ORIG, n_dest=N_DEST,
     random_state=rng,
 )
 edge_bc = network_processing.get_nested_edge_betweenness(
@@ -428,11 +455,11 @@ plt.show()
 # Beyond the no-stochastic-routing / no-capacity simplifications
 # flagged in the header:
 #
-# - **No automated calibration against counters.** The three knobs
-#   (`LOGNORM_SHAPE`, `LOGNORM_SCALE`, `TRIPS_PER_PERSON_PER_DAY`)
-#   come from priors. Production coordinate-descents these (with a
-#   slope-vs-RMSE trade-off and an inner-vs-outer counter filter)
-#   once the sampling bias is fixed.
+# - **No automated calibration against counters.** With the cost
+#   distribution now anchored by survey data, the only free knob is
+#   `TRIPS_PER_PERSON_PER_DAY` (a 1.5 prior here). Production
+#   coordinate-descents it against counters with a slope-vs-RMSE
+#   trade-off and an inner-vs-outer counter filter.
 # - **Output isn't consumed by `accessibility.ipynb`.** Each showcase
 #   notebook stands alone. Production *does* feed `flow_estimate` into
 #   edge-weight calibration as a `(V/C)²` BPR-style multiplicative
