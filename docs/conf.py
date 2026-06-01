@@ -24,9 +24,14 @@ extensions = [
     "sphinx.ext.intersphinx",   # cross-link to numpy / pandas / networkx docs
     "sphinx.ext.viewcode",      # adds [source] links to each function
     "myst_parser",              # markdown support for narrative pages
+    "nbsphinx",                 # render jupyter notebooks under docs/examples/
 ]
 
-source_suffix = {".rst": "restructuredtext", ".md": "markdown"}
+source_suffix = {
+    ".rst": "restructuredtext",
+    ".md": "markdown",
+    ".ipynb": "jupyter_notebook",
+}
 
 # -- HTML output -------------------------------------------------------------
 
@@ -74,6 +79,25 @@ intersphinx_mapping = {
     "geopandas": ("https://geopandas.org/en/stable", None),
     "matplotlib": ("https://matplotlib.org/stable", None),
 }
+
+# -- nbsphinx (notebook rendering) -------------------------------------------
+
+# Never re-execute notebooks during the docs build. The notebooks ship with
+# committed outputs; rebuilding them on RTD would require their data inputs
+# (OSM downloads, Google Maps API responses, private travel-survey data) that
+# the build environment can't provide.
+nbsphinx_execute = "never"
+
+# Don't fail the build if a notebook contains an error in its cached outputs
+# (we want the docs to render even if a re-run would error).
+nbsphinx_allow_errors = True
+
+# Exclude prep notebooks from sphinx autodiscovery — they ship outputs but
+# aren't part of the "tutorial" notebook set we want to surface in docs.
+exclude_patterns = [
+    "_build", "Thumbs.db", ".DS_Store",
+    "examples/prepare/**",
+]
 
 # -- Misc --------------------------------------------------------------------
 

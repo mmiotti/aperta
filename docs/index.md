@@ -60,6 +60,7 @@ OSM / topography helpers.
 :caption: Reference
 
 api/index
+examples/index
 benchmark
 ```
 

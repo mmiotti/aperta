@@ -88,6 +88,8 @@ docs = [
     "sphinx>=8.0",
     "furo>=2024.0",
     "myst-parser>=4.0",
+    "nbsphinx>=0.9",        # render notebooks under docs/examples/ into the site
+    "ipython>=8.0",         # nbsphinx uses ipython lexer for syntax highlighting
 ]
 
 # Src layout: package code lives under `src/aperta/`. Prevents accidental
