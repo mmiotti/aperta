@@ -373,9 +373,7 @@ def bin_adjusted_dest_weights(
                 continue
             # Per-bin total weight (vectorised with bincount).
             bin_idx_safe = np.where(in_range, bin_idx, 0)
-            bin_sums = np.bincount(
-                bin_idx_safe, weights=w_arr * in_range, minlength=n_bins
-            )
+            bin_sums = np.bincount(bin_idx_safe, weights=w_arr * in_range, minlength=n_bins)
             # Per-bin scaling factor: target_mass / available_mass, 0 for empty bins.
             scale = np.zeros(n_bins, dtype=float)
             populated = bin_sums > 0

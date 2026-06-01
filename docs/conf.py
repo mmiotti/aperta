@@ -18,13 +18,13 @@ version = ".".join(release.split(".")[:2])
 # -- General configuration ---------------------------------------------------
 
 extensions = [
-    "sphinx.ext.autodoc",       # pulls docstrings from importable modules
-    "sphinx.ext.autosummary",   # generates summary tables for autodoc entries
-    "sphinx.ext.napoleon",      # parses Google-style docstrings
-    "sphinx.ext.intersphinx",   # cross-link to numpy / pandas / networkx docs
-    "sphinx.ext.viewcode",      # adds [source] links to each function
-    "myst_parser",              # markdown support for narrative pages
-    "nbsphinx",                 # render jupyter notebooks under docs/examples/
+    "sphinx.ext.autodoc",  # pulls docstrings from importable modules
+    "sphinx.ext.autosummary",  # generates summary tables for autodoc entries
+    "sphinx.ext.napoleon",  # parses Google-style docstrings
+    "sphinx.ext.intersphinx",  # cross-link to numpy / pandas / networkx docs
+    "sphinx.ext.viewcode",  # adds [source] links to each function
+    "myst_parser",  # markdown support for narrative pages
+    "nbsphinx",  # render jupyter notebooks under docs/examples/
 ]
 
 source_suffix = {
@@ -47,9 +47,9 @@ autodoc_default_options = {
     "show-inheritance": True,
     "member-order": "bysource",
 }
-autodoc_typehints = "description"   # render type hints in the description, not signatures
+autodoc_typehints = "description"  # render type hints in the description, not signatures
 autodoc_typehints_format = "short"  # `dict` not `typing.Dict`
-autoclass_content = "class"         # docstring from __init__ + class merged
+autoclass_content = "class"  # docstring from __init__ + class merged
 
 # -- Napoleon (Google-style docstrings) -------------------------------------
 
@@ -57,14 +57,16 @@ napoleon_google_docstring = True
 napoleon_numpy_docstring = False
 napoleon_include_init_with_doc = True
 napoleon_use_admonition_for_notes = True
-napoleon_use_ivar = True  # render Attributes as :ivar — avoids duplicate-doc warning for dataclasses
+napoleon_use_ivar = (
+    True  # render Attributes as :ivar — avoids duplicate-doc warning for dataclasses
+)
 
 # -- MyST (markdown) ---------------------------------------------------------
 
 myst_enable_extensions = [
-    "colon_fence",   # ::: fenced directives
-    "deflist",       # definition lists
-    "smartquotes",   # typographic quotes
+    "colon_fence",  # ::: fenced directives
+    "deflist",  # definition lists
+    "smartquotes",  # typographic quotes
 ]
 myst_heading_anchors = 3
 
@@ -95,7 +97,9 @@ nbsphinx_allow_errors = True
 # Exclude prep notebooks from sphinx autodiscovery — they ship outputs but
 # aren't part of the "tutorial" notebook set we want to surface in docs.
 exclude_patterns = [
-    "_build", "Thumbs.db", ".DS_Store",
+    "_build",
+    "Thumbs.db",
+    ".DS_Store",
     "examples/prepare/**",
 ]
 

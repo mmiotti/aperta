@@ -479,20 +479,20 @@ class BinAdjustedDestWeightsTestCase(unittest.TestCase):
         self.bin_edges = np.array([0.0, 10.0, 20.0, 40.0, 60.0])  # 4 bins
         self.pairs = TieredODNodePairs(
             cells_to_cells={
-                "rich":   np.array(["d1", "d2", "d3", "d4", "d5", "d6"]),
+                "rich": np.array(["d1", "d2", "d3", "d4", "d5", "d6"]),
                 "sparse": np.array(["d1", "d2", "d3", "d4", "d5", "d6"]),
             },
         )
         self.costs = TieredODNodePairs(
             cells_to_cells={
-                "rich":   np.array([5.0, 15.0, 25.0, 35.0, 45.0, 55.0]),
-                "sparse": np.array([5.0,  5.0, 55.0, 55.0, 55.0, 55.0]),
+                "rich": np.array([5.0, 15.0, 25.0, 35.0, 45.0, 55.0]),
+                "sparse": np.array([5.0, 5.0, 55.0, 55.0, 55.0, 55.0]),
             },
         )
         # Uniform W(D) = 1 for all destinations.
         self.weights = TieredODNodePairs(
             cells_to_cells={
-                "rich":   np.ones(6),
+                "rich": np.ones(6),
                 "sparse": np.ones(6),
             },
         )
@@ -503,9 +503,7 @@ class BinAdjustedDestWeightsTestCase(unittest.TestCase):
         return np.digitize(costs, self.bin_edges) - 1
 
     def test_returns_same_subclass(self):
-        adj = bin_adjusted_dest_weights(
-            self.pairs, self.costs, self.weights, self.bin_edges
-        )
+        adj = bin_adjusted_dest_weights(self.pairs, self.costs, self.weights, self.bin_edges)
         self.assertIsInstance(adj, TieredODNodePairs)
 
     def test_per_bin_total_matches_target_for_rich_origin(self):
@@ -513,7 +511,10 @@ class BinAdjustedDestWeightsTestCase(unittest.TestCase):
         should equal target = 1/n_bins (before renormalize) or stay
         proportional after."""
         adj = bin_adjusted_dest_weights(
-            self.pairs, self.costs, self.weights, self.bin_edges,
+            self.pairs,
+            self.costs,
+            self.weights,
+            self.bin_edges,
             renormalize_per_origin=False,
         )
         w_rich = adj.cells_to_cells["rich"]
@@ -528,7 +529,10 @@ class BinAdjustedDestWeightsTestCase(unittest.TestCase):
         target is uniform 1/n_bins), regardless of how many destinations
         each bin holds."""
         adj = bin_adjusted_dest_weights(
-            self.pairs, self.costs, self.weights, self.bin_edges,
+            self.pairs,
+            self.costs,
+            self.weights,
+            self.bin_edges,
             renormalize_per_origin=True,
         )
         w_sparse = adj.cells_to_cells["sparse"]
@@ -562,7 +566,10 @@ class BinAdjustedDestWeightsTestCase(unittest.TestCase):
 
     def test_renormalize_makes_sparse_and_rich_have_same_total(self):
         adj = bin_adjusted_dest_weights(
-            self.pairs, self.costs, self.weights, self.bin_edges,
+            self.pairs,
+            self.costs,
+            self.weights,
+            self.bin_edges,
             renormalize_per_origin=True,
         )
         np.testing.assert_allclose(adj.cells_to_cells["rich"].sum(), 1.0, rtol=1e-12)
@@ -570,7 +577,10 @@ class BinAdjustedDestWeightsTestCase(unittest.TestCase):
 
     def test_no_renormalize_makes_sparse_total_less_than_rich(self):
         adj = bin_adjusted_dest_weights(
-            self.pairs, self.costs, self.weights, self.bin_edges,
+            self.pairs,
+            self.costs,
+            self.weights,
+            self.bin_edges,
             renormalize_per_origin=False,
         )
         # rich: 4 populated bins × 0.25 = 1.0;
@@ -651,19 +661,17 @@ class BinAdjustedDestWeightsTestCase(unittest.TestCase):
         weights = TieredODNodePairs(
             cells_to_cells={"c1": np.array([1.0])},
         )
-        adj = bin_adjusted_dest_weights(
-            pairs, costs, weights, self.bin_edges
-        )
+        adj = bin_adjusted_dest_weights(pairs, costs, weights, self.bin_edges)
         self.assertIsNone(adj.cells_to_zones)
         self.assertIsNone(adj.zones_to_zones)
 
     def test_invalid_bin_edges_raises(self):
         with self.assertRaisesRegex(ValueError, "non-decreasing"):
             bin_adjusted_dest_weights(
-                self.pairs, self.costs, self.weights,
+                self.pairs,
+                self.costs,
+                self.weights,
                 np.array([0.0, 10.0, 5.0, 20.0]),  # not monotone
             )
         with self.assertRaisesRegex(ValueError, "length >= 2"):
-            bin_adjusted_dest_weights(
-                self.pairs, self.costs, self.weights, np.array([0.0])
-            )
+            bin_adjusted_dest_weights(self.pairs, self.costs, self.weights, np.array([0.0]))

@@ -16,3 +16,14 @@ repos:
       - id: jupytext
         args: [--sync]
         files: ^examples/.*\.(py|ipynb)$
+
+  # Ruff: lint + auto-format on every commit. Matches the `ruff check` and
+  # `ruff format --check` steps in .github/workflows/test.yml so push-time
+  # CI lint failures don't happen. Lint config (selected rules, line-length,
+  # extend-exclude) lives in pyproject.toml — both hooks pick it up.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.15   # keep roughly in sync with the locally-installed ruff
+    hooks:
+      - id: ruff           # lint (auto-fixes what it can)
+        args: [--fix]
+      - id: ruff-format    # format
