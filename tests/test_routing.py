@@ -15,7 +15,9 @@ from aperta.routing import (
     NodeAggregation,
     PathAggregation,
     aggregate_along_paths,
+    apply_edge_weights,
     floor_intrazonal_costs,
+    mask_excluded_edges,
     tiered_path_aggregate,
     tiered_path_costs,
 )
@@ -590,6 +592,52 @@ class CutoffCorrectnessTestCase(unittest.TestCase):
         c_sp = tiered_path_costs(pairs, g, weight="w", cutoff=10.0)
         self.assertEqual(c_ig.cells_to_cells["a"][0], 1.0)
         self.assertEqual(c_sp.cells_to_cells["a"][0], 1.0)
+
+
+class MaskExcludedEdgesTestCase(unittest.TestCase):
+    """`mask_excluded_edges` wraps a weight function so edges flagged
+    `cost_excluded_flag=True` return cost = ∞.
+    """
+
+    def test_unflagged_edge_passes_through(self):
+        # No flag set → base weight function called normally.
+        masked = mask_excluded_edges(lambda d: d["length"] * 2, "excluded")
+        self.assertEqual(masked({"length": 5.0}), 10.0)
+
+    def test_flag_false_passes_through(self):
+        # Flag present but False → base function called.
+        masked = mask_excluded_edges(lambda d: d["length"], "excluded")
+        self.assertEqual(masked({"length": 7.0, "excluded": False}), 7.0)
+
+    def test_flag_true_returns_inf(self):
+        # Flag True → cost = ∞, base function not consulted.
+        called = []
+
+        def base(d):
+            called.append(d)
+            return 1.0
+
+        masked = mask_excluded_edges(base, "excluded")
+        self.assertEqual(masked({"length": 5.0, "excluded": True}), float("inf"))
+        self.assertEqual(called, [])  # base never called
+
+    def test_extra_kwargs_forwarded(self):
+        # apply_edge_weights passes fn_kwargs through to the wrapped fn.
+        masked = mask_excluded_edges(lambda d, speed: d["length"] / speed, "excluded")
+        self.assertEqual(masked({"length": 100.0}, speed=10.0), 10.0)
+
+    def test_integrates_with_apply_edge_weights(self):
+        # End-to-end: a graph with two flagged + one unflagged edge gets
+        # routing weights of inf and a real number, respectively.
+        g = nx.MultiDiGraph()
+        g.add_edge(0, 1, length=10.0, excluded=True)
+        g.add_edge(1, 2, length=20.0, excluded=False)
+        g.add_edge(2, 3, length=30.0)  # no flag attribute at all
+        masked = mask_excluded_edges(lambda d: d["length"], "excluded")
+        apply_edge_weights(g, masked, "cost")
+        self.assertEqual(g.edges[0, 1, 0]["cost"], float("inf"))
+        self.assertEqual(g.edges[1, 2, 0]["cost"], 20.0)
+        self.assertEqual(g.edges[2, 3, 0]["cost"], 30.0)
 
 
 if __name__ == "__main__":

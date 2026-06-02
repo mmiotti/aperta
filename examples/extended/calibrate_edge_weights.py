@@ -89,6 +89,17 @@ car_graph = network_processing.load_consolidated_graphml(
 print(f"Car graph: {car_graph.number_of_nodes():,} nodes / "
       f"{car_graph.number_of_edges():,} edges")
 
+# Mode-aware preparation: keeps the graph directed (car defaults), precomputes
+# the largest strongly connected component as the snap-eligible node set.
+# Passing `eligible_node_ids=car_prepared.snap_eligible_nodes` to the
+# calibration below prevents trip endpoints from snapping to trapped nodes
+# (which would otherwise produce spurious routing failures and contaminate
+# the OLS fit).
+car_prepared = network_processing.prepare_network(car_graph, 'car')
+car_graph = car_prepared.graph
+print(f"  Snap-eligible (largest SCC): {len(car_prepared.snap_eligible_nodes):,} nodes "
+      f"({100 * len(car_prepared.snap_eligible_nodes) / car_graph.number_of_nodes():.1f}%)")
+
 cells = gpd.read_file(PREPARED_DIR / 'cells.gpkg').set_index('cell_id')
 cells['pop_plus_emp'] = cells['population'] + cells['employment_total']
 print(f"Cells: {len(cells):,}")
@@ -158,6 +169,7 @@ result = calibration.calibrate_edge_weights(
     n_iterations=3,
     min_trip_distance=500.0,
     max_dist_to_line_ratio=5.0,
+    eligible_node_ids=car_prepared.snap_eligible_nodes,
 )
 
 

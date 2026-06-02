@@ -66,4 +66,6 @@ cache/
 
 # Temporary diagnostics
 **/paper_tier_figure.**
-**/diagnose_island.**
+**/diagnose_*.py
+**/diagnose_*.ipynb
+**/verify_filter_fix.**

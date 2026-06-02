@@ -283,22 +283,32 @@ class AddGeoOverheadsTestCase(unittest.TestCase):
             zone_node_column="node_id",
         )
 
-    def test_origin_cell_affects_cells_to_cells_and_cells_to_zones(self):
+    def test_origin_cell_propagates_to_all_origin_tiers(self):
+        # Full coverage so the auto-derived origin_zone is well-defined.
+        origin_cell = pd.Series({"C0": 10.0, "C1": 20.0, "C2": 30.0, "C3": 40.0})
         out = add_geo_overheads(
-            self.costs, self.pairs, origin_cell=pd.Series({"C0": 10.0, "C1": 20.0})
+            self.costs,
+            self.pairs,
+            origin_cell=origin_cell,
+            cell_to_zone=self.cells["zone_id"],
         )
-        # C0 (cell-tier): every outgoing cost +10.
+        # C0 (c2c): every outgoing cost +10.
         np.testing.assert_array_equal(
             out.cells_to_cells["C0"], self.costs.cells_to_cells["C0"] + 10.0
         )
-        # C0 (middle-tier): every outgoing cost +10 as well.
+        # C0 (c2z): every outgoing cost +10.
         np.testing.assert_array_equal(
             out.cells_to_zones["C0"], self.costs.cells_to_zones["C0"] + 10.0
         )
-        # C2 not in lookup → unchanged.
-        np.testing.assert_array_equal(out.cells_to_cells["C2"], self.costs.cells_to_cells["C2"])
-        # Zone tier untouched.
-        np.testing.assert_array_equal(out.zones_to_zones["Z0"], self.costs.zones_to_zones["Z0"])
+        # Z0 origin in z2z gets the per-zone mean of cell overheads.
+        # Z0 = mean(C0=10, C1=20, C2=30) = 20.
+        np.testing.assert_array_equal(
+            out.zones_to_zones["Z0"], self.costs.zones_to_zones["Z0"] + 20.0
+        )
+        # Z1 = mean(C3=40) = 40.
+        np.testing.assert_array_equal(
+            out.zones_to_zones["Z1"], self.costs.zones_to_zones["Z1"] + 40.0
+        )
 
     def test_origin_zone_only_affects_zones_to_zones(self):
         out = add_geo_overheads(self.costs, self.pairs, origin_zone=pd.Series({"Z0": 50.0}))
@@ -312,13 +322,30 @@ class AddGeoOverheadsTestCase(unittest.TestCase):
         np.testing.assert_array_equal(out.cells_to_cells["C0"], self.costs.cells_to_cells["C0"])
         np.testing.assert_array_equal(out.cells_to_zones["C0"], self.costs.cells_to_zones["C0"])
 
-    def test_dest_cell_adds_per_dest(self):
+    def test_dest_cell_adds_per_dest_with_auto_zone_aggregation(self):
+        # Full coverage so the auto-derived dest_zone is well-defined.
+        dest_cell = pd.Series({"C0": 1.0, "C1": 2.0, "C2": 3.0, "C3": 4.0})
         out = add_geo_overheads(
-            self.costs, self.pairs, dest_cell=pd.Series({"C0": 1.0, "C1": 2.0, "C2": 3.0})
+            self.costs,
+            self.pairs,
+            dest_cell=dest_cell,
+            cell_to_zone=self.cells["zone_id"],
         )
-        # C0 → dests [C0, C1, C2]: + [1, 2, 3].
+        # c2c: C0 → dests [C0, C1, C2] in fixture: +[1, 2, 3].
         np.testing.assert_array_equal(
-            out.cells_to_cells["C0"], self.costs.cells_to_cells["C0"] + np.array([1.0, 2.0, 3.0])
+            out.cells_to_cells["C0"],
+            self.costs.cells_to_cells["C0"] + np.array([1.0, 2.0, 3.0]),
+        )
+        # c2z: C0 → dest Z1, auto-derived Z1 = mean(C3=4) = 4.
+        np.testing.assert_array_equal(
+            out.cells_to_zones["C0"], self.costs.cells_to_zones["C0"] + 4.0
+        )
+        # z2z: Z0 → dest Z1: also +4. Z1 → dest Z0: Z0 = mean(C0,C1,C2) = 2.0.
+        np.testing.assert_array_equal(
+            out.zones_to_zones["Z0"], self.costs.zones_to_zones["Z0"] + 4.0
+        )
+        np.testing.assert_array_equal(
+            out.zones_to_zones["Z1"], self.costs.zones_to_zones["Z1"] + 2.0
         )
 
     def test_dest_zone_adds_per_dest_zone_at_both_tiers(self):
@@ -333,7 +360,14 @@ class AddGeoOverheadsTestCase(unittest.TestCase):
         )
 
     def test_returns_geo_subclass_not_mutating_input(self):
-        out = add_geo_overheads(self.costs, self.pairs, origin_cell=pd.Series({"C0": 1.0}))
+        # Use explicit origin_zone to skip auto-derivation (and keep this test
+        # focused on type + immutability rather than aggregation details).
+        out = add_geo_overheads(
+            self.costs,
+            self.pairs,
+            origin_cell=pd.Series({"C0": 1.0}),
+            origin_zone=pd.Series({"Z0": 0.0, "Z1": 0.0}),
+        )
         self.assertIsInstance(out, TieredODGeoPairs)
         # Input unchanged.
         np.testing.assert_array_equal(self.costs.cells_to_cells["C0"], np.array([0.0, 0.0, 100.0]))

@@ -11,6 +11,9 @@ The library exposes two concerns separately:
    intersection penalties, etc.) lives in these callables, not in this module.
    `combine_edge_weights` sums multiple per-edge components into a single routing
    weight (e.g. edge travel time + intersection penalty -> total cost).
+   `mask_excluded_edges` wraps a weight callable to return cost = ∞ for edges
+   flagged by `prepare_network` as non-traversable for a given mode (e.g.
+   motorways for walking).
 
 2. **Routing primitives** — covering the common query shapes:
 
@@ -64,6 +67,32 @@ def apply_edge_weights(graph: nx.Graph, weight_fn: Callable, weight_name: str, *
     else:
         for _u, _v, data in graph.edges(data=True):
             data[weight_name] = weight_fn(data, **fn_kwargs)
+
+
+def mask_excluded_edges(weight_fn: Callable, cost_excluded_flag: str) -> Callable:
+    """Wrap `weight_fn` so edges flagged `cost_excluded_flag=True` get cost = ∞.
+
+    Companion to `network_processing.prepare_network`, which writes the
+    per-edge boolean flag based on a mode's `cost_excluded_tags`. The flag
+    name is recorded on `PreparedGraph.cost_excluded_flag`; pass it here to
+    bake the mode-specific edge exclusion into a routing-weight callable.
+
+    Typical use:
+
+        prepared = prepare_network(graph, "walk")
+        weight_fn = mask_excluded_edges(duration_walk_fn, prepared.cost_excluded_flag)
+        apply_edge_weights(prepared.graph, weight_fn, "duration_walk_s")
+
+    Edges with the flag missing or `False` flow through to `weight_fn`
+    unchanged.
+    """
+
+    def masked(edge_data, **kwargs):
+        if edge_data.get(cost_excluded_flag, False):
+            return float("inf")
+        return weight_fn(edge_data, **kwargs)
+
+    return masked
 
 
 def combine_edge_weights(graph: nx.Graph, source_names: list[str], target_name: str) -> None:

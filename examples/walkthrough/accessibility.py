@@ -152,28 +152,29 @@ print(f"{len(cells):,} cells in {len(zones):,} zones")
 # urban areas is `network_type='all'` — it keeps trunk roads (so the
 # pedestrian paths stay connected) at the cost of letting the router walk
 # along trunk roads in the (rare) cases where that's the shortest path.
-# For a careful production analysis you would either patch the graph
-# manually (re-add specific way IDs that bridge the gap) or use a custom
-# filter that respects `sidewalk=*` tags. We use `'all'` here as the
-# pragmatic compromise.
+# `prepare_network` (below) handles the trunk-road problem by tagging
+# motorway / trunk edges as cost-excluded for the walk mode so the walk
+# weight function masks them at ∞.
 #
 # A second consideration is **directedness**. `graph_from_place` returns
 # a `MultiDiGraph` with directed edges that respect one-way tags — fine
-# for cars, but wrong for walking (pedestrians ignore one-ways). We
-# convert to undirected after projecting. Without this step, a small
-# number of cells whose snap-node sits on a one-way street's exit terminus
-# end up with almost no reachable destinations, producing zero
-# accessibility outliers that compress the colour scale on every map.
+# for cars, but wrong for walking (pedestrians ignore one-ways). And on a
+# consolidated network, OSMnx's directed edges can occasionally leave a
+# node trapped in a short one-way segment with no escape — silently
+# producing zero-accessibility outliers in the affected cells.
+# `prepare_network(graph, 'walk')` handles both: it applies
+# `to_undirected()` and precomputes the largest connected component as
+# the snap-eligible node set.
 
 # %%
 # Network. `graph_from_place` returns a MultiDiGraph clipped to the place
-# polygon. See the note above on `network_type='all'` vs `'walk'`, and on
-# the undirected conversion.
+# polygon; `prepare_network` then applies the walk-specific defaults:
+# undirected routing graph + snap-eligible-nodes + cost-excluded-edges
+# (motorway / trunk).
 graph = ox.graph_from_place(PLACE, network_type='all', simplify=True)
 graph = ox.project_graph(graph, to_crs=boundary_proj_crs)
-# Pedestrians can walk either way on one-way streets; undirect after
-# projecting (project_graph returns MultiDiGraph regardless of input).
-graph = graph.to_undirected()
+prepared = network_processing.prepare_network(graph, 'walk')
+graph = prepared.graph
 print(f"Network: {graph.number_of_nodes():,} nodes, {graph.number_of_edges():,} edges")
 
 # %%
@@ -243,6 +244,7 @@ cell_centroids_gdf = gpd.GeoDataFrame(
 )
 cells['node_id'], dist_to_node = network_processing.snap_to_network_nodes(
     cell_centroids_gdf, graph,
+    eligible_node_ids=prepared.snap_eligible_nodes,
 )
 # Walking overhead is the centroid→node distance divided by walking speed.
 # Aperta's accessibility cell-mode adds this to every destination cost so that
@@ -430,9 +432,14 @@ plt.show()
 # `dtype=np.float64` if downstream arithmetic needs the extra range.
 
 # %%
-# Convert each edge's length (m) into a walking time (s).
-for u, v, k, data in graph.edges(keys=True, data=True):
-    data['walk_time_s'] = data['length'] / WALK_SPEED_MS
+# Convert each edge's length (m) into a walking time (s). `mask_excluded_edges`
+# wraps the per-edge callable so motorway / trunk edges (flagged by
+# `prepare_network`) get cost = ∞ — making them effectively unwalkable for the
+# routing engine.
+walk_weight = routing.mask_excluded_edges(
+    lambda d: d['length'] / WALK_SPEED_MS, prepared.cost_excluded_flag,
+)
+routing.apply_edge_weights(graph, walk_weight, 'walk_time_s')
 
 times = routing.tiered_path_costs(
     pairs, graph, weight='walk_time_s',
@@ -610,35 +617,26 @@ plt.show()
 # %% [markdown]
 # ### 10.1 Fetch and snap the bike network
 #
-# Same `.to_undirected()` step we used for the walking graph: OSMnx
-# returns a `MultiDiGraph` that respects OSM `oneway=*` tags, which would
-# otherwise leave a handful of cells whose snap-node sits at a one-way
-# exit terminus with almost no reachable destinations.
+# Same `prepare_network` pattern as for walk, with `mode='bike'`: applies
+# `to_undirected()` and snaps to the largest connected component.
 #
-# **Jurisdiction caveat:** undirecting assumes bikes can ride against
-# any one-way street. That holds in Paris, Brussels, Amsterdam etc.
-# (general contraflow cycling allowance) but is too permissive for
-# strict jurisdictions (much of the US, parts of Germany). For a
-# production analysis the cleaner pattern is to keep the graph directed
-# AND re-snap cells away from problem nodes by restricting snap targets
-# to the largest strongly-connected component:
-#
-# ```python
-# import networkx as nx
-# main_scc = max(nx.strongly_connected_components(bike_graph), key=len)
-# cells['bike_node_id'], _ = network_processing.assign_to_eligible_centroid(
-#     cells, bike_graph, eligible_node_ids=main_scc,
-# )
-# ```
-#
-# Or use OSM tags (`oneway:bicycle=no`, `cycleway:left=opposite_lane`,
-# `bicycle:backward=yes`) to pre-filter edges so the bike-graph is
-# directed-but-jurisdiction-correct. Both options are out of scope here.
+# **Jurisdiction caveat:** the `'bike'` default applies `to_undirected()`,
+# which assumes bikes can ride against any one-way street. That holds in
+# Paris, Brussels, Amsterdam etc. (general contraflow cycling allowance)
+# but is too permissive for strict jurisdictions (much of the US, parts
+# of Germany). For a production analysis in a strict jurisdiction the
+# cleaner pattern is `prepare_network(bike_graph, 'bike',
+# directedness='directed_scc')` — keeps the graph directed AND snaps
+# cells to the largest strongly-connected component instead of the
+# largest CC. Or use OSM tags (`oneway:bicycle=no`, `cycleway:left=
+# opposite_lane`, `bicycle:backward=yes`) to pre-filter edges so the
+# bike-graph is directed-but-jurisdiction-correct.
 
 # %%
 bike_graph = ox.graph_from_place(PLACE, network_type='bike', simplify=True)
 bike_graph = ox.project_graph(bike_graph, to_crs=boundary_proj_crs)
-bike_graph = bike_graph.to_undirected()   # bikes assumed to ignore one-ways
+bike_prepared = network_processing.prepare_network(bike_graph, 'bike')
+bike_graph = bike_prepared.graph
 print(f"Bike network: {bike_graph.number_of_nodes():,} nodes, "
       f"{bike_graph.number_of_edges():,} edges")
 
@@ -646,6 +644,7 @@ print(f"Bike network: {bike_graph.number_of_nodes():,} nodes, "
 # centroid→node distance for the per-cell first-mile overhead below.
 cells['bike_node_id'], bike_dist_to_node = network_processing.snap_to_network_nodes(
     cell_centroids_gdf, bike_graph,
+    eligible_node_ids=bike_prepared.snap_eligible_nodes,
 )
 
 # Zone snapping via transport centroid (same tier-aware logic as for walk).
@@ -680,9 +679,11 @@ zones['bike_node_id'], _ = network_processing.assign_to_eligible_centroid(
 BIKE_SPEED_MS = 20 / 3.6           # 20 km/h, typical urban cycling speed
 INTERSECTION_PENALTY_S = 8.0       # stop-and-go time per intersection traversed
 
-for u, v, k, data in bike_graph.edges(keys=True, data=True):
-    base_time = float(data['length']) / BIKE_SPEED_MS
-    data['bike_time_s'] = base_time + INTERSECTION_PENALTY_S
+bike_weight = routing.mask_excluded_edges(
+    lambda d: float(d['length']) / BIKE_SPEED_MS + INTERSECTION_PENALTY_S,
+    bike_prepared.cost_excluded_flag,
+)
+routing.apply_edge_weights(bike_graph, bike_weight, 'bike_time_s')
 
 # %% [markdown]
 # ### 10.3 Bike overhead (unlock + walk-to-bike)
@@ -919,7 +920,7 @@ plt.show()
 #
 # ### 13.1 Bike utility with a route-feature
 #
-#     U_bike = −7 − 0.7 · (t_bike / 60) + 1.0 · mean_bike_score_on_path
+#     U_bike = −7 − 0.7 · (t_bike / 60) + 0.7 · mean_bike_score_on_path
 #
 # - **Constant −7**: Alternative-specific constant. Non-trivial setup before any trip (walk to bike,
 #   unlock, helmet).
@@ -943,7 +944,7 @@ bike_utility = utility.Utility(
         utility.RouteFeature(
             name='bike_score_avg',
             attribute=edge_bike_score,
-            coefficient=1.0,
+            coefficient=0.7,
             aggregator='mean',
         ),
     ],

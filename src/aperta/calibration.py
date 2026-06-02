@@ -149,12 +149,17 @@ def _filter_and_snap_legs(
     max_trip_distance: float,
     max_dist_to_line_ratio: float,
     snap_max_distance: float,
+    eligible_node_ids=None,
+    eligible_node_flag: str | None = None,
 ) -> pd.DataFrame:
     """Apply trip filters + snap origin / dest to nearest network nodes.
 
     Adds columns: `nx_node_orig`, `nx_node_dest`, `snap_dist_orig`,
     `snap_dist_dest`. Drops rows where either snap fails or distance
-    is beyond `snap_max_distance`.
+    is beyond `snap_max_distance`. `eligible_node_ids` / `eligible_node_flag`
+    are forwarded to `snap_to_network_nodes` to restrict snap targets to
+    trap-free nodes (typically `prepared.snap_eligible_nodes` from
+    `prepare_network`).
     """
     if "dist_line" not in legs.columns:
         legs = legs.copy()
@@ -180,7 +185,11 @@ def _filter_and_snap_legs(
             index=legs.index,
         )
         node_ids, dists = network_processing.snap_to_network_nodes(
-            points, graph, max_distance=snap_max_distance
+            points,
+            graph,
+            max_distance=snap_max_distance,
+            eligible_node_ids=eligible_node_ids,
+            eligible_node_flag=eligible_node_flag,
         )
         legs[f"nx_node_{side}"] = node_ids
         legs[f"snap_dist_{side}"] = dists
@@ -295,6 +304,8 @@ def calibrate_edge_weights(
     max_trip_distance: float = 100_000.0,
     max_dist_to_line_ratio: float = 4.0,
     edge_duration_attr: str = "duration_calibrated",
+    eligible_node_ids=None,
+    eligible_node_flag: str | None = None,
 ) -> CalibrationResult:
     """Iteratively calibrate per-edge durations against observed trip times.
 
@@ -337,6 +348,15 @@ def calibrate_edge_weights(
             usually data noise).
         edge_duration_attr: name of the per-edge duration attribute written
             on `graph` (overwritten each iteration).
+        eligible_node_ids: optional set / list / Index of node IDs to restrict
+            trip-endpoint snap targets to. Forwarded to
+            `snap_to_network_nodes`. Typically `prepared.snap_eligible_nodes`
+            from `network_processing.prepare_network` — prevents trips from
+            snapping to trapped nodes and contaminating the calibration fit.
+        eligible_node_flag: alternative to `eligible_node_ids` — name of a
+            per-node bool attribute on `graph` marking eligible snap targets
+            (e.g., `prepared.snap_eligible_flag`). Ignored if
+            `eligible_node_ids` is also given.
 
     Returns:
         `CalibrationResult` — see its docstring.
@@ -378,6 +398,8 @@ def calibrate_edge_weights(
         max_trip_distance=max_trip_distance,
         max_dist_to_line_ratio=max_dist_to_line_ratio,
         snap_max_distance=snap_max_distance,
+        eligible_node_ids=eligible_node_ids,
+        eligible_node_flag=eligible_node_flag,
     )
     if len(legs) == 0:
         raise ValueError("No trips remain after snap + filter.")

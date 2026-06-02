@@ -8,7 +8,7 @@
 #       format_name: percent
 #       format_version: '1.3'
 #   kernelspec:
-#     display_name: Python 3 (ipykernel)
+#     display_name: aperta
 #     language: python
 #     name: python3
 # ---
@@ -45,10 +45,15 @@ PLACE = 'Cambridge, Massachusetts, USA'
 # %%
 boundary = ox.geocode_to_gdf(PLACE)
 crs = boundary.estimate_utm_crs()
+# Note that we choose network_type='all'. Network_type='walk' can exclude
+# important parts of the walking network that are connected to the rest of the
+# network through an unwalkable highway / main road segment. Non-walkable roads
+# get cleaned up in prepare_network below.
 graph = ox.project_graph(
-    ox.graph_from_place(PLACE, network_type='walk', simplify=True),
+    ox.graph_from_place(PLACE, network_type='all', simplify=True),
     to_crs=crs,
-).to_undirected()  # pedestrians ignore one-ways
+)
+prepared = network_processing.prepare_network(graph, 'walk')
 
 # %% [markdown]
 # ## 2. H3 cells (origins) + supermarkets (destinations)
@@ -61,7 +66,10 @@ cells = geo_processing.build_h3_grid(
 cell_centroids = gpd.GeoDataFrame(
     geometry=cells.geometry.centroid, index=cells.index, crs=cells.crs,
 )
-cells['node_id'], _ = network_processing.snap_to_network_nodes(cell_centroids, graph)
+cells['node_id'], _ = network_processing.snap_to_network_nodes(
+    cell_centroids, prepared.graph,
+    eligible_node_ids=prepared.snap_eligible_nodes,
+)
 
 _sm = ox.features_from_place(PLACE, tags={'shop': 'supermarket'}).to_crs(crs)
 supermarkets = gpd.GeoDataFrame(geometry=_sm.geometry.centroid.values, crs=crs)
@@ -75,11 +83,13 @@ cells['supermarkets'] = (supermarkets.groupby('cell_id').size()
 # ## 3. Route + count accessibility
 
 # %%
-for _u, _v, _k, data in graph.edges(keys=True, data=True):
-    data['walk_time_s'] = data['length'] / 1.4
+walk_weight = routing.mask_excluded_edges(
+    lambda d: d['length'] / 1.4, prepared.cost_excluded_flag,
+)
+routing.apply_edge_weights(prepared.graph, walk_weight, 'walk_time_s')
 
 pairs = od_pairs.get_pairs(cells, r_cells=2000.0, node_column='node_id')
-times = routing.tiered_path_costs(pairs, graph, weight='walk_time_s')
+times = routing.tiered_path_costs(pairs, prepared.graph, weight='walk_time_s')
 sm_weights = od_pairs.dest_values('supermarkets', pairs, cells, node_column='node_id')
 
 acc = accessibility.cumulative_opportunities(

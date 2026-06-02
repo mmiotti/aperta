@@ -5,6 +5,7 @@ Run with:
 """
 
 import unittest
+import warnings
 
 import geopandas as gpd
 import networkx as nx
@@ -18,6 +19,7 @@ from aperta.network_processing import (
     consolidate_intersections,
     flag_node_intersections,
     lanes_per_direction,
+    prepare_network,
     snap_to_network_nodes,
 )
 
@@ -150,6 +152,53 @@ class SnapToNetworkNodesTestCase(unittest.TestCase):
         points = self._points([(0.5, 0.5)], ["p"])
         with self.assertRaisesRegex(ValueError, "every node"):
             snap_to_network_nodes(points, graph, eligible_node_ids=set())
+
+    def test_eligible_node_flag_filters_by_per_node_attribute(self):
+        """`eligible_node_flag` reads a per-node bool attribute to derive eligibility."""
+        graph = self._graph()  # nodes 'a', 'b', 'c'
+        # Mark only 'b' and 'c' as eligible.
+        graph.nodes["a"]["is_snap_eligible"] = False
+        graph.nodes["b"]["is_snap_eligible"] = True
+        graph.nodes["c"]["is_snap_eligible"] = True
+        points = self._points([(0.5, 0.5)], ["p"])
+        # 'a' is closest geometrically, but flagged ineligible → snaps to 'b' or 'c'.
+        ids, _ = snap_to_network_nodes(points, graph, eligible_node_flag="is_snap_eligible")
+        self.assertIn(ids.loc["p"], {"b", "c"})
+        self.assertNotEqual(ids.loc["p"], "a")
+
+    def test_eligible_node_ids_takes_precedence_over_flag(self):
+        """If both `eligible_node_ids` and `eligible_node_flag` are given,
+        the explicit `eligible_node_ids` wins."""
+        graph = self._graph()
+        # Flag would mark only 'a' eligible:
+        graph.nodes["a"]["is_snap_eligible"] = True
+        graph.nodes["b"]["is_snap_eligible"] = False
+        graph.nodes["c"]["is_snap_eligible"] = False
+        points = self._points([(0.5, 0.5)], ["p"])
+        # But explicit eligible_node_ids restricts to {'c'} only.
+        ids, _ = snap_to_network_nodes(
+            points,
+            graph,
+            eligible_node_ids={"c"},
+            eligible_node_flag="is_snap_eligible",
+        )
+        self.assertEqual(ids.loc["p"], "c")
+
+    def test_eligible_node_flag_missing_attribute_treated_as_false(self):
+        """A node without the flag attribute counts as ineligible."""
+        graph = self._graph()
+        # Only 'b' has the flag attribute and it's True; 'a' and 'c' have no attr.
+        graph.nodes["b"]["is_snap_eligible"] = True
+        points = self._points([(0.5, 0.5)], ["p"])
+        ids, _ = snap_to_network_nodes(points, graph, eligible_node_flag="is_snap_eligible")
+        self.assertEqual(ids.loc["p"], "b")
+
+    def test_eligible_node_flag_with_no_eligible_nodes_raises(self):
+        """Flag set to a value not present on any node → empty eligible set → raises."""
+        graph = self._graph()  # nodes have no flag attribute at all
+        points = self._points([(0.5, 0.5)], ["p"])
+        with self.assertRaisesRegex(ValueError, "every node"):
+            snap_to_network_nodes(points, graph, eligible_node_flag="is_snap_eligible")
 
 
 class AggregateEdgesToNodesTestCase(unittest.TestCase):
@@ -524,6 +573,455 @@ class LanesPerDirectionTestCase(unittest.TestCase):
 
     def test_unparseable_lanes_defaults_to_one(self):
         self.assertEqual(lanes_per_direction({"lanes": "unknown"}), 1.0)
+
+
+class PrepareNetworkTestCase(unittest.TestCase):
+    """`prepare_network` resolves per-mode defaults (with optional `base_mode`
+    inheritance for subtype labels), applies the directedness transform,
+    precomputes the largest CC / SCC, and decorates the graph in place with
+    per-node `snap_eligible_flag` and per-edge `cost_excluded_flag` boolean
+    attributes.
+    """
+
+    def _trap_graph(self, with_highway: bool = False) -> nx.MultiDiGraph:
+        """Tiny directed graph with a one-way trap.
+
+        Topology (all edges directed):
+            0 -> 1 -> 2 -> 0    (a 3-cycle = strongly connected)
+            2 -> 3              (one-way edge into 3; 3 has no outgoing edge)
+
+        Largest SCC = {0, 1, 2}. Node 3 is trapped: reachable from the cycle
+        but cannot reach anything. As undirected, every node is mutually
+        reachable: largest CC = {0, 1, 2, 3}.
+
+        If `with_highway`, edges carry varying `highway` tags so cost-exclusion
+        logic can be exercised.
+        """
+        g = nx.MultiDiGraph()
+        for n, (x, y) in {0: (0, 0), 1: (1, 0), 2: (1, 1), 3: (2, 1)}.items():
+            g.add_node(n, x=float(x), y=float(y))
+        if with_highway:
+            g.add_edge(0, 1, highway="residential")
+            g.add_edge(1, 2, highway="motorway")
+            g.add_edge(2, 0, highway=["primary", "trunk"])  # list-valued
+            g.add_edge(2, 3, highway="footway")
+        else:
+            g.add_edge(0, 1)
+            g.add_edge(1, 2)
+            g.add_edge(2, 0)
+            g.add_edge(2, 3)
+        return g
+
+    # --- default resolution ---
+
+    def test_walk_defaults(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            prepared = prepare_network(self._trap_graph(), "walk")
+        self.assertEqual(prepared.mode, "walk")
+        self.assertEqual(prepared.directedness, "undirected")
+        self.assertEqual(prepared.network_type, "all")
+        self.assertEqual(prepared.snap_eligible_flag, "is_snap_eligible_walk")
+        self.assertEqual(prepared.cost_excluded_flag, "cost_excluded_walk")
+
+    def test_bike_defaults(self):
+        prepared = prepare_network(self._trap_graph(), "bike")
+        self.assertEqual(prepared.directedness, "undirected")
+        self.assertEqual(prepared.network_type, "bike")
+        self.assertEqual(prepared.snap_eligible_flag, "is_snap_eligible_bike")
+        self.assertEqual(prepared.cost_excluded_flag, "cost_excluded_bike")
+
+    def test_car_defaults(self):
+        prepared = prepare_network(self._trap_graph(), "car")
+        self.assertEqual(prepared.directedness, "directed_scc")
+        self.assertEqual(prepared.network_type, "drive")
+        self.assertEqual(prepared.snap_eligible_flag, "is_snap_eligible_car")
+        self.assertEqual(prepared.cost_excluded_flag, "cost_excluded_car")
+
+    def test_unknown_mode_without_base_mode_raises(self):
+        # No `mode in MODE_DEFAULTS` and no `base_mode` → can't infer defaults.
+        with self.assertRaisesRegex(ValueError, "no defaults are available"):
+            prepare_network(self._trap_graph(), "moped")
+
+    def test_invalid_base_mode_raises(self):
+        with self.assertRaisesRegex(ValueError, "base_mode"):
+            prepare_network(self._trap_graph(), "car_night", base_mode="moped")  # type: ignore[arg-type]
+
+    def test_unknown_mode_with_explicit_flags_succeeds(self):
+        # No MODE_DEFAULTS entry, but caller supplies everything explicit.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            prepared = prepare_network(
+                self._trap_graph(),
+                "snowmobile",
+                directedness="undirected",
+                network_type="all",
+                cost_excluded_tags=set(),
+            )
+        self.assertEqual(prepared.mode, "snowmobile")
+        self.assertEqual(prepared.snap_eligible_flag, "is_snap_eligible_snowmobile")
+
+    # --- base_mode inheritance ---
+
+    def test_base_mode_inherits_defaults(self):
+        # Subtype label "car_night" with base_mode="car" → car defaults apply.
+        prepared = prepare_network(self._trap_graph(), "car_night", base_mode="car")
+        self.assertEqual(prepared.mode, "car_night")
+        self.assertEqual(prepared.directedness, "directed_scc")  # from car defaults
+        self.assertEqual(prepared.network_type, "drive")  # from car defaults
+        # Flag names embed the user-supplied label, not the base:
+        self.assertEqual(prepared.snap_eligible_flag, "is_snap_eligible_car_night")
+        self.assertEqual(prepared.cost_excluded_flag, "cost_excluded_car_night")
+
+    def test_base_mode_warnings_fire_for_subtype(self):
+        # car_night with directedness='undirected' should fire the car warning
+        # because base_mode='car' resolves to the car rule set.
+        with self.assertWarnsRegex(UserWarning, "treats one-way streets as"):
+            prepare_network(
+                self._trap_graph(),
+                "car_night",
+                base_mode="car",
+                directedness="undirected",
+            )
+
+    def test_base_mode_override_individual_flags(self):
+        # car_night inherits car defaults but overrides cost_excluded_tags
+        # to add night-closure tags.
+        prepared = prepare_network(
+            self._trap_graph(with_highway=True),
+            "car_night",
+            base_mode="car",
+            cost_excluded_tags={"service"},
+        )
+        # The directedness still inherits from car (directed → SCC).
+        self.assertEqual(prepared.directedness, "directed_scc")
+
+    # --- snap-eligible node computation ---
+
+    def test_undirected_snap_set_is_largest_cc(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            prepared = prepare_network(self._trap_graph(), "walk")
+        self.assertEqual(prepared.snap_eligible_nodes, frozenset({0, 1, 2, 3}))
+
+    def test_directed_scc_snap_set_excludes_trapped_node(self):
+        prepared = prepare_network(self._trap_graph(), "car")
+        self.assertEqual(prepared.snap_eligible_nodes, frozenset({0, 1, 2}))
+        self.assertNotIn(3, prepared.snap_eligible_nodes)
+
+    def test_directed_scc_picks_largest_when_multiple(self):
+        g = nx.MultiDiGraph()
+        # SCC A: 3-cycle on 0,1,2
+        g.add_edge(0, 1)
+        g.add_edge(1, 2)
+        g.add_edge(2, 0)
+        # SCC B: 2-cycle on 10,11
+        g.add_edge(10, 11)
+        g.add_edge(11, 10)
+        for n in g.nodes:
+            g.nodes[n]["x"] = float(n)
+            g.nodes[n]["y"] = 0.0
+        prepared = prepare_network(g, "car")
+        self.assertEqual(prepared.snap_eligible_nodes, frozenset({0, 1, 2}))
+
+    def test_directed_scc_requires_directed_graph(self):
+        undirected = nx.MultiGraph()
+        undirected.add_edge(0, 1)
+        for n in undirected.nodes:
+            undirected.nodes[n]["x"] = 0.0
+            undirected.nodes[n]["y"] = 0.0
+        with self.assertRaises(ValueError):
+            prepare_network(undirected, "car", directedness="directed_scc")
+
+    # --- graph attribute decoration ---
+
+    def test_snap_eligible_attribute_written_per_node(self):
+        # Car defaults → directed SCC of {0,1,2}, trap node 3 excluded.
+        # Every node should carry `is_snap_eligible_car: bool`.
+        prepared = prepare_network(self._trap_graph(), "car")
+        g = prepared.graph
+        self.assertTrue(g.nodes[0]["is_snap_eligible_car"])
+        self.assertTrue(g.nodes[1]["is_snap_eligible_car"])
+        self.assertTrue(g.nodes[2]["is_snap_eligible_car"])
+        self.assertFalse(g.nodes[3]["is_snap_eligible_car"])
+
+    def test_cost_excluded_attribute_written_per_edge_with_string_highway(self):
+        # Car defaults have empty cost_excluded_tags, so the flag is False
+        # everywhere even though edges carry highway tags. Override to
+        # exclude motorway/trunk to actually exercise the masking.
+        prepared = prepare_network(
+            self._trap_graph(with_highway=True),
+            "car_filtered",
+            base_mode="car",
+            cost_excluded_tags={"motorway", "trunk"},
+        )
+        g = prepared.graph
+        # Edge 0->1 (residential) → not excluded
+        self.assertFalse(g.edges[0, 1, 0]["cost_excluded_car_filtered"])
+        # Edge 1->2 (motorway) → excluded
+        self.assertTrue(g.edges[1, 2, 0]["cost_excluded_car_filtered"])
+        # Edge 2->0 has list-valued highway including 'trunk' → excluded
+        self.assertTrue(g.edges[2, 0, 0]["cost_excluded_car_filtered"])
+        # Edge 2->3 (footway) → not excluded
+        self.assertFalse(g.edges[2, 3, 0]["cost_excluded_car_filtered"])
+
+    def test_cost_excluded_handles_none_highway(self):
+        # _trap_graph() without with_highway=True has no highway tags.
+        # All edges should default to cost_excluded=False.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            prepared = prepare_network(self._trap_graph(), "walk")
+        g = prepared.graph
+        # Undirected MultiGraph after to_undirected
+        for u, v, k in g.edges(keys=True):
+            self.assertFalse(g.edges[u, v, k]["cost_excluded_walk"])
+
+    def test_multiple_modes_accumulate_flags(self):
+        # Calling prepare_network twice with different modes on graphs derived
+        # from the same source produces decorated graphs that, if applied to
+        # the SAME underlying directed graph, would carry both flag sets.
+        # We exercise the per-call accumulation directly on a directed graph.
+        g = self._trap_graph()
+        # Apply car (directed_scc — no to_undirected, so g itself is mutated).
+        prepared_car = prepare_network(g, "car")
+        self.assertIs(prepared_car.graph, g)  # same object
+        # Car flags landed on every node.
+        for n in g.nodes:
+            self.assertIn("is_snap_eligible_car", g.nodes[n])
+        # Now also apply 'car_night' on the same graph; both flag sets coexist.
+        _ = prepare_network(g, "car_night", base_mode="car")
+        for n in g.nodes:
+            self.assertIn("is_snap_eligible_car", g.nodes[n])
+            self.assertIn("is_snap_eligible_car_night", g.nodes[n])
+
+    def test_custom_flag_names_override_defaults(self):
+        prepared = prepare_network(
+            self._trap_graph(),
+            "car",
+            snap_eligible_flag="my_snap_flag",
+            cost_excluded_flag="my_cost_flag",
+        )
+        self.assertEqual(prepared.snap_eligible_flag, "my_snap_flag")
+        self.assertEqual(prepared.cost_excluded_flag, "my_cost_flag")
+        g = prepared.graph
+        self.assertIn("my_snap_flag", g.nodes[0])
+        # No default name written:
+        self.assertNotIn("is_snap_eligible_car", g.nodes[0])
+
+    # --- override paths ---
+
+    def test_user_overrides_take_precedence_over_defaults(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            prepared = prepare_network(
+                self._trap_graph(),
+                "walk",
+                network_type="bike",  # nonsense for walk but accepted
+            )
+        self.assertEqual(prepared.network_type, "bike")
+        self.assertEqual(prepared.directedness, "undirected")
+
+    def test_empty_cost_excluded_tags_is_explicit_override(self):
+        # Passing `cost_excluded_tags=set()` overrides the walk default.
+        # The override is observable via the per-edge flag staying False
+        # even on motorway-tagged edges.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            prepared = prepare_network(
+                self._trap_graph(with_highway=True),
+                "walk",
+                cost_excluded_tags=set(),
+            )
+        g = prepared.graph
+        # The motorway-tagged edge should now NOT be excluded.
+        # After to_undirected, find any edge with highway=motorway.
+        motorway_edges = [
+            (u, v, k)
+            for u, v, k, d in g.edges(keys=True, data=True)
+            if d.get("highway") == "motorway"
+        ]
+        self.assertTrue(motorway_edges)
+        for u, v, k in motorway_edges:
+            self.assertFalse(g.edges[u, v, k]["cost_excluded_walk"])
+
+    # --- warning emission ---
+
+    def test_walk_directed_scc_warns(self):
+        with self.assertWarnsRegex(UserWarning, "unnecessarily restrictive"):
+            prepare_network(self._trap_graph(), "walk", directedness="directed_scc")
+
+    def test_walk_network_type_walk_warns(self):
+        with self.assertWarnsRegex(UserWarning, "Cambridge MA pitfall"):
+            prepare_network(self._trap_graph(), "walk", network_type="walk")
+
+    def test_walk_all_with_empty_excluded_tags_warns(self):
+        with self.assertWarnsRegex(UserWarning, "routed across motorways"):
+            prepare_network(self._trap_graph(), "walk", cost_excluded_tags=set())
+
+    def test_car_undirected_warns(self):
+        with self.assertWarnsRegex(UserWarning, "treats one-way streets as"):
+            prepare_network(self._trap_graph(), "car", directedness="undirected")
+
+    def test_car_all_with_empty_excluded_tags_warns(self):
+        with self.assertWarnsRegex(UserWarning, "footways, pedestrian paths"):
+            prepare_network(self._trap_graph(), "car", network_type="all")
+
+    def test_bike_defaults_emit_no_warning(self):
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            prepare_network(self._trap_graph(), "bike")
+        self.assertEqual(
+            [w for w in captured if issubclass(w.category, UserWarning)],
+            [],
+            "Bike defaults should not emit any UserWarning.",
+        )
+
+    def test_car_defaults_emit_no_warning(self):
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            prepare_network(self._trap_graph(), "car")
+        self.assertEqual(
+            [w for w in captured if issubclass(w.category, UserWarning)],
+            [],
+            "Car defaults should not emit any UserWarning.",
+        )
+
+    def test_non_default_but_unproblematic_combo_emits_no_warning(self):
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            prepare_network(self._trap_graph(), "bike", directedness="directed_scc")
+        self.assertEqual(
+            [w for w in captured if issubclass(w.category, UserWarning)],
+            [],
+            "Bike + directed_scc is a valid non-default choice and should not warn.",
+        )
+
+    def test_unknown_mode_no_warnings_fire(self):
+        # No MODE_DEFAULTS entry and no base_mode → no warning rules apply,
+        # so even pathological combinations should be silent (the user is
+        # off the warning-policy reservation by choice).
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            prepare_network(
+                self._trap_graph(),
+                "snowmobile",
+                directedness="undirected",
+                network_type="all",
+                cost_excluded_tags=set(),
+            )
+        self.assertEqual(
+            [w for w in captured if issubclass(w.category, UserWarning)],
+            [],
+            "Unknown mode without base_mode should not fire any warnings.",
+        )
+
+    # --- PreparedGraph itself ---
+
+    def test_prepared_graph_is_frozen(self):
+        prepared = prepare_network(self._trap_graph(), "car")
+        with self.assertRaises(Exception):  # dataclass frozen → FrozenInstanceError
+            prepared.mode = "walk"  # type: ignore[misc]
+
+    # --- cost-mask-aware snap-eligibility (the motorway-ramp pedestrian case) ---
+
+    def _cost_mask_graph(self) -> nx.MultiDiGraph:
+        """4 nodes: A-B-C all connected by `residential` edges; D connected
+        to B only via a `motorway` edge.
+
+        Topology: A, B, C, D are all in the single largest connected
+        component (undirected) — purely topological eligibility includes all
+        4. But for walk, motorway is in `cost_excluded_tags`, so D is
+        practically unreachable on foot — the cost-masked subgraph isolates
+        D into its own singleton component.
+        """
+        g = nx.MultiDiGraph()
+        for n in ("A", "B", "C", "D"):
+            g.add_node(n, x=0.0, y=0.0)
+        g.add_edge("A", "B", highway="residential")
+        g.add_edge("B", "A", highway="residential")
+        g.add_edge("B", "C", highway="residential")
+        g.add_edge("C", "B", highway="residential")
+        g.add_edge("B", "D", highway="motorway")
+        g.add_edge("D", "B", highway="motorway")
+        return g
+
+    def test_snap_eligible_excludes_nodes_reachable_only_via_excluded_edges(self):
+        """A node reachable from the main CC ONLY through cost-excluded edges
+        must NOT be in the snap-eligible set, even though it is topologically
+        in the largest CC. This is the motorway-on-ramp pedestrian case
+        (pre-cost-mask behavior put cells here and routing failed silently)."""
+        prepared = prepare_network(self._cost_mask_graph(), "walk")
+        self.assertIn("A", prepared.snap_eligible_nodes)
+        self.assertIn("B", prepared.snap_eligible_nodes)
+        self.assertIn("C", prepared.snap_eligible_nodes)
+        self.assertNotIn("D", prepared.snap_eligible_nodes)
+
+    def test_snap_eligible_includes_nodes_when_cost_excluded_tags_empty(self):
+        """With empty cost_excluded_tags, the cost-masked subgraph equals the
+        raw graph, so a node reachable only via motorway IS eligible (because
+        nothing is excluded for routing either). Confirms the new behavior
+        reduces to the old behavior in the no-mask case (default for bike + car)."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # expect the empty-tags warning
+            prepared = prepare_network(
+                self._cost_mask_graph(),
+                "walk",
+                cost_excluded_tags=set(),
+            )
+        self.assertIn("D", prepared.snap_eligible_nodes)
+
+    def test_snap_eligible_excluded_node_also_marked_in_per_node_attribute(self):
+        """The per-node `is_snap_eligible_walk` graph attribute reflects the
+        cost-mask-aware result, not the raw topology — confirms the graph
+        decoration is in sync with the dataclass field."""
+        prepared = prepare_network(self._cost_mask_graph(), "walk")
+        g = prepared.graph
+        self.assertTrue(g.nodes["A"]["is_snap_eligible_walk"])
+        self.assertTrue(g.nodes["B"]["is_snap_eligible_walk"])
+        self.assertTrue(g.nodes["C"]["is_snap_eligible_walk"])
+        self.assertFalse(g.nodes["D"]["is_snap_eligible_walk"])
+
+    # --- end-to-end integration ---
+
+    def test_prepared_graph_feeds_snap_and_cost_mask(self):
+        """End-to-end: prepare_network → snap_to_network_nodes by flag →
+        mask_excluded_edges → apply_edge_weights. Verifies the per-node and
+        per-edge decorations flow through the downstream helpers cleanly.
+        """
+        from aperta.routing import apply_edge_weights, mask_excluded_edges
+
+        prepared = prepare_network(
+            self._trap_graph(with_highway=True),
+            "car_filtered",
+            base_mode="car",
+            cost_excluded_tags={"motorway", "trunk"},
+        )
+
+        # Snap-by-flag: a point near trap node 3 should NOT snap to 3
+        # (3 is outside the largest SCC for car directedness).
+        points = gpd.GeoDataFrame(
+            geometry=[Point(2.0, 1.0)],  # right on top of node 3
+            index=pd.Index(["p"], name="point_id"),
+        )
+        ids, _ = snap_to_network_nodes(
+            points,
+            prepared.graph,
+            eligible_node_flag=prepared.snap_eligible_flag,
+        )
+        self.assertNotEqual(ids.loc["p"], 3)
+        self.assertIn(ids.loc["p"], {0, 1, 2})
+
+        # Cost mask: edges flagged as cost-excluded get inf, others get the
+        # base weight (here: a constant 1.0 per edge).
+        masked = mask_excluded_edges(lambda d: 1.0, prepared.cost_excluded_flag)
+        apply_edge_weights(prepared.graph, masked, "cost")
+        # Edge 1->2 is motorway → excluded.
+        self.assertEqual(prepared.graph.edges[1, 2, 0]["cost"], float("inf"))
+        # Edge 2->0 has list-valued highway with 'trunk' → excluded.
+        self.assertEqual(prepared.graph.edges[2, 0, 0]["cost"], float("inf"))
+        # Edge 0->1 (residential) and 2->3 (footway) → not excluded.
+        self.assertEqual(prepared.graph.edges[0, 1, 0]["cost"], 1.0)
+        self.assertEqual(prepared.graph.edges[2, 3, 0]["cost"], 1.0)
 
 
 if __name__ == "__main__":

@@ -20,10 +20,18 @@ that don't fit under `routing` (shortest-path queries) or `osm_helpers`
 - **Edge betweenness sampling**: `get_nested_edge_betweenness` runs the
   per-origin Dijkstra + path-walking accumulator used by the traffic-flow
   estimation pipeline in `traffic_flows.py`.
+- **Mode-aware graph preparation**: `prepare_network` resolves per-mode
+  defaults (directedness, network type, cost-excluded tags), applies
+  `to_undirected()` where appropriate, and precomputes the largest
+  connected (or strongly-connected) component as a snap-eligible node set.
+  This avoids the trapped-node problem where consolidation isolates short
+  one-way segments from which routing cannot escape.
 """
 
+import warnings
 from collections import defaultdict
-from typing import Callable, Literal, cast
+from dataclasses import dataclass
+from typing import Callable, Iterable, Literal, cast
 
 import geopandas as gpd
 import networkx as nx
@@ -747,6 +755,7 @@ def snap_to_network_nodes(
     *,
     max_distance: float | None = None,
     eligible_node_ids: set | list | pd.Index | None = None,
+    eligible_node_flag: str | None = None,
 ) -> tuple[pd.Series, pd.Series]:
     """Snap each row in `points` to its nearest node in `graph`.
 
@@ -770,6 +779,13 @@ def snap_to_network_nodes(
             to filter out structurally undesirable snap targets (e.g.,
             motorway nodes, dead-end nodes, pedestrian-only paths for car
             analyses). `None` (default) considers all graph nodes.
+        eligible_node_flag: optional alternative to `eligible_node_ids` —
+            name of a per-node boolean attribute on `graph` that marks
+            eligible snap targets (e.g., the `snap_eligible_flag` written
+            by `prepare_network`). Useful when the graph has been prepared
+            elsewhere (e.g., loaded from `.graphml`) and the eligible-set
+            travels with it as a node attribute. Ignored if
+            `eligible_node_ids` is also given.
 
     Returns:
         Tuple `(node_ids, distances)`:
@@ -779,6 +795,11 @@ def snap_to_network_nodes(
     """
     from aperta import geo_mapping  # local import to avoid module-load cycle
 
+    if eligible_node_ids is None and eligible_node_flag is not None:
+        eligible_node_ids = [
+            n for n, data in graph.nodes(data=True) if data.get(eligible_node_flag)
+        ]
+
     if eligible_node_ids is None:
         node_ids = list(graph.nodes)
     else:
@@ -786,8 +807,9 @@ def snap_to_network_nodes(
         node_ids = [n for n in graph.nodes if n in eligible_set]
         if not node_ids:
             raise ValueError(
-                "`eligible_node_ids` filter excluded every node in the graph. "
-                "Cannot snap to an empty set of targets."
+                "Eligibility filter excluded every node in the graph "
+                "(`eligible_node_ids` or `eligible_node_flag`). Cannot snap to "
+                "an empty set of targets."
             )
     node_x = [graph.nodes[n]["x"] for n in node_ids]
     node_y = [graph.nodes[n]["y"] for n in node_ids]
@@ -1014,3 +1036,360 @@ def assign_to_eligible_centroid(
 
     # Reindex to the full polygons.index (NaN for any that fell through).
     return (snapped_ids.reindex(polygons.index), snapped_dists.reindex(polygons.index))
+
+
+# --- Mode-aware graph preparation -------------------------------------------
+
+BaseMode = Literal["walk", "bike", "car"]
+Directedness = Literal["undirected", "directed_scc"]
+
+
+# Per-mode default configuration for `prepare_network`. The rationale for each
+# choice is documented in the design memo `project_aperta_node_snap_trap_fix`:
+#   - walk: undirected (walking does not respect one-ways) + `network_type='all'`
+#     (avoids stripping pedestrian paths topologically connected through highway
+#     nodes — the Cambridge MA pitfall) + motorway/trunk excluded at cost time.
+#   - bike: undirected (untagged contraflow is more common than legit-bike-only
+#     one-ways; the permissive default is the right error budget) + `'bike'`.
+#   - car:  directed with snap-to-largest-SCC (one-ways are semantically real
+#     for cars; flipping them produces wrong-direction routes) + `'drive'`.
+MODE_DEFAULTS: dict[BaseMode, dict] = {
+    "walk": {
+        "network_type": "all",
+        "directedness": "undirected",
+        "cost_excluded_tags": frozenset({"motorway", "motorway_link", "trunk", "trunk_link"}),
+    },
+    "bike": {
+        "network_type": "bike",
+        "directedness": "undirected",
+        "cost_excluded_tags": frozenset(),
+    },
+    "car": {
+        "network_type": "drive",
+        "directedness": "directed_scc",
+        "cost_excluded_tags": frozenset(),
+    },
+}
+
+
+@dataclass(frozen=True)
+class PreparedGraph:
+    """Routing-ready graph plus the in-session metadata derived by `prepare_network`.
+
+    `prepare_network` decorates the underlying `graph` in place with two
+    boolean attributes — one per node (`snap_eligible_flag`) and one per
+    edge (`cost_excluded_flag`) — so the trap-fix information survives
+    `.graphml` roundtripping and is available to downstream consumers that
+    receive only the graph (e.g., Pandana). The `PreparedGraph` itself is a
+    thin session-time wrapper that memoizes the snap-eligible node set for
+    direct 1:1 hand-off to `snap_to_network_nodes` and records the
+    resolved-config metadata for introspection.
+
+    Attributes:
+        graph: The routing graph. `MultiGraph` (undirected) when
+            `directedness='undirected'`, `MultiDiGraph` (directed) when
+            `directedness='directed_scc'`.
+        snap_eligible_nodes: Node IDs from which every node in the set is
+            mutually reachable under the chosen directedness — the largest
+            connected component for `'undirected'`, the largest strongly
+            connected component for `'directed_scc'`. Pass as
+            `eligible_node_ids=` to `snap_to_network_nodes` to prevent cells
+            from snapping to trapped nodes. Memoized; the same set is also
+            recoverable from the per-node `snap_eligible_flag` attribute on
+            `graph`.
+        snap_eligible_flag: Name of the per-node boolean attribute written
+            onto `graph` (default `f"is_snap_eligible_{mode}"`).
+        cost_excluded_flag: Name of the per-edge boolean attribute written
+            onto `graph` (default `f"cost_excluded_{mode}"`). Mode-specific
+            cost functions consult this flag to assign cost = ∞.
+        mode: The user-supplied mode label (free-form string).
+        directedness: Resolved directedness setting.
+        network_type: Resolved OSMnx network-type string (recorded for
+            metadata / warnings; `prepare_network` does not re-fetch).
+    """
+
+    graph: nx.Graph
+    snap_eligible_nodes: frozenset
+    snap_eligible_flag: str
+    cost_excluded_flag: str
+    mode: str
+    directedness: Directedness
+    network_type: str
+
+
+def prepare_network(
+    graph: nx.MultiDiGraph,
+    mode: str,
+    *,
+    base_mode: BaseMode | None = None,
+    directedness: Directedness | None = None,
+    network_type: str | None = None,
+    cost_excluded_tags: Iterable[str] | None = None,
+    snap_eligible_flag: str | None = None,
+    cost_excluded_flag: str | None = None,
+) -> PreparedGraph:
+    """Apply mode-aware graph preparation: directedness + snap-eligibility + cost-exclusion flags.
+
+    Wraps an already-fetched (and typically already-consolidated) graph to
+    produce a `PreparedGraph` ready for trap-free routing. The two axes —
+    `directedness` and `network_type` — each have per-mode defaults
+    (`MODE_DEFAULTS`) that callers can override. The trap-fix outputs
+    (`snap_eligible_flag` per node, `cost_excluded_flag` per edge) are
+    written onto the underlying graph in place so they survive `.graphml`
+    roundtripping and are available to downstream consumers that don't
+    know about `PreparedGraph`.
+
+    The `mode` argument is a free-form string label used for default flag
+    names and for warning-policy lookup. Common cases (`'walk'`, `'bike'`,
+    `'car'`) pick up defaults directly from `MODE_DEFAULTS`. Subtype /
+    context labels (e.g., `'car_night'`, `'ebike25'`) work too; pass
+    `base_mode` to inherit defaults from a known base, and override
+    individual flags as needed. Default flag names embed `mode`, so
+    multiple calls on the same graph with different mode labels accumulate
+    independent decorations (`is_snap_eligible_car_peak`,
+    `is_snap_eligible_car_night`, etc.) instead of overwriting each other.
+
+    Args:
+        graph: Routing graph, typically the output of `fetch_network` +
+            `consolidate_intersections`. Must be directed
+            (`nx.MultiDiGraph`) when `directedness='directed_scc'` is
+            chosen.
+        mode: Free-form mode label. Used to derive default flag names and,
+            if it matches a `BaseMode` (`'walk'`/`'bike'`/`'car'`), to pull
+            defaults from `MODE_DEFAULTS`.
+        base_mode: Optional `BaseMode` for `MODE_DEFAULTS` lookup when
+            `mode` itself is not a `BaseMode` (e.g., `mode='car_night'`,
+            `base_mode='car'`). Resolution order: `base_mode` if given,
+            else `mode` if in `MODE_DEFAULTS`, else no defaults available
+            and all flags must be supplied explicitly.
+        directedness: `'undirected'` applies `to_undirected()` and snaps to
+            the largest connected component. `'directed_scc'` keeps the
+            graph directed and snaps to the largest strongly connected
+            component. `None` resolves from defaults.
+        network_type: The OSMnx `network_type` used to fetch `graph`. Used
+            only for warning-policy decisions and recorded as metadata;
+            this function does not re-fetch. `None` resolves from defaults.
+        cost_excluded_tags: Highway-tag values to mark for cost = ∞
+            downstream (e.g., `{'motorway', 'trunk'}` for walk on
+            `network_type='all'`). `None` resolves from defaults; an empty
+            iterable is a valid explicit override.
+        snap_eligible_flag: Name of the per-node bool attribute to write.
+            `None` defaults to `f"is_snap_eligible_{mode}"`.
+        cost_excluded_flag: Name of the per-edge bool attribute to write.
+            `None` defaults to `f"cost_excluded_{mode}"`.
+
+    Returns:
+        A `PreparedGraph` carrying the (possibly transformed) routing
+        graph, the snap-eligible node set (also written per-node onto the
+        graph), and the resolved metadata.
+
+    Warns:
+        `UserWarning` on combinations known to silently produce wrong
+        answers (e.g., `walk + network_type='walk'` strips pedestrian
+        paths; `car + directedness='undirected'` routes the wrong way down
+        one-way streets). Warnings are keyed by the resolved base mode, so
+        they fire for subtypes too (`'car_night'` with `base_mode='car'`
+        still warns on `directedness='undirected'`). Deviations from a
+        mode default that are not known-problematic do NOT warn.
+
+    Raises:
+        ValueError: if `mode` has no defaults available (neither
+            `base_mode` nor `mode in MODE_DEFAULTS`) and any of
+            `directedness` / `network_type` / `cost_excluded_tags` is
+            unspecified; or if `directedness='directed_scc'` is requested
+            on an already-undirected graph.
+    """
+    if base_mode is not None and base_mode not in MODE_DEFAULTS:
+        raise ValueError(f"`base_mode` must be one of {list(MODE_DEFAULTS)}; got {base_mode!r}.")
+
+    if base_mode is not None:
+        defaults: dict | None = MODE_DEFAULTS[base_mode]
+        effective_base: BaseMode | None = base_mode
+    elif mode in MODE_DEFAULTS:
+        defaults = MODE_DEFAULTS[cast(BaseMode, mode)]
+        effective_base = cast(BaseMode, mode)
+    else:
+        defaults = None
+        effective_base = None
+
+    def _resolve(flag_value, default_key: str, flag_name: str):
+        if flag_value is not None:
+            return flag_value
+        if defaults is None:
+            raise ValueError(
+                f"`{flag_name}` not provided and no defaults are available for "
+                f"mode={mode!r}. Pass `base_mode` to inherit from a known base, "
+                f"or supply `{flag_name}` explicitly."
+            )
+        return defaults[default_key]
+
+    directedness_r: Directedness = _resolve(directedness, "directedness", "directedness")
+    network_type_r: str = _resolve(network_type, "network_type", "network_type")
+    cost_excluded_tags_r: frozenset = frozenset(
+        _resolve(cost_excluded_tags, "cost_excluded_tags", "cost_excluded_tags")
+    )
+
+    snap_eligible_flag_r: str = (
+        snap_eligible_flag if snap_eligible_flag is not None else f"is_snap_eligible_{mode}"
+    )
+    cost_excluded_flag_r: str = (
+        cost_excluded_flag if cost_excluded_flag is not None else f"cost_excluded_{mode}"
+    )
+
+    if effective_base is not None:
+        _check_combination(effective_base, directedness_r, network_type_r, cost_excluded_tags_r)
+
+    if directedness_r == "undirected":
+        prepared_graph: nx.Graph = graph.to_undirected()
+    else:
+        if not graph.is_directed():
+            raise ValueError(
+                "`directedness='directed_scc'` requires a directed input graph; "
+                "got an undirected graph."
+            )
+        prepared_graph = graph
+
+    # Write per-edge cost_excluded_flag FIRST so the snap-eligible
+    # computation below can mask cost-excluded edges out of its topology
+    # analysis. Without this ordering, a node connected to the rest of
+    # the largest CC only via cost-excluded edges (e.g., a pedestrian
+    # cell snapped to a motorway-ramp node) would appear topologically
+    # eligible but route to inf at every query — silent zero-accessibility
+    # outliers.
+    if prepared_graph.is_multigraph():
+        for u, v, k, edata in prepared_graph.edges(keys=True, data=True):
+            prepared_graph.edges[u, v, k][cost_excluded_flag_r] = _highway_in_excluded(
+                edata.get("highway"), cost_excluded_tags_r
+            )
+    else:
+        for u, v, edata in prepared_graph.edges(data=True):
+            prepared_graph.edges[u, v][cost_excluded_flag_r] = _highway_in_excluded(
+                edata.get("highway"), cost_excluded_tags_r
+            )
+
+    snap_nodes = _compute_snap_eligible_nodes(prepared_graph, directedness_r, cost_excluded_flag_r)
+
+    # Decorate the graph in place so the trap-fix information rides along
+    # with the graph (e.g., through .graphml roundtripping) and downstream
+    # consumers can use it without knowing about `PreparedGraph`.
+    for n in prepared_graph.nodes:
+        prepared_graph.nodes[n][snap_eligible_flag_r] = n in snap_nodes
+
+    return PreparedGraph(
+        graph=prepared_graph,
+        snap_eligible_nodes=snap_nodes,
+        snap_eligible_flag=snap_eligible_flag_r,
+        cost_excluded_flag=cost_excluded_flag_r,
+        mode=mode,
+        directedness=directedness_r,
+        network_type=network_type_r,
+    )
+
+
+def _compute_snap_eligible_nodes(
+    graph: nx.Graph,
+    directedness: Directedness,
+    cost_excluded_flag: str,
+) -> frozenset:
+    """Largest CC (undirected) or SCC (directed) of the *cost-masked* subgraph.
+
+    The cost-masked subgraph contains only edges where the per-edge attribute
+    `cost_excluded_flag` is absent or `False`. Computing eligibility on this
+    subgraph (rather than on the raw topology) is what distinguishes
+    "topologically reachable" from "reachable at finite routing cost." A node
+    connected to the rest of the largest CC only via cost-excluded edges
+    (e.g., a pedestrian-network node at a motorway interchange) is in the
+    largest topological CC but practically unreachable at routing time — the
+    cost-masked subgraph correctly identifies it as ineligible.
+
+    When `cost_excluded_tags` is empty (the default for bike + car), no edges
+    carry `cost_excluded_flag=True`, so the cost-masked subgraph equals the
+    full graph and the result matches plain topological analysis.
+    """
+    if graph.is_multigraph():
+        ok_edges = [
+            (u, v, k)
+            for u, v, k, d in graph.edges(keys=True, data=True)
+            if not d.get(cost_excluded_flag, False)
+        ]
+    else:
+        ok_edges = [
+            (u, v) for u, v, d in graph.edges(data=True) if not d.get(cost_excluded_flag, False)
+        ]
+    subgraph = graph.edge_subgraph(ok_edges)
+    if directedness == "undirected":
+        components = nx.connected_components(subgraph)
+    else:
+        components = nx.strongly_connected_components(subgraph)
+    largest = max(components, key=len, default=set())
+    return frozenset(largest)
+
+
+def _highway_in_excluded(highway_value, excluded: frozenset) -> bool:
+    """True if the edge's `highway` tag is in `excluded`. Tolerates list-valued
+    tags (post-`consolidate_intersections` edges can carry a list of highway
+    strings) and `None`.
+    """
+    if highway_value is None:
+        return False
+    if isinstance(highway_value, list):
+        return any(v in excluded for v in highway_value)
+    return highway_value in excluded
+
+
+def _check_combination(
+    base_mode: BaseMode,
+    directedness: Directedness,
+    network_type: str,
+    cost_excluded_tags: frozenset,
+) -> None:
+    """Emit `UserWarning` for combinations known to silently produce wrong
+    answers. Keyed by the resolved base mode, so warnings fire for subtypes
+    (e.g., `'car_night'` with `base_mode='car'` triggers car-rule warnings).
+    Deviations from defaults that are not known-problematic stay silent —
+    warnings are reserved for actual risk, not "this is not the recommended
+    setting".
+    """
+    if base_mode == "walk":
+        if directedness == "directed_scc":
+            warnings.warn(
+                "walk + directedness='directed_scc' is unnecessarily restrictive; "
+                "walking does not need to respect one-ways. Consider 'undirected'.",
+                UserWarning,
+                stacklevel=3,
+            )
+        if network_type == "walk":
+            warnings.warn(
+                "walk + network_type='walk' may strip pedestrian paths topologically "
+                "connected to the rest of the network through highway nodes "
+                "(the Cambridge MA pitfall). Consider network_type='all' with "
+                "cost_excluded_tags={'motorway', 'motorway_link', 'trunk', "
+                "'trunk_link'}.",
+                UserWarning,
+                stacklevel=3,
+            )
+        if network_type == "all" and not cost_excluded_tags:
+            warnings.warn(
+                "walk + network_type='all' with empty cost_excluded_tags: walking "
+                "will be routed across motorways. Consider excluding {'motorway', "
+                "'motorway_link', 'trunk', 'trunk_link'}.",
+                UserWarning,
+                stacklevel=3,
+            )
+    elif base_mode == "car":
+        if directedness == "undirected":
+            warnings.warn(
+                "car + directedness='undirected' treats one-way streets as "
+                "bidirectional. Was this intentional? Routes may go the wrong way "
+                "down one-way streets.",
+                UserWarning,
+                stacklevel=3,
+            )
+        if network_type == "all" and not cost_excluded_tags:
+            warnings.warn(
+                "car + network_type='all' with empty cost_excluded_tags: car routing "
+                "may traverse footways, pedestrian paths, or steps. Consider "
+                "excluding non-drivable highway tags.",
+                UserWarning,
+                stacklevel=3,
+            )

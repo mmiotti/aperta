@@ -8,7 +8,7 @@
 #       format_name: percent
 #       format_version: '1.3'
 #   kernelspec:
-#     display_name: Python 3 (ipykernel)
+#     display_name: aperta
 #     language: python
 #     name: python3
 # ---
@@ -286,6 +286,16 @@ print(f"Zones: {len(zones):,} (avg {len(cells)/len(zones):.1f} cells each).")
 # metres) — keeping all three in one DataFrame means downstream OD-pair
 # construction just passes the right `node_column=` argument.
 #
+# **Eligibility filter via `prepare_network`.** Each mode's graph is run
+# through `prepare_network` first, which applies the mode's recommended
+# directedness (`undirected` for walk + bike, `directed_scc` for car) and
+# precomputes the snap-eligible node set: the largest connected
+# component for walk/bike, the largest strongly connected component for
+# car. Cells then snap only to nodes in that eligible set. Without this,
+# cells whose centroid happens to lie nearest a node on a small
+# disconnected island (walk/bike) or a one-way trap segment (car) would
+# silently produce zero-accessibility outliers at routing time.
+#
 # Snap distances are reused downstream as the cell-to-network-node
 # first-mile / last-mile component of trip overheads.
 
@@ -297,15 +307,36 @@ bike_graph = network_processing.load_consolidated_graphml(
 car_graph  = network_processing.load_consolidated_graphml(
     PREPARED_DIR / 'car_graph.graphml')
 
+# Mode-aware preparation: undirected + largest-CC for walk + bike,
+# directed + largest-SCC for car. The returned PreparedGraph objects
+# carry the snap-eligible node set used below.
+walk_prepared = network_processing.prepare_network(walk_graph, 'walk')
+bike_prepared = network_processing.prepare_network(bike_graph, 'bike')
+car_prepared  = network_processing.prepare_network(car_graph,  'car')
+for label, prepared in [('walk', walk_prepared),
+                        ('bike', bike_prepared),
+                        ('car',  car_prepared)]:
+    n_total = prepared.graph.number_of_nodes()
+    n_elig = len(prepared.snap_eligible_nodes)
+    print(f"  {label:4s} snap-eligible: {n_elig:>7,} / {n_total:>7,} nodes "
+          f"({100 * n_elig / n_total:.1f}%)")
+
 
 def snap_layer_to_all_networks(layer: gpd.GeoDataFrame) -> None:
-    """Mutate `layer` to add node-id + snap-distance columns for each network."""
+    """Mutate `layer` to add node-id + snap-distance columns for each network.
+
+    Snap targets are restricted to each PreparedGraph's `snap_eligible_nodes`,
+    so cells can't land on disconnected islands (walk/bike) or trap nodes (car).
+    """
     centroids = layer.copy()
     centroids['geometry'] = centroids.geometry.centroid
-    for graph, label in [(walk_graph, 'walk'),
-                         (bike_graph, 'bike'),
-                         (car_graph,  'car')]:
-        nid, dist = network_processing.snap_to_network_nodes(centroids, graph)
+    for label, prepared in [('walk', walk_prepared),
+                            ('bike', bike_prepared),
+                            ('car',  car_prepared)]:
+        nid, dist = network_processing.snap_to_network_nodes(
+            centroids, prepared.graph,
+            eligible_node_ids=prepared.snap_eligible_nodes,
+        )
         layer[f'node_id_{label}'] = nid
         layer[f'snap_dist_{label}'] = dist
 

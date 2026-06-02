@@ -92,6 +92,8 @@ the reason in your project.
     )
 """
 
+from typing import Callable
+
 import geopandas as gpd
 import networkx as nx
 import numpy as np
@@ -369,6 +371,76 @@ def aggregate_dest_overhead_per_group_routed(
     return pd.Series(out, name=f"dest_overhead_per_group({group_id_column})")
 
 
+def _zones_referenced_as_origins(costs: TieredODGeoPairs) -> set:
+    """Set of zone IDs that appear as origins in any zone-keyed origin tier."""
+    if costs.zones_to_zones is None:
+        return set()
+    return set(costs.zones_to_zones.keys())
+
+
+def _zones_referenced_as_dests(pairs: TieredODGeoPairs) -> set:
+    """Set of zone IDs that appear as destinations in any zone-keyed dest tier."""
+    zones: set = set()
+    for tier in (pairs.cells_to_zones, pairs.zones_to_zones):
+        if tier is None:
+            continue
+        for dest_ids in tier.values():
+            zones.update(dest_ids)
+    return zones
+
+
+def _aggregate_cell_to_zone(
+    cell_overhead: pd.Series | dict,
+    cell_to_zone: pd.Series | dict | None,
+    aggregator: str | Callable,
+    *,
+    referenced_zones: set,
+    side: str,
+) -> pd.Series:
+    """Aggregate per-cell overhead into per-zone overhead.
+
+    Raises if `cell_to_zone` is missing, if any cell in `cell_overhead` is
+    missing from `cell_to_zone`, or if any zone in `referenced_zones` is
+    missing from the aggregation result (no constituent cells).
+    """
+    if cell_to_zone is None:
+        raise ValueError(
+            f"`{side}_cell` overhead provided and zone-tier overhead is needed "
+            f"(the costs include zones_to_zones or cells_to_zones), but neither "
+            f"`{side}_zone` nor `cell_to_zone` was given. Pass `cell_to_zone` "
+            f"(e.g., `cells['zone_id']`) to auto-derive the zone-tier overhead, "
+            f"or supply `{side}_zone` explicitly."
+        )
+    if isinstance(cell_overhead, dict):
+        cell_overhead = pd.Series(cell_overhead)
+    if isinstance(cell_to_zone, dict):
+        cell_to_zone = pd.Series(cell_to_zone)
+
+    # Align cell_to_zone to the cells in cell_overhead.
+    aligned = cell_to_zone.reindex(cell_overhead.index)
+    missing_cells = aligned.isna()
+    if missing_cells.any():
+        n = int(missing_cells.sum())
+        sample = list(cell_overhead.index[missing_cells][:5])
+        raise ValueError(
+            f"{n} cells in `{side}_cell` overhead have no zone assignment in "
+            f"`cell_to_zone` (first {len(sample)}: {sample})."
+        )
+
+    grouped = cell_overhead.groupby(aligned).agg(aggregator)
+
+    missing_zones = referenced_zones - set(grouped.index)
+    if missing_zones:
+        sample = list(missing_zones)[:5]
+        raise ValueError(
+            f"{len(missing_zones)} zone(s) used in the costs have no "
+            f"constituent cells in `cell_to_zone` (first {len(sample)}: "
+            f"{sample}). Cannot derive per-zone {side} overhead. Pass "
+            f"`{side}_zone` explicitly for these zones."
+        )
+    return grouped
+
+
 def _as_lookup(x: pd.Series | dict | None) -> dict | None:
     """Normalise a Series-or-dict-or-None to a dict-or-None."""
     if x is None:
@@ -471,6 +543,8 @@ def add_geo_overheads(
     origin_zone: pd.Series | dict | None = None,
     dest_cell: pd.Series | dict | None = None,
     dest_zone: pd.Series | dict | None = None,
+    cell_to_zone: pd.Series | dict | None = None,
+    zone_aggregator: str | Callable = "mean",
 ) -> TieredODGeoPairs:
     """Add per-geo-unit origin and destination overheads to a geo-keyed cost ODM.
 
@@ -487,10 +561,9 @@ def add_geo_overheads(
       mode-specific). Mode-specific origin overhead baked here propagates
       correctly through `aggregate_across_modes`.
     - `origin_zone`: per-zone-id overhead, added to every `zones_to_zones`
-      OD cost. Use the per-zone average of per-cell first-mile overheads
-      (cells in the same zone share a far-tier OD pair, so we collapse to
-      a single zone-level scalar — see `add_origin_cell_overhead` for the
-      canonical convenience wrapper).
+      OD cost. If `origin_cell` is given and `origin_zone` is not, the
+      zone-tier version is auto-derived from `origin_cell` + `cell_to_zone`
+      using `zone_aggregator` (default `'mean'`).
 
     Destination (looked up by dest unit ID at each tier):
 
@@ -498,12 +571,63 @@ def add_geo_overheads(
       destination. Use for per-cell last-mile.
     - `dest_zone`: per-zone-id overhead, added to every `cells_to_zones`
       AND `zones_to_zones` destination (both tiers have zone-id dests).
-      Plug in the output of `aggregate_dest_overhead_per_group_euclidean`
-      (or `_routed`) directly — no zone-id → zone-node-id detour needed.
+      If `dest_cell` is given and `dest_zone` is not, the zone-tier version
+      is auto-derived from `dest_cell` + `cell_to_zone` using
+      `zone_aggregator`.
 
     Tiers not present in `costs` pass through as `None`. The input is not
     mutated; a new `TieredODGeoPairs` is returned.
+
+    **Why the auto-derivation matters.** Leaving zone-tier overhead absent
+    when cell-tier overhead is set produces silently-wrong accessibility:
+    `zones_to_zones` OD pairs end up with zero overhead while
+    `cells_to_cells` pairs carry the full 2× cell overhead. In nearest-k
+    metrics this makes the z2z tier appear artificially cheap, and z2z
+    routes (which use origin-zone rep-nodes shared by all cells in a zone)
+    produce visible origin-zone outlines in the output. Auto-derivation
+    closes this footgun by default.
+
+    Args:
+        costs: geo-keyed cost ODM (typically from `reindex_by_geo_unit`).
+        pairs: matching geo-keyed pairs (for tier structure + dest lookups).
+        origin_cell / origin_zone / dest_cell / dest_zone: see above.
+        cell_to_zone: cell-id → zone-id map (`pd.Series`, `dict`, or any
+            cell-indexed series with zone values). Required when a cell-tier
+            overhead is given but the corresponding zone-tier overhead is
+            absent AND a coarser tier exists in `costs`. Cells absent from
+            the map raise `ValueError`.
+        zone_aggregator: how to collapse per-cell overheads into per-zone
+            scalars during auto-derivation. Any pandas groupby-compatible
+            string (`'mean'`, `'median'`, etc.) or callable. Default
+            `'mean'` — unweighted mean over cells in each zone.
+
+    Raises:
+        ValueError: if a cell-tier overhead is given but the corresponding
+            zone-tier is needed for a present tier and `cell_to_zone` is
+            missing; or if `cell_to_zone` lacks zones referenced by `costs`;
+            or if any cell in a cell-tier overhead is missing from
+            `cell_to_zone`.
     """
+    needs_origin_zone = costs.zones_to_zones is not None
+    needs_dest_zone = costs.cells_to_zones is not None or costs.zones_to_zones is not None
+
+    if origin_zone is None and origin_cell is not None and needs_origin_zone:
+        origin_zone = _aggregate_cell_to_zone(
+            origin_cell,
+            cell_to_zone,
+            zone_aggregator,
+            referenced_zones=_zones_referenced_as_origins(costs),
+            side="origin",
+        )
+    if dest_zone is None and dest_cell is not None and needs_dest_zone:
+        dest_zone = _aggregate_cell_to_zone(
+            dest_cell,
+            cell_to_zone,
+            zone_aggregator,
+            referenced_zones=_zones_referenced_as_dests(pairs),
+            side="destination",
+        )
+
     o_cell_lu = _as_lookup(origin_cell)
     o_zone_lu = _as_lookup(origin_zone)
     d_cell_lu = _as_lookup(dest_cell)
