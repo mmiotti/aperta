@@ -1,10 +1,25 @@
 # Pre-commit hooks. Install once per clone:
 #     pip install pre-commit
-#     pre-commit install
+#     pre-commit install                       # commit-stage hooks
+#     pre-commit install --hook-type pre-push  # push-stage hooks (mypy + tests)
 #
-# After install, the configured hooks run automatically on every `git commit`.
+# After install:
+#   - `git commit` runs the fast checks (ruff lint, ruff format, jupytext sync).
+#   - `git push`   additionally runs the CI-matching slow checks (mypy
+#                  typecheck, full unittest suite). Anything that passes
+#                  locally will pass on CI's `lint`, `typecheck`, and `test`
+#                  jobs in .github/workflows/test.yml.
+#
+# **Run `git push` (or the on-demand commands below) from a shell where the
+# project's Python environment is active** — `conda activate aperta` or
+# equivalent. The push-stage hooks below use `language: system`, which runs
+# the entries with whichever `python` / `mypy` is on PATH. Without the env
+# active, mypy / unittest can't resolve `aperta.*` imports and the hooks
+# fail with "ModuleNotFoundError: No module named 'aperta'".
+#
 # Run on demand:
 #     pre-commit run --all-files
+#     pre-commit run --all-files --hook-stage pre-push
 
 repos:
   # Keep jupytext-paired .py / .ipynb files in sync. After install, editing
@@ -27,3 +42,24 @@ repos:
       - id: ruff           # lint (auto-fixes what it can)
         args: [--fix]
       - id: ruff-format    # format
+
+  # CI-matching slow checks: mypy typecheck + full unittest suite. These
+  # fire on `git push` (not per commit), so the interactive commit loop
+  # stays fast while the final pre-push gate catches anything CI would
+  # reject. `language: system` runs the commands in the user's current
+  # environment (where aperta is installed editable), letting mypy resolve
+  # `aperta.*` imports and unittest pick up the project's deps.
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy (CI-matching typecheck)
+        entry: mypy --config-file pyproject.toml
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+      - id: unittest
+        name: unittest (full library suite)
+        entry: python -m unittest discover -s tests -t .
+        language: system
+        pass_filenames: false
+        stages: [pre-push]

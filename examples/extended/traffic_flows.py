@@ -99,7 +99,7 @@ from aperta import (
     routing,
     traffic_flows,
 )
-from aperta.network_processing import HIGHWAY_RANKS
+from aperta.network_processing import OSM_HIGHWAY_RANKS
 
 warnings.filterwarnings('ignore', category=FutureWarning)
 warnings.filterwarnings('ignore', category=UserWarning, module='geopandas')
@@ -128,7 +128,7 @@ BEARING_TOL_DEG = 20.0
 # signal load. Features from `prepare/5_density`; coefficients are
 # off-peak car priors.
 INITIAL_MULT = {'density_norm': 0.25}
-INITIAL_ADD = {'is_degree_4': 3.0, 'is_traffic_signal': 7.0}
+INITIAL_ADD = {'is_4way': 3.0, 'is_traffic_signal': 7.0}
 
 # OD-tier radii (CRS metres) + travel-time cutoff.
 R_CELLS_M = 1_500
@@ -225,7 +225,7 @@ def _edge_rank_and_tier(d) -> tuple[int, str]:
     hwy = d.get('highway')
     if isinstance(hwy, list):
         hwy = hwy[0] if hwy else None
-    rank = HIGHWAY_RANKS.get(hwy, -1)
+    rank = OSM_HIGHWAY_RANKS.get(hwy, -1)
     if rank >= 6: tier = 'highway'    # motorway / trunk
     elif rank >= 3: tier = 'main'     # primary / secondary / tertiary
     else: tier = 'local'              # residential / service / unknown

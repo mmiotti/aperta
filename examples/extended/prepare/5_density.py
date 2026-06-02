@@ -24,13 +24,13 @@
 #    measure used in the published Miotti et al. coefficients
 #    (`beta_density` term).
 # 2. **Propagate per-node features to edges.** Density, intersection flags
-#    (`is_degree_3`, `is_degree_4`), and traffic-signal flags are all
+#    (`is_t_junction`, `is_4way`), and traffic-signal flags are all
 #    per-node by nature, but the edge-weight formula in downstream
 #    notebooks needs them at the edge level. We propagate as the mean of
 #    the two endpoint values per edge — so values land in `{0, 0.5, 1}`
 #    for binary flags and a continuous mean for density.
 #
-# `is_degree_3` / `is_degree_4` / `is_traffic_signal` are already on the
+# `is_t_junction` / `is_4way` / `is_traffic_signal` are already on the
 # nodes from consolidation (`network_processing.consolidate_intersections`
 # in notebook 1). We just need to push them to edges here.
 #
@@ -38,7 +38,7 @@
 # place with new attributes:
 #
 # - **Per node**: `density_norm`
-# - **Per edge**: `density_norm`, `is_degree_3`, `is_degree_4`,
+# - **Per edge**: `density_norm`, `is_t_junction`, `is_4way`,
 #   `is_traffic_signal` (all endpoint-mean of the per-node values)
 
 # %%
@@ -118,7 +118,7 @@ def add_density_and_propagate(graph: nx.MultiDiGraph, label: str) -> None:
     # is a continuous value; the others are binary {0, 1} on nodes and
     # become {0, 0.5, 1} on edges.
     NODE_FEATURES = (
-        'density_norm', 'is_degree_3', 'is_degree_4', 'is_traffic_signal',
+        'density_norm', 'is_t_junction', 'is_4way', 'is_traffic_signal',
     )
     for u, v, k, data in graph.edges(keys=True, data=True):
         u_attr, v_attr = graph.nodes[u], graph.nodes[v]
@@ -139,5 +139,5 @@ add_density_and_propagate(car_graph, 'car')
 ox.save_graphml(walk_graph, PREPARED_DIR / 'walk_graph.graphml')
 ox.save_graphml(bike_graph, PREPARED_DIR / 'bike_graph.graphml')
 ox.save_graphml(car_graph, PREPARED_DIR / 'car_graph.graphml')
-print("\nGraphs updated with per-edge `density_norm`, `is_degree_3`, "
-      "`is_degree_4`, `is_traffic_signal`.")
+print("\nGraphs updated with per-edge `density_norm`, `is_t_junction`, "
+      "`is_4way`, `is_traffic_signal`.")

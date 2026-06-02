@@ -296,6 +296,29 @@ print(f"Zones: {len(zones):,} (avg {len(cells)/len(zones):.1f} cells each).")
 # disconnected island (walk/bike) or a one-way trap segment (car) would
 # silently produce zero-accessibility outliers at routing time.
 #
+# **Two-pass snap (priority + eligible fallback).** `prepare_network` also
+# computes a *priority* subset of eligible nodes: well-connected
+# intersections that make better snap targets than dead-end residential
+# cul-de-sacs or one-way passthrough segments. The snap runs in two
+# passes — priority first within a tight radius, eligible fallback for
+# anything that doesn't find a priority node in range. This prevents
+# cells from anchoring trips at structurally inconvenient nodes
+# (cul-de-sac terminus, low-class minor street) when a real intersection
+# is just a short distance away. Per-mode priority criteria (see
+# `network_processing.MODE_PRIORITY_DEFAULTS`):
+#
+# - **walk + bike**: 4-way intersections (well-connected, road class
+#   doesn't matter for non-motorised modes).
+# - **car**: anchor T-junctions + 4-way intersections (touches at least
+#   one tertiary+ road, but isn't a pure motorway/trunk interchange).
+#
+# Priority radii: cells use a small radius (100 m) — cells are small
+# enough that a real intersection within 100 m is "close enough", and
+# we accept the cul-de-sac snap otherwise. Zones use a larger radius
+# (500 m) — zone-representative nodes especially benefit from picking
+# real intersections rather than arbitrary minor-road nodes within the
+# zone's extent.
+#
 # Snap distances are reused downstream as the cell-to-network-node
 # first-mile / last-mile component of trip overheads.
 
@@ -309,7 +332,10 @@ car_graph  = network_processing.load_consolidated_graphml(
 
 # Mode-aware preparation: undirected + largest-CC for walk + bike,
 # directed + largest-SCC for car. The returned PreparedGraph objects
-# carry the snap-eligible node set used below.
+# carry both the snap-eligible node set (largest CC/SCC of the
+# cost-masked subgraph) and the snap-priority node set (well-connected
+# intersections, per `MODE_PRIORITY_DEFAULTS`) used in the two-pass snap
+# below.
 walk_prepared = network_processing.prepare_network(walk_graph, 'walk')
 bike_prepared = network_processing.prepare_network(bike_graph, 'bike')
 car_prepared  = network_processing.prepare_network(car_graph,  'car')
@@ -318,31 +344,45 @@ for label, prepared in [('walk', walk_prepared),
                         ('car',  car_prepared)]:
     n_total = prepared.graph.number_of_nodes()
     n_elig = len(prepared.snap_eligible_nodes)
+    n_pri = len(prepared.snap_priority_nodes)
     print(f"  {label:4s} snap-eligible: {n_elig:>7,} / {n_total:>7,} nodes "
-          f"({100 * n_elig / n_total:.1f}%)")
+          f"({100 * n_elig / n_total:.1f}%);  priority: {n_pri:>6,} "
+          f"({100 * n_pri / n_total:.1f}%)")
 
 
-def snap_layer_to_all_networks(layer: gpd.GeoDataFrame) -> None:
+# Per-layer priority radii for the two-pass snap. Cells get a tight radius (most
+# cells either have a real intersection nearby or accept the cul-de-sac / minor
+# road snap); zones get a wider radius (zone-rep nodes benefit from picking a
+# real intersection with at least one medium / main tier road connected to it
+# within the zone footprint). Radii are similar to / slightly larger than
+# respective hexagon edge lengths.
+PRIORITY_RADIUS_M = {'cells': 75.0, 'zones': 750.0}
+
+
+def snap_layer_to_all_networks(layer: gpd.GeoDataFrame, layer_name: str) -> None:
     """Mutate `layer` to add node-id + snap-distance columns for each network.
 
-    Snap targets are restricted to each PreparedGraph's `snap_eligible_nodes`,
-    so cells can't land on disconnected islands (walk/bike) or trap nodes (car).
+    Two-pass snap: priority targets (well-connected intersections) within
+    `PRIORITY_RADIUS_M[layer_name]`, eligible fallback otherwise.
     """
     centroids = layer.copy()
     centroids['geometry'] = centroids.geometry.centroid
+    priority_radius = PRIORITY_RADIUS_M[layer_name]
     for label, prepared in [('walk', walk_prepared),
                             ('bike', bike_prepared),
                             ('car',  car_prepared)]:
         nid, dist = network_processing.snap_to_network_nodes(
             centroids, prepared.graph,
             eligible_node_ids=prepared.snap_eligible_nodes,
+            priority_node_ids=prepared.snap_priority_nodes,
+            priority_max_distance=priority_radius,
         )
         layer[f'node_id_{label}'] = nid
         layer[f'snap_dist_{label}'] = dist
 
 
 for layer, name in [(cells, 'cells'), (zones, 'zones')]:
-    snap_layer_to_all_networks(layer)
+    snap_layer_to_all_networks(layer, name)
     print(f"  Snapped {name}: "
           f"walk {layer['node_id_walk'].notna().sum():>6,} "
           f"(median dist {layer['snap_dist_walk'].median():.0f} m), "

@@ -17,11 +17,18 @@ from aperta.network_processing import (
     aggregate_edges_to_nodes,
     assign_to_eligible_centroid,
     consolidate_intersections,
-    flag_node_intersections,
+    flag_node_intersection_topology,
+    flag_node_osm_classification,
     lanes_per_direction,
     prepare_network,
     snap_to_network_nodes,
 )
+
+
+def _flag_all(g):
+    """Test helper: topology + OSM classification in one call."""
+    flag_node_intersection_topology(g)
+    flag_node_osm_classification(g)
 
 
 class SnapToNetworkNodesTestCase(unittest.TestCase):
@@ -199,6 +206,143 @@ class SnapToNetworkNodesTestCase(unittest.TestCase):
         points = self._points([(0.5, 0.5)], ["p"])
         with self.assertRaisesRegex(ValueError, "every node"):
             snap_to_network_nodes(points, graph, eligible_node_flag="is_snap_eligible")
+
+    # --- two-pass snapping (priority + eligible fallback) ---
+
+    def _priority_graph(self) -> nx.Graph:
+        """Four nodes:
+        'a' at (0, 0)   — priority + eligible
+        'b' at (10, 0)  — priority + eligible
+        'c' at (50, 0)  — eligible only (not priority)
+        'd' at (100, 0) — eligible only (not priority)
+        """
+        g = nx.Graph()
+        coords = {"a": (0, 0), "b": (10, 0), "c": (50, 0), "d": (100, 0)}
+        for n, (x, y) in coords.items():
+            g.add_node(n, x=float(x), y=float(y))
+        return g
+
+    def test_priority_snap_two_pass_prefers_priority_within_radius(self):
+        """A point near a priority node and an eligible-only node should snap
+        to the priority node, even if the eligible-only node is slightly closer."""
+        graph = self._priority_graph()
+        # Point at (45, 0): geometrically closer to 'c' (5 m) than to 'b' (35 m).
+        # With priority radius 40 m, 'b' is in range → priority pass picks 'b'.
+        points = self._points([(45.0, 0.0)], ["p"])
+        ids, dists = snap_to_network_nodes(
+            points,
+            graph,
+            eligible_node_ids={"a", "b", "c", "d"},
+            priority_node_ids={"a", "b"},
+            priority_max_distance=40.0,
+        )
+        self.assertEqual(ids.loc["p"], "b")
+        self.assertAlmostEqual(dists.loc["p"], 35.0)
+
+    def test_priority_snap_falls_back_to_eligible_when_no_priority_in_range(self):
+        """If no priority node is within `priority_max_distance`, snap to
+        nearest eligible node (within `max_distance`)."""
+        graph = self._priority_graph()
+        # Point at (60, 0): nearest priority 'b' is 50 m away, beyond radius 30 m.
+        # Falls back to eligible — nearest is 'c' (10 m).
+        points = self._points([(60.0, 0.0)], ["p"])
+        ids, dists = snap_to_network_nodes(
+            points,
+            graph,
+            eligible_node_ids={"a", "b", "c", "d"},
+            priority_node_ids={"a", "b"},
+            priority_max_distance=30.0,
+        )
+        self.assertEqual(ids.loc["p"], "c")
+        self.assertAlmostEqual(dists.loc["p"], 10.0)
+
+    def test_priority_snap_mixed_first_pass_and_fallback(self):
+        """Some points get priority snap, others fall back to eligible."""
+        graph = self._priority_graph()
+        # p1 at (5, 0): closest priority 'a' is 5 m — within priority radius.
+        # p2 at (60, 0): closest priority 'b' is 50 m — beyond priority radius,
+        #                fall back to eligible nearest 'c' (10 m).
+        points = self._points([(5.0, 0.0), (60.0, 0.0)], ["p1", "p2"])
+        ids, dists = snap_to_network_nodes(
+            points,
+            graph,
+            eligible_node_ids={"a", "b", "c", "d"},
+            priority_node_ids={"a", "b"},
+            priority_max_distance=20.0,
+        )
+        self.assertEqual(ids.loc["p1"], "a")
+        self.assertEqual(ids.loc["p2"], "c")
+        self.assertAlmostEqual(dists.loc["p1"], 5.0)
+        self.assertAlmostEqual(dists.loc["p2"], 10.0)
+
+    def test_priority_snap_uses_flag_attribute(self):
+        """`priority_node_flag` derives the priority set from a per-node attr."""
+        graph = self._priority_graph()
+        graph.nodes["a"]["is_priority"] = True
+        graph.nodes["b"]["is_priority"] = True
+        graph.nodes["c"]["is_priority"] = False
+        graph.nodes["d"]["is_priority"] = False
+        points = self._points([(45.0, 0.0)], ["p"])
+        ids, _ = snap_to_network_nodes(
+            points,
+            graph,
+            eligible_node_ids={"a", "b", "c", "d"},
+            priority_node_flag="is_priority",
+            priority_max_distance=40.0,
+        )
+        self.assertEqual(ids.loc["p"], "b")
+
+    def test_priority_ids_take_precedence_over_priority_flag(self):
+        """If both `priority_node_ids` and `priority_node_flag` are given,
+        the explicit set wins."""
+        graph = self._priority_graph()
+        # Flag would mark only 'c' as priority:
+        graph.nodes["a"]["is_priority"] = False
+        graph.nodes["b"]["is_priority"] = False
+        graph.nodes["c"]["is_priority"] = True
+        graph.nodes["d"]["is_priority"] = False
+        points = self._points([(45.0, 0.0)], ["p"])
+        # But explicit priority_node_ids restricts to {'b'}.
+        ids, _ = snap_to_network_nodes(
+            points,
+            graph,
+            eligible_node_ids={"a", "b", "c", "d"},
+            priority_node_ids={"b"},
+            priority_node_flag="is_priority",
+            priority_max_distance=40.0,
+        )
+        self.assertEqual(ids.loc["p"], "b")
+
+    def test_priority_empty_set_falls_back_to_eligible_silently(self):
+        """An empty priority set is a valid state (not all graphs have
+        priority targets); every point falls through to the eligible pass."""
+        graph = self._priority_graph()
+        points = self._points([(45.0, 0.0)], ["p"])
+        ids, _ = snap_to_network_nodes(
+            points,
+            graph,
+            eligible_node_ids={"a", "b", "c", "d"},
+            priority_node_ids=set(),
+            priority_max_distance=40.0,
+        )
+        # Snap proceeds via eligible: 'c' at 5 m is nearest.
+        self.assertEqual(ids.loc["p"], "c")
+
+    def test_priority_max_distance_none_means_no_priority_cap(self):
+        """`priority_max_distance=None` lets the priority pass match any
+        distance — every point snaps to a priority node if any exist."""
+        graph = self._priority_graph()
+        # Point at (95, 0): geometrically closer to 'd' (5 m) than to any
+        # priority node. With no priority cap, still snaps to priority 'b'.
+        points = self._points([(95.0, 0.0)], ["p"])
+        ids, _ = snap_to_network_nodes(
+            points,
+            graph,
+            eligible_node_ids={"a", "b", "c", "d"},
+            priority_node_ids={"a", "b"},
+            priority_max_distance=None,
+        )
+        self.assertEqual(ids.loc["p"], "b")
 
 
 class AggregateEdgesToNodesTestCase(unittest.TestCase):
@@ -379,18 +523,19 @@ class AssignToEligibleCentroidTestCase(unittest.TestCase):
 
 
 class FlagNodeIntersectionsTestCase(unittest.TestCase):
-    """`flag_node_intersections` writes mutually-exclusive degree flags
-    (`is_degree_3` / `is_degree_4`) and per-node max / min highway-rank
-    flags. Obstacle flags (traffic signals etc.) live in
-    `consolidate_intersections`, not here.
+    """`flag_node_intersection_topology` + `flag_node_osm_classification`
+    write per-node attributes describing intersection type (`n_streets`,
+    `is_t_junction`, `is_4way`), their rank-conditional variants (`_major`,
+    `_anchor`), and per-node max / min OSM highway-rank. Obstacle flags
+    (traffic signals etc.) live in `consolidate_intersections`, not here.
     """
 
     def _graph(self) -> nx.MultiDiGraph:
         """Mixed-degree fixture:
-            1: 4-way intersection (deg 4) — primary roads
-            2: degree-2 mid-edge — primary (1↔2) + residential (2↔6)
-            3, 4, 5: degree-1 arm tips on residential
-            6: degree-1 leaf on residential
+            1: 4-way intersection (n_streets=4) — primary + residential
+            2: passthrough (n_streets=2) — primary (1↔2) + residential (2↔6)
+            3, 4, 5: leaves (n_streets=1) on residential
+            6: leaf (n_streets=1) on residential
         Highway tags chosen so node 1 sees both primary (rank 5) and
         residential (rank 2) — tests max/min rank.
         """
@@ -408,44 +553,49 @@ class FlagNodeIntersectionsTestCase(unittest.TestCase):
             g.add_edge(v, u, highway=hw)
         return g
 
-    def test_degree_flags_are_mutually_exclusive(self):
-        """is_degree_3 = exactly 3; is_degree_4 = ≥ 4; never both set."""
+    def test_basic_intersection_flags_mutually_exclusive(self):
+        """is_t_junction = exactly 3 distinct neighbours; is_4way = ≥ 4;
+        never both set on the same node. Leaves and passthroughs get neither."""
         g = self._graph()
-        flag_node_intersections(g)
-        # Node 1: degree 4 → only is_degree_4.
-        self.assertEqual(g.nodes[1]["is_degree_3"], 0.0)
-        self.assertEqual(g.nodes[1]["is_degree_4"], 1.0)
-        # Node 2: degree 2 → neither.
-        self.assertEqual(g.nodes[2]["is_degree_3"], 0.0)
-        self.assertEqual(g.nodes[2]["is_degree_4"], 0.0)
-        # Leaf node 6: degree 1 → neither.
-        self.assertEqual(g.nodes[6]["is_degree_3"], 0.0)
-        self.assertEqual(g.nodes[6]["is_degree_4"], 0.0)
+        _flag_all(g)
+        # Node 1: 4 distinct neighbours → only is_4way.
+        self.assertEqual(g.nodes[1]["n_streets"], 4.0)
+        self.assertEqual(g.nodes[1]["is_t_junction"], 0.0)
+        self.assertEqual(g.nodes[1]["is_4way"], 1.0)
+        # Node 2: passthrough → neither.
+        self.assertEqual(g.nodes[2]["n_streets"], 2.0)
+        self.assertEqual(g.nodes[2]["is_t_junction"], 0.0)
+        self.assertEqual(g.nodes[2]["is_4way"], 0.0)
+        # Leaf node 6: 1 neighbour → neither.
+        self.assertEqual(g.nodes[6]["n_streets"], 1.0)
+        self.assertEqual(g.nodes[6]["is_t_junction"], 0.0)
+        self.assertEqual(g.nodes[6]["is_4way"], 0.0)
 
-    def test_degree_3_fires_at_exactly_three(self):
-        """Add one arm to a leaf, drop one from the 4-way → 3-way."""
+    def test_t_junction_fires_at_exactly_three(self):
+        """3-way intersection (T-junction) lights up is_t_junction."""
         g = nx.MultiDiGraph()
         for n, (x, y) in enumerate([(0, 0), (1, 0), (-1, 0), (0, 1)]):
             g.add_node(n, x=float(x), y=float(y))
         for u, v in [(0, 1), (0, 2), (0, 3)]:
             g.add_edge(u, v)
             g.add_edge(v, u)
-        flag_node_intersections(g)
-        self.assertEqual(g.nodes[0]["is_degree_3"], 1.0)
-        self.assertEqual(g.nodes[0]["is_degree_4"], 0.0)
+        _flag_all(g)
+        self.assertEqual(g.nodes[0]["n_streets"], 3.0)
+        self.assertEqual(g.nodes[0]["is_t_junction"], 1.0)
+        self.assertEqual(g.nodes[0]["is_4way"], 0.0)
 
     def test_max_min_highway_rank(self):
-        """max/min from HIGHWAY_RANKS over incident edges."""
+        """max/min from OSM_HIGHWAY_RANKS over incident edges."""
         g = self._graph()
-        flag_node_intersections(g)
-        from aperta.network_processing import HIGHWAY_RANKS
+        _flag_all(g)
+        from aperta.network_processing import OSM_HIGHWAY_RANKS
 
         # Node 1: edges of types {primary, residential} → max=5, min=2.
-        self.assertEqual(g.nodes[1]["max_highway_rank"], float(HIGHWAY_RANKS["primary"]))
-        self.assertEqual(g.nodes[1]["min_highway_rank"], float(HIGHWAY_RANKS["residential"]))
+        self.assertEqual(g.nodes[1]["max_highway_rank"], float(OSM_HIGHWAY_RANKS["primary"]))
+        self.assertEqual(g.nodes[1]["min_highway_rank"], float(OSM_HIGHWAY_RANKS["residential"]))
         # Node 6: only residential edges → max=min=2.
-        self.assertEqual(g.nodes[6]["max_highway_rank"], float(HIGHWAY_RANKS["residential"]))
-        self.assertEqual(g.nodes[6]["min_highway_rank"], float(HIGHWAY_RANKS["residential"]))
+        self.assertEqual(g.nodes[6]["max_highway_rank"], float(OSM_HIGHWAY_RANKS["residential"]))
+        self.assertEqual(g.nodes[6]["min_highway_rank"], float(OSM_HIGHWAY_RANKS["residential"]))
 
     def test_undirected_graph_works(self):
         """Undirected graphs use `graph.neighbors`, not predecessors/successors."""
@@ -454,10 +604,97 @@ class FlagNodeIntersectionsTestCase(unittest.TestCase):
         for i, (x, y) in enumerate([(1, 0), (-1, 0), (0, 1)], start=1):
             g.add_node(i, x=float(x), y=float(y))
             g.add_edge(0, i)
-        flag_node_intersections(g)
-        # 3 distinct neighbours of node 0 → is_degree_3 set, is_degree_4 clear.
-        self.assertEqual(g.nodes[0]["is_degree_3"], 1.0)
-        self.assertEqual(g.nodes[0]["is_degree_4"], 0.0)
+        _flag_all(g)
+        # 3 distinct neighbours of node 0 → is_t_junction set, is_4way clear.
+        self.assertEqual(g.nodes[0]["n_streets"], 3.0)
+        self.assertEqual(g.nodes[0]["is_t_junction"], 1.0)
+        self.assertEqual(g.nodes[0]["is_4way"], 0.0)
+
+    def test_major_requires_min_rank_ge_3(self):
+        """`_major` variants need every incident edge to be tertiary or better."""
+        # Node A: 3-way T-junction with three primary edges → major qualifies.
+        g_pure_t = nx.MultiDiGraph()
+        for n in ("A", "B", "C", "D"):
+            g_pure_t.add_node(n, x=0.0, y=0.0)
+        for u, v in [("A", "B"), ("A", "C"), ("A", "D")]:
+            g_pure_t.add_edge(u, v, highway="primary")
+            g_pure_t.add_edge(v, u, highway="primary")
+        _flag_all(g_pure_t)
+        self.assertEqual(g_pure_t.nodes["A"]["is_t_junction"], 1.0)
+        self.assertEqual(g_pure_t.nodes["A"]["is_t_junction_major"], 1.0)
+
+        # Node from `_graph` fixture: 4-way with one primary + three
+        # residential → min_rank = 2 (residential) → major fails.
+        g_mixed = self._graph()
+        _flag_all(g_mixed)
+        self.assertEqual(g_mixed.nodes[1]["is_4way"], 1.0)
+        self.assertEqual(g_mixed.nodes[1]["is_4way_major"], 0.0)  # has a residential branch
+
+    def test_anchor_requires_max_rank_ge_3_and_min_rank_le_5(self):
+        """`_anchor` variants need ≥1 tertiary+ edge AND not pure trunk/motorway."""
+        # Mixed residential + primary 4-way: max=5 (primary), min=2 (residential).
+        # 5 >= 3 ✓ and 2 <= 5 ✓ → anchor qualifies.
+        g_mixed = self._graph()
+        _flag_all(g_mixed)
+        self.assertEqual(g_mixed.nodes[1]["is_4way"], 1.0)
+        self.assertEqual(g_mixed.nodes[1]["is_4way_anchor"], 1.0)
+
+        # Pure-residential T-junction: max=2 → fails `max >= 3` → anchor=0.
+        g_pure_res = nx.MultiDiGraph()
+        for n in ("A", "B", "C", "D"):
+            g_pure_res.add_node(n, x=0.0, y=0.0)
+        for u, v in [("A", "B"), ("A", "C"), ("A", "D")]:
+            g_pure_res.add_edge(u, v, highway="residential")
+            g_pure_res.add_edge(v, u, highway="residential")
+        _flag_all(g_pure_res)
+        self.assertEqual(g_pure_res.nodes["A"]["is_t_junction"], 1.0)
+        self.assertEqual(g_pure_res.nodes["A"]["is_t_junction_anchor"], 0.0)
+
+        # Pure-motorway T-junction: max=min=7 → fails `min <= 5` → anchor=0.
+        g_pure_mw = nx.MultiDiGraph()
+        for n in ("A", "B", "C", "D"):
+            g_pure_mw.add_node(n, x=0.0, y=0.0)
+        for u, v in [("A", "B"), ("A", "C"), ("A", "D")]:
+            g_pure_mw.add_edge(u, v, highway="motorway")
+            g_pure_mw.add_edge(v, u, highway="motorway")
+        _flag_all(g_pure_mw)
+        self.assertEqual(g_pure_mw.nodes["A"]["is_t_junction"], 1.0)
+        self.assertEqual(g_pure_mw.nodes["A"]["is_t_junction_anchor"], 0.0)
+
+    def test_major_is_a_subset_of_anchor_when_max_rank_le_5(self):
+        """If every edge is tertiary–primary (rank 3–5), the node is BOTH
+        major (min >= 3) AND anchor (max >= 3, min <= 5)."""
+        g = nx.MultiDiGraph()
+        for n in ("A", "B", "C", "D", "E"):
+            g.add_node(n, x=0.0, y=0.0)
+        for u, v in [("A", "B"), ("A", "C"), ("A", "D"), ("A", "E")]:
+            g.add_edge(u, v, highway="tertiary")
+            g.add_edge(v, u, highway="tertiary")
+        _flag_all(g)
+        self.assertEqual(g.nodes["A"]["is_4way"], 1.0)
+        self.assertEqual(g.nodes["A"]["is_4way_major"], 1.0)
+        self.assertEqual(g.nodes["A"]["is_4way_anchor"], 1.0)
+
+    def test_passthrough_node_gets_no_intersection_flags(self):
+        """Passthrough (n_streets=2) is neither T-junction nor 4-way, regardless of rank."""
+        g = nx.MultiDiGraph()
+        for n in ("A", "B", "C"):
+            g.add_node(n, x=0.0, y=0.0)
+        for u, v in [("A", "B"), ("B", "C")]:
+            g.add_edge(u, v, highway="primary")
+            g.add_edge(v, u, highway="primary")
+        _flag_all(g)
+        self.assertEqual(g.nodes["B"]["n_streets"], 2.0)
+        # All intersection flags off:
+        for flag in (
+            "is_t_junction",
+            "is_4way",
+            "is_t_junction_major",
+            "is_4way_major",
+            "is_t_junction_anchor",
+            "is_4way_anchor",
+        ):
+            self.assertEqual(g.nodes["B"][flag], 0.0, f"{flag} should be 0 for passthrough")
 
 
 class ConsolidateIntersectionsTestCase(unittest.TestCase):
@@ -501,7 +738,7 @@ class ConsolidateIntersectionsTestCase(unittest.TestCase):
         # Find the consolidated central intersection (degree ≥ 4 near 1000,1000).
         central = None
         for nid, d in consolidated.nodes(data=True):
-            if abs(d["x"] - 1000) < 30 and abs(d["y"] - 1000) < 30 and d.get("is_degree_4") == 1.0:
+            if abs(d["x"] - 1000) < 30 and abs(d["y"] - 1000) < 30 and d.get("is_4way") == 1.0:
                 central = nid
                 break
         self.assertIsNotNone(central, "no consolidated 4-way intersection found")
@@ -980,6 +1217,120 @@ class PrepareNetworkTestCase(unittest.TestCase):
         self.assertTrue(g.nodes["B"]["is_snap_eligible_walk"])
         self.assertTrue(g.nodes["C"]["is_snap_eligible_walk"])
         self.assertFalse(g.nodes["D"]["is_snap_eligible_walk"])
+
+    # --- priority-node classification ---
+
+    def _intersection_graph(self) -> nx.MultiDiGraph:
+        """A graph with three node types that map to distinct priority outcomes:
+
+        - Node H (hub): 4-way intersection, all tertiary edges → all of
+          is_4way / is_4way_major / is_4way_anchor set.
+        - Node M (mixed T): 3-way intersection with one residential + two
+          tertiary edges → is_t_junction set; major fails (min_rank=2);
+          anchor passes (max_rank=3, min_rank=2 ≤ 5).
+        - Node E (leaf): dead-end on residential → no intersection flags.
+
+        Built so all four nodes are in a single (undirected) connected
+        component for the cost-mask-aware eligibility step.
+        """
+        g = nx.MultiDiGraph()
+        for n in ("H", "M", "E", "N1", "N2", "N3"):
+            g.add_node(n, x=0.0, y=0.0)
+        # H is a 4-way on tertiary roads
+        for nbr in ("N1", "N2", "N3", "M"):
+            g.add_edge("H", nbr, highway="tertiary")
+            g.add_edge(nbr, "H", highway="tertiary")
+        # M is a T-junction: tertiary to H, tertiary to N1, residential to E
+        g.add_edge("M", "N1", highway="tertiary")
+        g.add_edge("N1", "M", highway="tertiary")
+        g.add_edge("M", "E", highway="residential")
+        g.add_edge("E", "M", highway="residential")
+        # Write topology + OSM-classification node attributes.
+        _flag_all(g)
+        return g
+
+    def test_car_priority_default_picks_anchor_intersections(self):
+        """Car default predicate (is_t_junction_anchor OR is_4way_anchor)
+        marks H (4-way anchor) and M (T-junction anchor) but not E (leaf)."""
+        prepared = prepare_network(self._intersection_graph(), "car")
+        # H: 4-way intersection with all tertiary edges → anchor.
+        self.assertIn("H", prepared.snap_priority_nodes)
+        # M: T-junction with mixed residential/tertiary → anchor.
+        self.assertIn("M", prepared.snap_priority_nodes)
+        # E: leaf node (n_streets=1) → no intersection flags → not priority.
+        self.assertNotIn("E", prepared.snap_priority_nodes)
+
+    def test_walk_bike_priority_default_picks_only_4way(self):
+        """Walk + bike default predicate (is_4way) marks only nodes with
+        n_streets >= 4 — H qualifies, M (T-junction) does not."""
+        for mode in ("walk", "bike"):
+            with self.subTest(mode=mode):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    prepared = prepare_network(self._intersection_graph(), mode)
+                self.assertIn("H", prepared.snap_priority_nodes)
+                self.assertNotIn("M", prepared.snap_priority_nodes)
+                self.assertNotIn("E", prepared.snap_priority_nodes)
+
+    def test_priority_nodes_decoration_written_to_graph(self):
+        """Per-node `is_snap_priority_<mode>` graph attribute reflects the
+        priority set — survives `.graphml` roundtripping."""
+        prepared = prepare_network(self._intersection_graph(), "car")
+        g = prepared.graph
+        flag = prepared.snap_priority_flag
+        self.assertEqual(flag, "is_snap_priority_car")
+        self.assertTrue(g.nodes["H"][flag])
+        self.assertTrue(g.nodes["M"][flag])
+        self.assertFalse(g.nodes["E"][flag])
+
+    def test_priority_filter_override_replaces_mode_default(self):
+        """Explicit `priority_node_filter` overrides the mode default."""
+
+        def only_4way_anchors(data: dict) -> bool:
+            return bool(data.get("is_4way_anchor", 0))
+
+        prepared = prepare_network(
+            self._intersection_graph(),
+            "car",
+            priority_node_filter=only_4way_anchors,
+        )
+        # H (4-way anchor) qualifies, M (T-junction anchor) does not.
+        self.assertIn("H", prepared.snap_priority_nodes)
+        self.assertNotIn("M", prepared.snap_priority_nodes)
+
+    def test_unknown_mode_without_base_mode_gets_empty_priority(self):
+        """No predicate available → empty priority set, no raise."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            prepared = prepare_network(
+                self._intersection_graph(),
+                "snowmobile",
+                directedness="directed_scc",
+                network_type="all",
+                cost_excluded_tags=set(),
+            )
+        self.assertEqual(prepared.snap_priority_nodes, frozenset())
+        # Per-node flag still written (all False).
+        for n in prepared.graph.nodes:
+            self.assertFalse(prepared.graph.nodes[n]["is_snap_priority_snowmobile"])
+
+    def test_priority_is_subset_of_eligible(self):
+        """Every priority node must also be in `snap_eligible_nodes` —
+        priority is a refinement of eligibility, not orthogonal to it."""
+        prepared = prepare_network(self._intersection_graph(), "car")
+        self.assertTrue(prepared.snap_priority_nodes.issubset(prepared.snap_eligible_nodes))
+
+    def test_custom_snap_priority_flag_name(self):
+        """Explicit `snap_priority_flag` overrides the default name."""
+        prepared = prepare_network(
+            self._intersection_graph(),
+            "car",
+            snap_priority_flag="my_priority",
+        )
+        self.assertEqual(prepared.snap_priority_flag, "my_priority")
+        g = prepared.graph
+        self.assertIn("my_priority", g.nodes["H"])
+        self.assertNotIn("is_snap_priority_car", g.nodes["H"])
 
     # --- end-to-end integration ---
 

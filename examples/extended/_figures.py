@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 
 from aperta import visualization as viz
-from aperta.network_processing import HIGHWAY_RANKS
+from aperta.network_processing import OSM_HIGHWAY_RANKS
 
 
 # Harmonised font sizes for paper-figure output. Imported by every
@@ -134,7 +134,7 @@ def plot_network_map(
 
     Wraps `aperta.visualization.plot_edge_values` with the Swiss
     aesthetic: per-tier line widths from `HWY_WIDTH`, sorted by
-    `HIGHWAY_RANKS` ascending (motorway/trunk land on top of the
+    `OSM_HIGHWAY_RANKS` ascending (motorway/trunk land on top of the
     residential mesh — without that, thin gray edges visually mask
     the busiest roads at junctions), height-matched colour bar, square
     aspect, hidden ticks, optional bbox crop.
@@ -172,7 +172,7 @@ def plot_network_map(
     viz.plot_edge_values(
         graph, values, ax=ax, cmap=cmap, vmin=vmin, vmax=vmax,
         edge_widths=edge_widths,
-        sort_key=lambda key, d: HIGHWAY_RANKS.get(edge_highway(d), -1),
+        sort_key=lambda key, d: OSM_HIGHWAY_RANKS.get(edge_highway(d), -1),
     )
     if not basemap:
         ax.set_facecolor('white')

@@ -411,23 +411,25 @@ def _aggregate_cell_to_zone(
             f"(e.g., `cells['zone_id']`) to auto-derive the zone-tier overhead, "
             f"or supply `{side}_zone` explicitly."
         )
-    if isinstance(cell_overhead, dict):
-        cell_overhead = pd.Series(cell_overhead)
-    if isinstance(cell_to_zone, dict):
-        cell_to_zone = pd.Series(cell_to_zone)
+    cell_overhead_s: pd.Series = (
+        pd.Series(cell_overhead) if isinstance(cell_overhead, dict) else cell_overhead
+    )
+    cell_to_zone_s: pd.Series = (
+        pd.Series(cell_to_zone) if isinstance(cell_to_zone, dict) else cell_to_zone
+    )
 
     # Align cell_to_zone to the cells in cell_overhead.
-    aligned = cell_to_zone.reindex(cell_overhead.index)
+    aligned = cell_to_zone_s.reindex(cell_overhead_s.index)
     missing_cells = aligned.isna()
     if missing_cells.any():
         n = int(missing_cells.sum())
-        sample = list(cell_overhead.index[missing_cells][:5])
+        sample = list(cell_overhead_s.index[missing_cells][:5])
         raise ValueError(
             f"{n} cells in `{side}_cell` overhead have no zone assignment in "
             f"`cell_to_zone` (first {len(sample)}: {sample})."
         )
 
-    grouped = cell_overhead.groupby(aligned).agg(aggregator)
+    grouped = cell_overhead_s.groupby(aligned).agg(aggregator)
 
     missing_zones = referenced_zones - set(grouped.index)
     if missing_zones:

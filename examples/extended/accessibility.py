@@ -30,7 +30,7 @@
 #
 # - 3 consolidated networks (`walk_graph`, `bike_graph`, `car_graph`)
 #   carrying per-edge features from prep: `speed_kph`,
-#   `density_norm`, `elev_gain`, `elev_loss`, `is_degree_4`,
+#   `density_norm`, `elev_gain`, `elev_loss`, `is_4way`,
 #   `is_traffic_signal`. Edge travel times are computed inline in
 #   section 2 below by applying published coefficients to these
 #   features.
@@ -169,15 +169,27 @@ OVERHEAD_COEF = {
 # public reference.
 
 UTILITY_COEF = {
-    "walk": {"asc": 0.0, "time": -0.30, "time_log": -0.0, "density": 0.0, "bike_score": 0.0},
+    "walk": {
+        "asc": 0.0,
+        "time": -0.30,
+        "time_log": -0.0,
+        "density": 0.0,
+        "bike_score": 0.0
+    },
     "bike_regular": {
-        "asc": -4.0,
-        "time": -0.20,
+        "asc": 0.0,
+        "time": -0.30,
         "time_log": -0.0,
         "density": -0.0,
         "bike_score": 0.0,
     },
-    "car_peak": {"asc": -6.0, "time": -0.10, "time_log": -0.0, "density": -0.0, "bike_score": 0.0},
+    "car_peak": {
+        "asc": 0.0,
+        "time": -0.30,
+        "time_log": -0.0,
+        "density": -0.0,
+        "bike_score": 0.0
+    },
 }
 
 # === Accessibility metrics ==================================================
@@ -204,7 +216,12 @@ DEST_NEST_SCALE = {
 # the example origin, then renders the K nearest grocery routes from
 # it on top of the per-cell aggregation map.
 EXAMPLE_ORIGIN_XY = (2_600_800, 1_199_800)  # in old town
-EXAMPLE_K_ROUTES = 25
+EXAMPLE_K_ROUTES = 30
+# §11 aggregation: route to the nearest K grocery stores from each origin
+# cell, then take the mean feature along those routes. "Stores", not
+# "cells" — destination cells with multiple groceries count proportionally
+# (and may be partially counted to hit exactly K).
+NEAREST_K_GROCERIES = 10
 # ============================================================================
 
 
@@ -225,8 +242,8 @@ FEATURE_COLS = (
     "density_norm",
     "elev_gain",
     "elev_loss",
-    "is_degree_3",
-    "is_degree_4",
+    "is_t_junction",
+    "is_4way",
     "is_traffic_signal",
 )
 for g in (walk_graph, bike_graph, car_graph):
@@ -309,7 +326,7 @@ print(f"{CITY_NAME}: polygon area {CITY_POLYGON.area / 1e6:.1f} km²; {len(pois)
 # duration_s    = L / (effective_kph / 3.6)
 #               + α_up   · elev_gain                     (m climbed u→v)
 #               + α_down · elev_loss                     (m descended u→v)
-#               + β_intersection_4 · is_degree_4         (∈ {0, 0.5, 1})
+#               + β_intersection_4 · is_4way             (∈ {0, 0.5, 1})
 #               + β_traffic_signal · is_traffic_signal   (∈ {0, 0.5, 1})
 # ```
 #
@@ -360,7 +377,7 @@ def apply_edge_times(
         base_dur = data["length"] / (effective_kph / 3.6)
         slope_pen = alpha_up * data["elev_gain"] + alpha_down * data["elev_loss"]
         intersection_pen = (
-            beta_intersection_4 * data["is_degree_4"]
+            beta_intersection_4 * data["is_4way"]
             + beta_traffic_signal * data["is_traffic_signal"]
         )
         total = base_dur + slope_pen + intersection_pen
@@ -901,7 +918,7 @@ def edge_bike_score(u, v, data) -> float:
         or data.get("bicycle") == "designated"
     ):
         return 5.0
-    rank = network_processing.HIGHWAY_RANKS.get(h, -1)
+    rank = network_processing.OSM_HIGHWAY_RANKS.get(h, -1)
     if rank < 0:
         return 4.0  # service / track / unclassified — mid-good default
     # Higher OSM rank = busier road = worse.
@@ -1032,16 +1049,27 @@ def assemble_utility_from_total_time(
 # - **`density_norm`** — per-edge urban density. Tells you whether the
 #   typical bike trip goes through dense centres or quieter periphery.
 #
-# Per-origin aggregator: destination-weighted mean (weight = number of
-# groceries at each destination cell), so origins with one nearby
-# grocery + 50 far ones aren't dragged towards the far ones' route
-# characteristics. Restricted to the `cells_to_cells` tier — closer,
-# higher-resolution trips are the ones grocery-trip viewers actually
-# care about.
+# Per-origin aggregator: **nearest-K stores by bike travel time**. For each
+# origin, sort destination grocery cells by routed cost ascending, walk
+# through accumulating store counts (the per-cell `poi_errands_groceries`
+# count), stop when K stores are covered, and take the cost-weighted-quota
+# mean of the per-pair feature across exactly those K stores. "Stores",
+# not "cells" — a destination cell with multiple groceries contributes
+# proportionally, and the last counted cell may be partially weighted to
+# hit exactly K. Restricted to the `cells_to_cells` tier.
+#
+# This replaces an earlier "weighted mean over ALL destinations in the c2c
+# tier" aggregator. The earlier version produced visibly H3-zone-shaped
+# outputs for spatially smooth features (e.g. density_norm), because all
+# cells in one H3 zone shared the entire c2c destination set (the tier is
+# built per-zone-pair for clean mutual exclusion) and a smooth feature's
+# path-mean over that shared set varies only minimally cell-by-cell.
+# Nearest-K dissolves that artefact: each origin picks its own K nearest
+# stores, so destination sets differ cell-by-cell.
 
 # %%
 bike_pairs = PAIRS["bike"]
-_, feat_aggs = routing.tiered_path_aggregate(
+costs_odm, feat_aggs = routing.tiered_path_aggregate(
     bike_pairs,
     bike_graph,
     weight="bike_time_s",
@@ -1054,42 +1082,85 @@ _, feat_aggs = routing.tiered_path_aggregate(
 )
 
 
-def dest_weighted_mean_cells_tier(feat_odm, pairs, cells_df, value_column, node_column):
-    """Per-origin destination-weighted mean of a per-pair feature, using
-    the cells_to_cells tier only.
+def dest_nearest_k_mean_cells_tier(
+    feat_odm, costs_odm, pairs, cells_df, value_column, node_column, k: int,
+):
+    """Per-origin mean of a per-pair feature over the K nearest destinations
+    (by routed cost), where "destination unit" is the per-cell count in
+    `value_column` (typically a POI count). Restricted to the
+    `cells_to_cells` tier.
 
-    `value_column`: cells column whose value weights each destination
-    (e.g. POI counts). Multiple cells per snap-node are summed.
-    Returns a Series keyed by snap-node ID."""
+    For each origin:
+      1. Look up destinations + per-pair feature + per-pair cost from c2c.
+      2. Filter to destinations with `value_column > 0` (cells holding POIs)
+         and finite cost / feature.
+      3. Sort ascending by cost.
+      4. Walk through, accumulating per-cell counts; stop at K. The last
+         counted cell may be partially weighted so the total counts to
+         exactly K.
+      5. Take the weighted mean of the per-pair feature over those K.
+
+    If fewer than K POIs are reachable from an origin, use what's available
+    (no error). Returns a Series keyed by origin snap-node ID."""
     node_to_val = cells_df.groupby(node_column)[value_column].sum().to_dict()
     out = {}
+    short_count = 0
     for origin, dest_nodes in pairs.cells_to_cells.items():
         f = feat_odm.cells_to_cells[origin]
+        c = costs_odm.cells_to_cells[origin]
         w = np.fromiter(
             (node_to_val.get(d, 0.0) for d in dest_nodes), dtype=float, count=len(dest_nodes)
         )
-        valid = np.isfinite(f) & (w > 0)
-        if valid.any():
-            out[origin] = float((f[valid] * w[valid]).sum() / w[valid].sum())
-    return pd.Series(out, name="mean_along_routes")
+        valid = np.isfinite(c) & np.isfinite(f) & (w > 0)
+        if not valid.any():
+            continue
+        valid_idx = np.where(valid)[0]
+        order = valid_idx[np.argsort(c[valid_idx])]
+
+        used = 0.0
+        sum_f = 0.0
+        sum_w = 0.0
+        for i in order:
+            w_i = w[i]
+            remaining = k - used
+            w_take = w_i if w_i <= remaining else remaining
+            sum_f += f[i] * w_take
+            sum_w += w_take
+            used += w_take
+            if used >= k:
+                break
+        if sum_w > 0:
+            out[origin] = sum_f / sum_w
+            if used < k:
+                short_count += 1
+    if short_count:
+        print(
+            f"  note: {short_count:,} origin(s) had fewer than k={k} reachable "
+            f"{value_column!s} units; using whatever was available."
+        )
+    return pd.Series(out, name=f"mean_along_nearest_{k}_routes")
 
 
-bike_score_by_node = dest_weighted_mean_cells_tier(
-    feat_aggs["bike_score"], bike_pairs, cells, "poi_errands_groceries", "node_id_bike"
+bike_score_by_node = dest_nearest_k_mean_cells_tier(
+    feat_aggs["bike_score"], costs_odm, bike_pairs, cells,
+    "poi_errands_groceries", "node_id_bike", k=NEAREST_K_GROCERIES,
 )
-density_by_node = dest_weighted_mean_cells_tier(
-    feat_aggs["density_norm"], bike_pairs, cells, "poi_errands_groceries", "node_id_bike"
+density_by_node = dest_nearest_k_mean_cells_tier(
+    feat_aggs["density_norm"], costs_odm, bike_pairs, cells,
+    "poi_errands_groceries", "node_id_bike", k=NEAREST_K_GROCERIES,
 )
 # Snap-node → cell: multiple cells per node all inherit the same scalar.
 bike_score_per_cell = cells["node_id_bike"].map(bike_score_by_node.to_dict())
 density_per_cell = cells["node_id_bike"].map(density_by_node.to_dict())
 print(
-    f"bike_score (1–5) along routes: median {bike_score_per_cell.median():.2f}, "
+    f"bike_score (1–5) along routes to nearest {NEAREST_K_GROCERIES} groceries: "
+    f"median {bike_score_per_cell.median():.2f}, "
     f"P5–P95 [{bike_score_per_cell.quantile(0.05):.2f}, "
     f"{bike_score_per_cell.quantile(0.95):.2f}]"
 )
 print(
-    f"density_norm   along routes: median {density_per_cell.median():.2f}, "
+    f"density_norm    along routes to nearest {NEAREST_K_GROCERIES} groceries: "
+    f"median {density_per_cell.median():.2f}, "
     f"P5–P95 [{density_per_cell.quantile(0.05):.2f}, "
     f"{density_per_cell.quantile(0.95):.2f}]"
 )
@@ -1179,7 +1250,7 @@ figures.plot_city_focus(
     vmax=5,
     crop_center_xy=CITY_CROP_CENTER_XY,
     crop_half_m=CITY_CROP_HALF_M,
-    title="Mean bike-score along bike routes to nearby groceries",
+    title=f"Mean bike-score along bike routes to nearest {NEAREST_K_GROCERIES} groceries",
     label="1 (busy primary) → 5 (cycleway)",
 )
 figures.plot_city_focus(
@@ -1190,7 +1261,7 @@ figures.plot_city_focus(
     cmap="plasma",
     crop_center_xy=CITY_CROP_CENTER_XY,
     crop_half_m=CITY_CROP_HALF_M,
-    title="Mean density along bike routes to nearby groceries",
+    title=f"Mean density along bike routes to nearest {NEAREST_K_GROCERIES} groceries",
     label="Density (square root, normalized, 1 = 10,000/km²)",
 )
 plt.subplots_adjust(wspace=0.10)

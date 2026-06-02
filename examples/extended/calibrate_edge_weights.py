@@ -117,7 +117,7 @@ print(f"Ground-truth legs: {len(legs):,} "
 # graph from the prep notebooks:
 #
 # - `speed_kph` per edge (from `prepare/1_download`)
-# - `density_norm`, `is_degree_4`, `is_traffic_signal` per edge (from
+# - `density_norm`, `is_4way`, `is_traffic_signal` per edge (from
 #   `prepare/5_density`)
 #
 # These attrs are cast back to floats on graphml load via
@@ -157,8 +157,8 @@ result = calibration.calibrate_edge_weights(
         'density_norm':      0.2,    # Higher density = lower speeds
     },
     additive_route_features={
-        # is_degree_3 dropped — multicollinear with density.
-        'is_degree_4':       2.6,    # secs per 4-way intersection
+        # is_t_junction dropped — multicollinear with density.
+        'is_4way':           2.6,    # secs per 4-way intersection
         'is_traffic_signal': 4.4,    # secs per signalised intersection
     },
     additive_endpoint_features={

@@ -40,11 +40,11 @@ import pandas as pd
 
 from aperta.errors import DataError
 
-# OSM highway-type ranking used by `collapse_highway_lists_by_rank` and
-# `flag_node_intersections` (for max/min per-node highway rank). Higher
+# OSM highway-type ranking used by `collapse_osm_highway_lists_by_rank` and
+# `flag_node_osm_classification` (for max/min per-node highway rank). Higher
 # value = more major road. Anything not listed (or `None`) is treated
 # as rank -1 ("not a real motor-vehicle road").
-HIGHWAY_RANKS: dict[str, int] = {
+OSM_HIGHWAY_RANKS: dict[str, int] = {
     "motorway": 7,
     "motorway_link": 7,
     "trunk": 6,
@@ -72,18 +72,18 @@ HIGHWAY_RANKS: dict[str, int] = {
 }
 
 
-def _highway_rank(value) -> int:
+def _osm_highway_rank(value) -> int:
     """Rank lookup tolerant of strings, lists (OSMnx-merged), and None."""
     if value is None:
         return -1
     if isinstance(value, list):
-        return max((HIGHWAY_RANKS.get(v, -1) for v in value), default=-1)
-    return HIGHWAY_RANKS.get(value, -1)
+        return max((OSM_HIGHWAY_RANKS.get(v, -1) for v in value), default=-1)
+    return OSM_HIGHWAY_RANKS.get(value, -1)
 
 
-def collapse_highway_lists_by_rank(graph: nx.Graph) -> None:
+def collapse_osm_highway_lists_by_rank(graph: nx.Graph) -> None:
     """Mutate `graph` in place: collapse list-valued edge `highway` to a single
-    string (the highest-rank value via `HIGHWAY_RANKS`).
+    string (the highest-rank value via `OSM_HIGHWAY_RANKS`).
 
     After `osmnx.consolidate_intersections`, edges built from multiple source
     edges have `highway` as a *list* of strings. Most downstream code expects
@@ -107,7 +107,7 @@ def collapse_highway_lists_by_rank(graph: nx.Graph) -> None:
         hw = d.get("highway")
         if not isinstance(hw, list):
             continue
-        ranks = [HIGHWAY_RANKS.get(v_, -1) for v_ in hw]
+        ranks = [OSM_HIGHWAY_RANKS.get(v_, -1) for v_ in hw]
         d["highway"] = hw[ranks.index(max(ranks))]
 
 
@@ -324,7 +324,8 @@ def _parse_lanes(raw) -> float | None:
 
 
 def lanes_per_direction(edge_data: dict) -> float:
-    """Per-direction lane count for a directed edge.
+    """Per-direction lane count for a directed edge. OSM-specific: reads the
+    OSM `lanes` and `oneway` tag conventions.
 
     OSM's `lanes` tag is the **total** lane count across both directions on
     two-way roads, and OSMnx inherits the same value on both directional
@@ -382,8 +383,13 @@ def _int_via_float(value) -> int:
 # works as written. Pass to `ox.load_graphml` via the `node_dtypes`
 # kwarg, or use `load_consolidated_graphml` below.
 CONSOLIDATED_NODE_DTYPES: dict[str, Callable] = {
-    "is_degree_3": _int_via_float,
-    "is_degree_4": _int_via_float,
+    "n_streets": _int_via_float,
+    "is_t_junction": _int_via_float,
+    "is_4way": _int_via_float,
+    "is_t_junction_major": _int_via_float,
+    "is_4way_major": _int_via_float,
+    "is_t_junction_anchor": _int_via_float,
+    "is_4way_anchor": _int_via_float,
     "max_highway_rank": _int_via_float,
     "min_highway_rank": _int_via_float,
     # Per-obstacle `is_<name>` flags are dynamic; the default set used by
@@ -401,7 +407,7 @@ CONSOLIDATED_NODE_DTYPES: dict[str, Callable] = {
 #
 # Sources:
 #   - `lanes_per_direction`: written by `consolidate_intersections`.
-#   - `density_norm`, `is_degree_3`, `is_degree_4`, `is_traffic_signal`:
+#   - `density_norm`, `is_t_junction`, `is_4way`, `is_traffic_signal`:
 #     endpoint-mean of the per-node values, written by per-project density
 #     prep steps (see `examples/extended/prepare/5_density.py`). Values
 #     live in {0, 0.5, 1} on edges (mean of {0, 1} node flags), so `float`
@@ -411,8 +417,8 @@ CONSOLIDATED_NODE_DTYPES: dict[str, Callable] = {
 CONSOLIDATED_EDGE_DTYPES: dict[str, Callable] = {
     "lanes_per_direction": float,
     "density_norm": float,
-    "is_degree_3": float,
-    "is_degree_4": float,
+    "is_t_junction": float,
+    "is_4way": float,
     "is_traffic_signal": float,
 }
 
@@ -421,7 +427,10 @@ def load_consolidated_graphml(
     filepath, *, node_dtypes: dict | None = None, edge_dtypes: dict | None = None, **kwargs
 ):
     """Load a graphml saved by `consolidate_intersections`, casting our
-    custom `is_*` / `*_highway_rank` attrs back to float.
+    custom `is_*` / `*_highway_rank` attrs back to float. OSM-specific —
+    expects graphs in the OSMnx node/edge attribute convention; for non-OSM
+    pickle/graphml saves, call `nx.read_graphml` directly and apply your own
+    project-specific dtype casts.
 
     Thin wrapper around `osmnx.load_graphml` that merges in
     `CONSOLIDATED_NODE_DTYPES`. OSMnx only auto-casts attrs in its
@@ -534,16 +543,26 @@ def consolidate_intersections(
     roundabout collapses to a single consolidated node.
 
     The returned graph has the per-node attributes set by
-    `flag_node_intersections` (`is_degree_3`, `is_degree_4`,
-    `max_highway_rank`, `min_highway_rank`), plus one `is_<name>` per
+    `flag_node_intersection_topology` (`n_streets`, `is_t_junction`,
+    `is_4way`) and `flag_node_osm_classification` (`max_highway_rank`,
+    `min_highway_rank`, `is_t_junction_major`, `is_4way_major`,
+    `is_t_junction_anchor`, `is_4way_anchor`), plus one `is_<name>` per
     requested obstacle type, plus `is_roundabout` if
     `detect_roundabouts=True`. Edge `highway` lists from the consolidation
     are collapsed to the highest-rank single string via
-    `collapse_highway_lists_by_rank`. Each edge also gets
+    `collapse_osm_highway_lists_by_rank`. Each edge also gets
     `lanes_per_direction` (the OSM `lanes` tag corrected for two-way
     roads — see `lanes_per_direction()`). **Node IDs are new integer IDs**
     (per OSMnx behaviour) — caller must re-snap geo units to the
     consolidated graph.
+
+    OSM-specific. The wrapper consumes OSMnx graphs, reads the OSM
+    `highway` / `junction` / `traffic_signals` tag conventions, and
+    writes `OSM_HIGHWAY_RANKS`-derived per-node attributes. Projects
+    working with non-OSM road networks (e.g. LUMOS's simplified 3-tier
+    network) should skip consolidation entirely and call
+    `flag_node_intersection_topology` directly for the network-agnostic
+    `is_t_junction` / `is_4way` flags.
 
     **Geometry guarantee**: every consolidated edge carries a `geometry`
     LineString (OSMnx attaches one during the rebuild). This isn't true
@@ -659,9 +678,10 @@ def consolidate_intersections(
         d["lanes_per_direction"] = lanes_per_direction(d)
 
     # 4. Collapse list-valued highway to a single string, then per-node
-    #    intersection + highway-rank flags.
-    collapse_highway_lists_by_rank(consolidated)
-    flag_node_intersections(consolidated)
+    #    intersection topology + OSM highway-rank classification.
+    collapse_osm_highway_lists_by_rank(consolidated)
+    flag_node_intersection_topology(consolidated)
+    flag_node_osm_classification(consolidated)
 
     # 5. Spatial re-attachment: nearest consolidated node within
     #    obstacle_buffer gets the obstacle / roundabout flag.
@@ -690,29 +710,93 @@ def consolidate_intersections(
     return consolidated
 
 
-def flag_node_intersections(graph: nx.Graph) -> None:
-    """Mutate `graph` in place to add per-node intersection + highway-rank flags.
+def flag_node_intersection_topology(graph: nx.Graph) -> None:
+    """Mutate `graph` in place to add per-node **topology-only** intersection
+    flags. Network-agnostic — works on any graph regardless of where it came
+    from (OSM, a custom road dataset, a synthetic graph) since it inspects
+    only neighbour count, not edge tags.
 
-    Four float attributes per node:
+    Per-node attributes written:
 
-    - `is_degree_3`      — 1.0 if degree == 3 (T-intersection / fork), else 0.
-    - `is_degree_4`      — 1.0 if degree >= 4 (cross / multi-way), else 0.
-    - `max_highway_rank` — max `HIGHWAY_RANKS` value over edges incident to
-      this node (`-1.0` for unknown / not-a-real-road, e.g. footways).
-    - `min_highway_rank` — same with min.
+    - `n_streets` — number of distinct neighbour nodes (degree in the
+      undirected sense, ignoring edge direction and parallel edges). The
+      "physical" intersection size: 1 = dead-end, 2 = passthrough,
+      3 = T-junction, 4+ = 4-way intersection or denser.
+    - `is_t_junction` — 1 if `n_streets == 3`, else 0.
+    - `is_4way` — 1 if `n_streets >= 4`, else 0.
 
-    `is_degree_3` and `is_degree_4` are **mutually exclusive** — a degree-4
-    node carries only the latter. (Degree 1 / 2 nodes — leaves and mid-edge
-    nodes — get neither.) This is a deliberate change from a previous
-    `has_intersection` (≥3) / `has_intersection_4` (≥4) cumulative encoding:
-    edge-weight models that penalise 4-way more than 3-way should set the
-    two coefficients independently rather than additively.
+    `is_t_junction` and `is_4way` are **mutually exclusive** — a 4-way
+    node carries only `is_4way`. (Degree 1 / 2 nodes — leaves and
+    passthroughs — get neither.)
 
-    Per-node obstacle flags (`is_traffic_signal`, `is_stop`, etc.) live in
-    `consolidate_intersections`, which captures them from the original
-    graph's OSM tags and re-attaches them spatially after consolidation.
+    OSM-tag-based per-node classifications (highway rank, `_major` /
+    `_anchor` variants) live in the companion function
+    `flag_node_osm_classification`, which must be called AFTER this one
+    if you want the rank-conditional variants (since they're conditional
+    on `is_t_junction` / `is_4way`). A project working with a non-OSM
+    road network (e.g., LUMOS's simplified 3-tier networks) can call
+    this function alone and supply its own project-specific classifier
+    on top.
+
+    Per-node obstacle flags (`is_traffic_signal`, `is_stop`, etc.) live
+    in `consolidate_intersections`, which is also OSM-specific.
     """
     is_directed = graph.is_directed()
+
+    for nid in graph.nodes():
+        if is_directed:
+            neighbours = set(graph.predecessors(nid)) | set(graph.successors(nid))
+        else:
+            neighbours = set(graph.neighbors(nid))
+        n_streets = len(neighbours)
+        graph.nodes[nid]["n_streets"] = n_streets
+        graph.nodes[nid]["is_t_junction"] = int(n_streets == 3)
+        graph.nodes[nid]["is_4way"] = int(n_streets >= 4)
+
+
+def flag_node_osm_classification(graph: nx.Graph) -> None:
+    """Mutate `graph` in place to add **OSM-tag-based** per-node classification
+    attributes derived from the per-edge `highway` tag (OSM convention).
+
+    Reads the per-edge `highway` attribute via `OSM_HIGHWAY_RANKS` and the
+    per-node `is_t_junction` / `is_4way` flags. Call
+    `flag_node_intersection_topology` first so those flags are present.
+
+    Per-node attributes written:
+
+    - `max_highway_rank` — max `OSM_HIGHWAY_RANKS` value over edges
+      incident to this node (`-1` for unknown / not-a-real-road, e.g.
+      footways).
+    - `min_highway_rank` — same with min.
+    - `is_t_junction_major` — `is_t_junction` AND `min_highway_rank >= 3`
+      (every incident edge is tertiary or better — a "fully classified"
+      T-junction with no minor branches).
+    - `is_4way_major` — `is_4way` AND `min_highway_rank >= 3`.
+    - `is_t_junction_anchor` — `is_t_junction` AND `max_highway_rank >= 3`
+      AND `min_highway_rank <= 5` (at least one tertiary-or-better edge,
+      and not exclusively trunk / motorway — a trip-anchor T-junction
+      where car trips can naturally begin or end).
+    - `is_4way_anchor` — `is_4way` AND the same rank condition.
+
+    The two OSM-derived intersection tiers — `_major`, `_anchor` —
+    capture progressively different selection criteria for downstream
+    snap targets and edge-weight features:
+
+    - **`_major`**: intersections where every connecting street is at
+      least tertiary class. Used when only "real road" junctions matter
+      (e.g., generating a coarse zone-snap candidate set).
+    - **`_anchor`**: intersections that touch at least one main road
+      (tertiary or better) and aren't purely highway interchanges. Used
+      as priority snap targets for car routing — trips begin and end at
+      anchor nodes.
+
+    **Non-OSM networks**: this function only fires on graphs whose edges
+    carry the OSM `highway` attribute (or `OSM_HIGHWAY_RANKS`-compatible
+    string values for it). For networks with a different classification
+    scheme (e.g., LUMOS's simplified 3-tier network with `highway` /
+    `autostrasse` / `main_street` tiers), write a project-specific
+    classifier that follows the same per-node-attribute pattern.
+    """
     is_multi = graph.is_multigraph()
 
     # Per-node max / min highway rank from incident edges.
@@ -720,7 +804,7 @@ def flag_node_intersections(graph: nx.Graph) -> None:
     node_min = {n: float("inf") for n in graph.nodes}
     if is_multi:
         for u, v, _, d in graph.edges(keys=True, data=True):
-            rank = _highway_rank(d.get("highway"))
+            rank = _osm_highway_rank(d.get("highway"))
             for endpoint in (u, v):
                 if rank > node_max[endpoint]:
                     node_max[endpoint] = rank
@@ -728,7 +812,7 @@ def flag_node_intersections(graph: nx.Graph) -> None:
                     node_min[endpoint] = rank
     else:
         for u, v, d in graph.edges(data=True):
-            rank = _highway_rank(d.get("highway"))
+            rank = _osm_highway_rank(d.get("highway"))
             for endpoint in (u, v):
                 if rank > node_max[endpoint]:
                     node_max[endpoint] = rank
@@ -736,17 +820,46 @@ def flag_node_intersections(graph: nx.Graph) -> None:
                     node_min[endpoint] = rank
 
     for nid in graph.nodes():
-        if is_directed:
-            neighbours = set(graph.predecessors(nid)) | set(graph.successors(nid))
-        else:
-            neighbours = set(graph.neighbors(nid))
-        degree = len(neighbours)
-        graph.nodes[nid]["is_degree_3"] = int(degree == 3)
-        graph.nodes[nid]["is_degree_4"] = int(degree >= 4)
+        is_t = bool(graph.nodes[nid].get("is_t_junction", 0))
+        is_4 = bool(graph.nodes[nid].get("is_4way", 0))
         mx = node_max[nid]
         mn = node_min[nid]
-        graph.nodes[nid]["max_highway_rank"] = int(mx) if mx != float("-inf") else -1
-        graph.nodes[nid]["min_highway_rank"] = int(mn) if mn != float("inf") else -1
+        max_rank = int(mx) if mx != float("-inf") else -1
+        min_rank = int(mn) if mn != float("inf") else -1
+        is_major = min_rank >= 3
+        is_anchor = (max_rank >= 3) and (min_rank <= 5)
+
+        graph.nodes[nid]["max_highway_rank"] = max_rank
+        graph.nodes[nid]["min_highway_rank"] = min_rank
+        graph.nodes[nid]["is_t_junction_major"] = int(is_t and is_major)
+        graph.nodes[nid]["is_4way_major"] = int(is_4 and is_major)
+        graph.nodes[nid]["is_t_junction_anchor"] = int(is_t and is_anchor)
+        graph.nodes[nid]["is_4way_anchor"] = int(is_4 and is_anchor)
+
+
+def _snap_to_subset(
+    points: gpd.GeoDataFrame,
+    graph: nx.Graph,
+    node_ids: list,
+    *,
+    max_distance: float | None,
+) -> tuple[pd.Series, pd.Series]:
+    """Helper: snap each point to its nearest node in `node_ids`. Returns
+    all-NaN series if `node_ids` is empty (rather than raising)."""
+    from aperta import geo_mapping  # local import to avoid module-load cycle
+
+    if not node_ids:
+        nan_ids = pd.Series([pd.NA] * len(points), index=points.index, dtype=object)
+        nan_dists = pd.Series([float("nan")] * len(points), index=points.index, dtype=float)
+        return nan_ids, nan_dists
+    node_x = [graph.nodes[n]["x"] for n in node_ids]
+    node_y = [graph.nodes[n]["y"] for n in node_ids]
+    nodes_gdf = gpd.GeoDataFrame(
+        geometry=gpd.points_from_xy(node_x, node_y),
+        index=pd.Index(node_ids, name="node_id"),
+        crs=points.crs,
+    )
+    return geo_mapping.map_points_to_points(points, nodes_gdf, max_distance=max_distance)
 
 
 def snap_to_network_nodes(
@@ -756,12 +869,24 @@ def snap_to_network_nodes(
     max_distance: float | None = None,
     eligible_node_ids: set | list | pd.Index | None = None,
     eligible_node_flag: str | None = None,
+    priority_node_ids: set | list | pd.Index | None = None,
+    priority_node_flag: str | None = None,
+    priority_max_distance: float | None = None,
 ) -> tuple[pd.Series, pd.Series]:
     """Snap each row in `points` to its nearest node in `graph`.
 
     For each point, finds the closest network node by Euclidean distance and
     returns both the node ID and the distance. The point CRS and the graph
     coordinates must already agree — this function does no reprojection.
+
+    Two-pass snapping. When either `priority_node_ids` or
+    `priority_node_flag` is given, the function first tries to snap each
+    point to its nearest **priority** node within `priority_max_distance`.
+    Points that don't find a priority node in range fall through to a
+    second pass that snaps to the nearest **eligible** node within
+    `max_distance`. Use this to prefer high-quality snap targets (real
+    intersections, well-connected nodes) while still guaranteeing every
+    point gets snapped to something safe.
 
     Network nodes must carry `x` and `y` attributes (aperta convention).
     Typical sources of such graphs are OSMnx (`ox.project_graph(...)` produces
@@ -772,8 +897,9 @@ def snap_to_network_nodes(
         points: GeoDataFrame of points to snap. Output is indexed by
             `points.index`.
         graph: NetworkX (or compatible) graph with `x` / `y` node attributes.
-        max_distance: optional cap. Points farther than this from every node
-            return `NaN` for both ID and distance. `None` means no cap.
+        max_distance: optional cap. Points farther than this from every
+            eligible node return `NaN` for both ID and distance. `None`
+            means no cap.
         eligible_node_ids: optional restriction — only nodes in this set are
             considered as snap targets. Use with `aggregate_edges_to_nodes`
             to filter out structurally undesirable snap targets (e.g.,
@@ -786,6 +912,22 @@ def snap_to_network_nodes(
             elsewhere (e.g., loaded from `.graphml`) and the eligible-set
             travels with it as a node attribute. Ignored if
             `eligible_node_ids` is also given.
+        priority_node_ids: optional **priority** snap targets — high-quality
+            nodes preferred over plain eligible nodes when within
+            `priority_max_distance`. Use `prepared.snap_priority_nodes`
+            from `prepare_network`. When given (or `priority_node_flag` is),
+            the function runs in two-pass mode: priority first within
+            `priority_max_distance`, eligible fallback within
+            `max_distance`. Points beyond the priority radius fall back to
+            the eligible second pass.
+        priority_node_flag: optional alternative to `priority_node_ids` —
+            name of a per-node bool attribute on `graph` (e.g.,
+            `prepared.snap_priority_flag`). Ignored if `priority_node_ids`
+            is also given.
+        priority_max_distance: optional cap on the priority first pass.
+            Points farther than this from every priority node fall through
+            to the eligible second pass. `None` means no priority-side cap
+            (every point gets snapped to a priority node if any exist).
 
     Returns:
         Tuple `(node_ids, distances)`:
@@ -793,32 +935,54 @@ def snap_to_network_nodes(
             - `distances`: `pd.Series` of distances (in CRS units), indexed by
               `points.index`.
     """
-    from aperta import geo_mapping  # local import to avoid module-load cycle
-
     if eligible_node_ids is None and eligible_node_flag is not None:
         eligible_node_ids = [
             n for n, data in graph.nodes(data=True) if data.get(eligible_node_flag)
         ]
 
     if eligible_node_ids is None:
-        node_ids = list(graph.nodes)
+        eligible_node_list = list(graph.nodes)
     else:
         eligible_set = set(eligible_node_ids)
-        node_ids = [n for n in graph.nodes if n in eligible_set]
-        if not node_ids:
+        eligible_node_list = [n for n in graph.nodes if n in eligible_set]
+        if not eligible_node_list:
             raise ValueError(
                 "Eligibility filter excluded every node in the graph "
                 "(`eligible_node_ids` or `eligible_node_flag`). Cannot snap to "
                 "an empty set of targets."
             )
-    node_x = [graph.nodes[n]["x"] for n in node_ids]
-    node_y = [graph.nodes[n]["y"] for n in node_ids]
-    nodes_gdf = gpd.GeoDataFrame(
-        geometry=gpd.points_from_xy(node_x, node_y),
-        index=pd.Index(node_ids, name="node_id"),
-        crs=points.crs,
+
+    # Resolve priority subset (optional). Empty priority set is fine — it
+    # just yields all-NaN from the first pass, so every point falls through
+    # to the eligible second pass.
+    priority_requested = priority_node_ids is not None or priority_node_flag is not None
+    if not priority_requested:
+        return _snap_to_subset(points, graph, eligible_node_list, max_distance=max_distance)
+
+    if priority_node_ids is None:
+        priority_set = {n for n, data in graph.nodes(data=True) if data.get(priority_node_flag)}
+    else:
+        priority_set = set(priority_node_ids)
+    priority_node_list = [n for n in graph.nodes if n in priority_set]
+
+    # First pass: priority within priority_max_distance.
+    pri_ids, pri_dists = _snap_to_subset(
+        points, graph, priority_node_list, max_distance=priority_max_distance
     )
-    return geo_mapping.map_points_to_points(points, nodes_gdf, max_distance=max_distance)
+    unmatched = pri_ids.isna()
+    if not unmatched.any():
+        return pri_ids, pri_dists
+
+    # Second pass: eligible (with broader max_distance) for the unmatched.
+    fallback_points = points.loc[unmatched]
+    elig_ids, elig_dists = _snap_to_subset(
+        fallback_points, graph, eligible_node_list, max_distance=max_distance
+    )
+    pri_ids = pri_ids.copy()
+    pri_dists = pri_dists.copy()
+    pri_ids.loc[unmatched] = elig_ids
+    pri_dists.loc[unmatched] = elig_dists
+    return pri_ids, pri_dists
 
 
 def aggregate_edges_to_nodes(
@@ -1053,6 +1217,11 @@ Directedness = Literal["undirected", "directed_scc"]
 #     one-ways; the permissive default is the right error budget) + `'bike'`.
 #   - car:  directed with snap-to-largest-SCC (one-ways are semantically real
 #     for cars; flipping them produces wrong-direction routes) + `'drive'`.
+# OSM-specific. `network_type` values (`'all'`, `'bike'`, `'drive'`) are OSMnx
+# network filters, and `cost_excluded_tags` reads the OSM `highway` tag.
+# Projects working with non-OSM road networks should override these settings
+# explicitly when calling `prepare_network` (or skip it and write the
+# `is_snap_eligible_*` / `cost_excluded_*` decorations directly).
 MODE_DEFAULTS: dict[BaseMode, dict] = {
     "walk": {
         "network_type": "all",
@@ -1069,6 +1238,34 @@ MODE_DEFAULTS: dict[BaseMode, dict] = {
         "directedness": "directed_scc",
         "cost_excluded_tags": frozenset(),
     },
+}
+
+
+# Per-mode default predicates for "priority" snap-target classification.
+# A priority node is a high-quality snap target — typically a well-connected
+# intersection — used as the first-pass choice in two-pass snapping. Cells
+# / zones snap to a priority node within a tight radius if one exists, and
+# fall back to the broader eligible set otherwise. The walk / bike predicate
+# reads only `is_4way` (topology, from `flag_node_intersection_topology`).
+# The car predicate reads `is_*_anchor` attributes, which depend on the OSM
+# `highway` tag and are written by `flag_node_osm_classification` — for
+# non-OSM road networks a project-specific car predicate is required.
+def _priority_walk_bike(node_data: dict) -> bool:
+    """4-way intersections only (well-connected, regardless of road class)."""
+    return bool(node_data.get("is_4way", 0))
+
+
+def _priority_car(node_data: dict) -> bool:
+    """Anchor T-junctions and 4-way intersections: at least one tertiary+
+    road touching, AND not a pure trunk/motorway interchange. OSM-specific:
+    reads `is_*_anchor` written by `flag_node_osm_classification`."""
+    return bool(node_data.get("is_t_junction_anchor", 0) or node_data.get("is_4way_anchor", 0))
+
+
+MODE_PRIORITY_DEFAULTS: dict[BaseMode, Callable[[dict], bool]] = {
+    "walk": _priority_walk_bike,
+    "bike": _priority_walk_bike,
+    "car": _priority_car,
 }
 
 
@@ -1099,6 +1296,15 @@ class PreparedGraph:
             `graph`.
         snap_eligible_flag: Name of the per-node boolean attribute written
             onto `graph` (default `f"is_snap_eligible_{mode}"`).
+        snap_priority_nodes: Subset of `snap_eligible_nodes` classified as
+            high-quality snap targets (e.g., real intersections of suitable
+            road class). Empty if no priority predicate is in effect. Pass
+            as `priority_node_ids=` to `snap_to_network_nodes` for two-pass
+            snapping (priority first within a tight radius, eligible
+            fallback otherwise).
+        snap_priority_flag: Name of the per-node boolean attribute written
+            onto `graph` (default `f"is_snap_priority_{mode}"`). False for
+            every node when no priority predicate is in effect.
         cost_excluded_flag: Name of the per-edge boolean attribute written
             onto `graph` (default `f"cost_excluded_{mode}"`). Mode-specific
             cost functions consult this flag to assign cost = ∞.
@@ -1111,6 +1317,8 @@ class PreparedGraph:
     graph: nx.Graph
     snap_eligible_nodes: frozenset
     snap_eligible_flag: str
+    snap_priority_nodes: frozenset
+    snap_priority_flag: str
     cost_excluded_flag: str
     mode: str
     directedness: Directedness
@@ -1127,6 +1335,8 @@ def prepare_network(
     cost_excluded_tags: Iterable[str] | None = None,
     snap_eligible_flag: str | None = None,
     cost_excluded_flag: str | None = None,
+    priority_node_filter: Callable[[dict], bool] | None = None,
+    snap_priority_flag: str | None = None,
 ) -> PreparedGraph:
     """Apply mode-aware graph preparation: directedness + snap-eligibility + cost-exclusion flags.
 
@@ -1177,6 +1387,18 @@ def prepare_network(
             `None` defaults to `f"is_snap_eligible_{mode}"`.
         cost_excluded_flag: Name of the per-edge bool attribute to write.
             `None` defaults to `f"cost_excluded_{mode}"`.
+        priority_node_filter: Optional predicate `(node_data) -> bool` that
+            classifies each node as a "priority" snap target (high-quality
+            intersection where trips naturally begin / end). Used for the
+            first pass of two-pass snapping; nodes that don't satisfy this
+            but ARE in `snap_eligible_nodes` remain available as fallback.
+            `None` resolves from `MODE_PRIORITY_DEFAULTS` if a base mode is
+            available, otherwise leaves the priority set empty. The
+            predicate consults node attributes typically written by
+            `flag_node_intersection_topology` and (for OSM-derived flags
+            like `is_*_anchor`) `flag_node_osm_classification`.
+        snap_priority_flag: Name of the per-node bool attribute to write
+            for priority nodes. `None` defaults to `f"is_snap_priority_{mode}"`.
 
     Returns:
         A `PreparedGraph` carrying the (possibly transformed) routing
@@ -1235,6 +1457,17 @@ def prepare_network(
     cost_excluded_flag_r: str = (
         cost_excluded_flag if cost_excluded_flag is not None else f"cost_excluded_{mode}"
     )
+    snap_priority_flag_r: str = (
+        snap_priority_flag if snap_priority_flag is not None else f"is_snap_priority_{mode}"
+    )
+    # Resolve priority predicate: explicit arg wins; else mode default; else None.
+    priority_filter_r: Callable[[dict], bool] | None
+    if priority_node_filter is not None:
+        priority_filter_r = priority_node_filter
+    elif effective_base is not None:
+        priority_filter_r = MODE_PRIORITY_DEFAULTS.get(effective_base)
+    else:
+        priority_filter_r = None
 
     if effective_base is not None:
         _check_combination(effective_base, directedness_r, network_type_r, cost_excluded_tags_r)
@@ -1258,27 +1491,39 @@ def prepare_network(
     # outliers.
     if prepared_graph.is_multigraph():
         for u, v, k, edata in prepared_graph.edges(keys=True, data=True):
-            prepared_graph.edges[u, v, k][cost_excluded_flag_r] = _highway_in_excluded(
+            prepared_graph.edges[u, v, k][cost_excluded_flag_r] = _osm_highway_in_excluded(
                 edata.get("highway"), cost_excluded_tags_r
             )
     else:
         for u, v, edata in prepared_graph.edges(data=True):
-            prepared_graph.edges[u, v][cost_excluded_flag_r] = _highway_in_excluded(
+            prepared_graph.edges[u, v][cost_excluded_flag_r] = _osm_highway_in_excluded(
                 edata.get("highway"), cost_excluded_tags_r
             )
 
     snap_nodes = _compute_snap_eligible_nodes(prepared_graph, directedness_r, cost_excluded_flag_r)
+
+    # Compute priority nodes (subset of eligible): nodes that satisfy
+    # `priority_filter_r` on their per-node attributes. Empty if no filter.
+    if priority_filter_r is None:
+        priority_nodes: frozenset = frozenset()
+    else:
+        priority_nodes = frozenset(
+            n for n in snap_nodes if priority_filter_r(prepared_graph.nodes[n])
+        )
 
     # Decorate the graph in place so the trap-fix information rides along
     # with the graph (e.g., through .graphml roundtripping) and downstream
     # consumers can use it without knowing about `PreparedGraph`.
     for n in prepared_graph.nodes:
         prepared_graph.nodes[n][snap_eligible_flag_r] = n in snap_nodes
+        prepared_graph.nodes[n][snap_priority_flag_r] = n in priority_nodes
 
     return PreparedGraph(
         graph=prepared_graph,
         snap_eligible_nodes=snap_nodes,
         snap_eligible_flag=snap_eligible_flag_r,
+        snap_priority_nodes=priority_nodes,
+        snap_priority_flag=snap_priority_flag_r,
         cost_excluded_flag=cost_excluded_flag_r,
         mode=mode,
         directedness=directedness_r,
@@ -1306,6 +1551,7 @@ def _compute_snap_eligible_nodes(
     carry `cost_excluded_flag=True`, so the cost-masked subgraph equals the
     full graph and the result matches plain topological analysis.
     """
+    ok_edges: list
     if graph.is_multigraph():
         ok_edges = [
             (u, v, k)
@@ -1321,11 +1567,11 @@ def _compute_snap_eligible_nodes(
         components = nx.connected_components(subgraph)
     else:
         components = nx.strongly_connected_components(subgraph)
-    largest = max(components, key=len, default=set())
+    largest: set = max(components, key=len, default=set())
     return frozenset(largest)
 
 
-def _highway_in_excluded(highway_value, excluded: frozenset) -> bool:
+def _osm_highway_in_excluded(highway_value, excluded: frozenset) -> bool:
     """True if the edge's `highway` tag is in `excluded`. Tolerates list-valued
     tags (post-`consolidate_intersections` edges can carry a list of highway
     strings) and `None`.
