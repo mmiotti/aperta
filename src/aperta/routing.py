@@ -72,10 +72,10 @@ def apply_edge_weights(graph: nx.Graph, weight_fn: Callable, weight_name: str, *
 def mask_excluded_edges(weight_fn: Callable, cost_excluded_flag: str) -> Callable:
     """Wrap `weight_fn` so edges flagged `cost_excluded_flag=True` get cost = ∞.
 
-    Companion to `network_processing.prepare_network`, which writes the
-    per-edge boolean flag based on a mode's `cost_excluded_tags`. The flag
-    name is recorded on `PreparedGraph.cost_excluded_flag`; pass it here to
-    bake the mode-specific edge exclusion into a routing-weight callable.
+    Companion to `routing_prep.prepare_network`, which writes the per-edge
+    boolean flag based on a mode's `cost_excluded_tags`. The flag name is
+    recorded on `PreparedGraph.cost_excluded_flag`; pass it here to bake
+    the mode-specific edge exclusion into a routing-weight callable.
 
     Typical use:
 

@@ -196,7 +196,7 @@ def map_points_to_points(
 
     For the common special case where `right_points` are the nodes of a
     `networkx` graph (or similar), use
-    `aperta.network_processing.snap_to_network_nodes` instead — it takes the
+    `aperta.network_snap.snap_to_network_nodes` instead — it takes the
     graph directly, skipping the boilerplate of extracting node `(x, y)`
     coordinates and wrapping them in a GeoDataFrame.
 

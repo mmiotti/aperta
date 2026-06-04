@@ -48,10 +48,10 @@ python -m unittest discover -s tests -t .
 Aperta is organized around a six-phase workflow. Phases 4 and 5's calibration sub-step are optional; the rest is the minimum end-to-end pipeline.
 
 1. **Load and prepare data** — networks (one per mode), land use, topography, optional ground-truth data (traffic counters, travel-survey times).
-2. **Map data to units** — aggregate source data into the `cells → zones` hierarchy; snap geo units to network nodes.
-3. **Build sparse OD pairs** — the tiered OD structure (three distance tiers) with per-cell origins at near range and zone-aggregated destinations at far range, keeping per-origin compute bounded independently of network extent.
-4. **(Optional) Estimate traffic flows** — sampled betweenness centrality; optionally calibrate against observed counter data.
-5. **Estimate travel costs** — shortest paths on the routing graph plus per-cell trip overheads. Optionally: utility-based generalized costs and edge-weight calibration against observed travel times.
+2. **Map data to units** — aggregate source data into the `cells → zones` hierarchy; snap geo units to network nodes. Snapping is either plain nearest-node lookup (`snap_to_network_nodes`) or, optionally, tiered with edge-based fallback (`snap_to_network_tiered`) — when a target has no eligible node within a tight radius, a synthetic node is inserted onto the nearest road segment (with optional prioritization of specific road segments, e.g. main roads).
+3. **Build sparse OD pairs** — the tiered OD structure with per-cell origins at near range and zone-aggregated destinations at far range, keeping per-origin compute bounded independently of network extent.
+4. **(Optional) Estimate traffic flows** — sampled betweenness centrality (essentially an network-based "2.5-step" travel demand model); optionally calibrate against observed traffic counter data.
+5. **Estimate travel costs** — shortest paths on the routing graph. Three optional features: (a) trip overheads for parking search, unlocking a bicycle, etc (usually estimated through correlation with urban characteristics such as density); (b) utility-based generalized costs and (c) edge-weight calibration against observed travel times.
 6. **Calculate accessibilities** — cumulative-opportunity, gravity, nearest-k, logsum (and cross-modal aggregation across per-mode results).
 
 See the [API reference](https://aperta.readthedocs.io/en/latest/api/) for which module covers each phase and for the specific functions.

@@ -5,8 +5,9 @@ The library is organized around a six-phase workflow:
 
   1. Load and prepare data  — networks (per mode), land use, topography.
   2. Map data to units      — `cells → zones` aggregation hierarchy
-                              (`geo_mapping`, `network_processing.snap_to_network_nodes`,
-                              `network_processing.assign_to_eligible_centroid`).
+                              (`geo_mapping`, `network_snap.snap_to_network_nodes`,
+                              `network_snap.snap_to_network_tiered`,
+                              `network_snap.transport_centroid`).
   3. Build sparse OD pairs  — `od_pairs.get_pairs` returns a `TieredODNodePairs`
                               (three distance tiers: cells_to_cells,
                               cells_to_zones, zones_to_zones). Lift to

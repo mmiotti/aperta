@@ -50,7 +50,7 @@ import pandas as pd
 import pandana
 from shapely.geometry import Point, box
 
-from aperta import accessibility, network_processing, od_pairs, routing
+from aperta import accessibility, network_processing, network_snap, od_pairs, routing
 
 
 # ----------------------------------------------------------------------------
@@ -110,7 +110,7 @@ def snap_cells(cells, graph, node_col):
     centroids = gpd.GeoDataFrame(
         geometry=cells.geometry.centroid, index=cells.index, crs=cells.crs,
     )
-    cells[node_col], _ = network_processing.snap_to_network_nodes(centroids, graph)
+    cells[node_col], _ = network_snap.snap_to_network_nodes(centroids, graph)
 
 
 def clip_to_test_bbox(cells, zones, graph, aoi_polygon, half_km):

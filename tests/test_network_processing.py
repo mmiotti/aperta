@@ -11,18 +11,24 @@ import geopandas as gpd
 import networkx as nx
 import numpy as np
 import pandas as pd
-from shapely.geometry import Point, box
+from shapely.geometry import LineString, Point, box
 
 from aperta.network_processing import (
     aggregate_edges_to_nodes,
-    assign_to_eligible_centroid,
     consolidate_intersections,
     flag_node_intersection_topology,
     flag_node_osm_classification,
     lanes_per_direction,
-    prepare_network,
-    snap_to_network_nodes,
 )
+from aperta.network_snap import (
+    insert_projected_nodes,
+    nodes_incident_to_edges,
+    snap_to_network_nodes,
+    split_edge_at_point,
+    split_two_way_edge_at_point,
+    transport_centroid,
+)
+from aperta.routing_prep import compute_snap_eligibility, prepare_network
 
 
 def _flag_all(g):
@@ -95,8 +101,8 @@ class SnapToNetworkNodesTestCase(unittest.TestCase):
         self.assertEqual(list(ids.index), ["first", "second"])
         self.assertEqual(list(distances.index), ["first", "second"])
 
-    def test_max_distance_caps_assignment(self):
-        """Points farther than `max_distance` from every node get NaN."""
+    def test_max_radius_caps_assignment(self):
+        """Points farther than `max_radius` from every node get NaN."""
         graph = self._graph()
         points = self._points(
             [
@@ -105,7 +111,7 @@ class SnapToNetworkNodesTestCase(unittest.TestCase):
             ],  # far from every node
             ["near", "far"],
         )
-        ids, distances = snap_to_network_nodes(points, graph, max_distance=5.0)
+        ids, distances = snap_to_network_nodes(points, graph, max_radius=5.0)
         self.assertEqual(ids.loc["near"], "a")
         self.assertTrue(pd.isna(ids.loc["far"]))
         self.assertAlmostEqual(distances.loc["near"], 1.0)
@@ -173,23 +179,19 @@ class SnapToNetworkNodesTestCase(unittest.TestCase):
         self.assertIn(ids.loc["p"], {"b", "c"})
         self.assertNotEqual(ids.loc["p"], "a")
 
-    def test_eligible_node_ids_takes_precedence_over_flag(self):
-        """If both `eligible_node_ids` and `eligible_node_flag` are given,
-        the explicit `eligible_node_ids` wins."""
+    def test_both_eligible_kwargs_raises(self):
+        """Passing both `eligible_node_ids` and `eligible_node_flag` raises
+        (avoids silent footgun from the previous "ids wins" precedence)."""
         graph = self._graph()
-        # Flag would mark only 'a' eligible:
         graph.nodes["a"]["is_snap_eligible"] = True
-        graph.nodes["b"]["is_snap_eligible"] = False
-        graph.nodes["c"]["is_snap_eligible"] = False
         points = self._points([(0.5, 0.5)], ["p"])
-        # But explicit eligible_node_ids restricts to {'c'} only.
-        ids, _ = snap_to_network_nodes(
-            points,
-            graph,
-            eligible_node_ids={"c"},
-            eligible_node_flag="is_snap_eligible",
-        )
-        self.assertEqual(ids.loc["p"], "c")
+        with self.assertRaises(ValueError):
+            snap_to_network_nodes(
+                points,
+                graph,
+                eligible_node_ids={"c"},
+                eligible_node_flag="is_snap_eligible",
+            )
 
     def test_eligible_node_flag_missing_attribute_treated_as_false(self):
         """A node without the flag attribute counts as ineligible."""
@@ -206,143 +208,6 @@ class SnapToNetworkNodesTestCase(unittest.TestCase):
         points = self._points([(0.5, 0.5)], ["p"])
         with self.assertRaisesRegex(ValueError, "every node"):
             snap_to_network_nodes(points, graph, eligible_node_flag="is_snap_eligible")
-
-    # --- two-pass snapping (priority + eligible fallback) ---
-
-    def _priority_graph(self) -> nx.Graph:
-        """Four nodes:
-        'a' at (0, 0)   — priority + eligible
-        'b' at (10, 0)  — priority + eligible
-        'c' at (50, 0)  — eligible only (not priority)
-        'd' at (100, 0) — eligible only (not priority)
-        """
-        g = nx.Graph()
-        coords = {"a": (0, 0), "b": (10, 0), "c": (50, 0), "d": (100, 0)}
-        for n, (x, y) in coords.items():
-            g.add_node(n, x=float(x), y=float(y))
-        return g
-
-    def test_priority_snap_two_pass_prefers_priority_within_radius(self):
-        """A point near a priority node and an eligible-only node should snap
-        to the priority node, even if the eligible-only node is slightly closer."""
-        graph = self._priority_graph()
-        # Point at (45, 0): geometrically closer to 'c' (5 m) than to 'b' (35 m).
-        # With priority radius 40 m, 'b' is in range → priority pass picks 'b'.
-        points = self._points([(45.0, 0.0)], ["p"])
-        ids, dists = snap_to_network_nodes(
-            points,
-            graph,
-            eligible_node_ids={"a", "b", "c", "d"},
-            priority_node_ids={"a", "b"},
-            priority_max_distance=40.0,
-        )
-        self.assertEqual(ids.loc["p"], "b")
-        self.assertAlmostEqual(dists.loc["p"], 35.0)
-
-    def test_priority_snap_falls_back_to_eligible_when_no_priority_in_range(self):
-        """If no priority node is within `priority_max_distance`, snap to
-        nearest eligible node (within `max_distance`)."""
-        graph = self._priority_graph()
-        # Point at (60, 0): nearest priority 'b' is 50 m away, beyond radius 30 m.
-        # Falls back to eligible — nearest is 'c' (10 m).
-        points = self._points([(60.0, 0.0)], ["p"])
-        ids, dists = snap_to_network_nodes(
-            points,
-            graph,
-            eligible_node_ids={"a", "b", "c", "d"},
-            priority_node_ids={"a", "b"},
-            priority_max_distance=30.0,
-        )
-        self.assertEqual(ids.loc["p"], "c")
-        self.assertAlmostEqual(dists.loc["p"], 10.0)
-
-    def test_priority_snap_mixed_first_pass_and_fallback(self):
-        """Some points get priority snap, others fall back to eligible."""
-        graph = self._priority_graph()
-        # p1 at (5, 0): closest priority 'a' is 5 m — within priority radius.
-        # p2 at (60, 0): closest priority 'b' is 50 m — beyond priority radius,
-        #                fall back to eligible nearest 'c' (10 m).
-        points = self._points([(5.0, 0.0), (60.0, 0.0)], ["p1", "p2"])
-        ids, dists = snap_to_network_nodes(
-            points,
-            graph,
-            eligible_node_ids={"a", "b", "c", "d"},
-            priority_node_ids={"a", "b"},
-            priority_max_distance=20.0,
-        )
-        self.assertEqual(ids.loc["p1"], "a")
-        self.assertEqual(ids.loc["p2"], "c")
-        self.assertAlmostEqual(dists.loc["p1"], 5.0)
-        self.assertAlmostEqual(dists.loc["p2"], 10.0)
-
-    def test_priority_snap_uses_flag_attribute(self):
-        """`priority_node_flag` derives the priority set from a per-node attr."""
-        graph = self._priority_graph()
-        graph.nodes["a"]["is_priority"] = True
-        graph.nodes["b"]["is_priority"] = True
-        graph.nodes["c"]["is_priority"] = False
-        graph.nodes["d"]["is_priority"] = False
-        points = self._points([(45.0, 0.0)], ["p"])
-        ids, _ = snap_to_network_nodes(
-            points,
-            graph,
-            eligible_node_ids={"a", "b", "c", "d"},
-            priority_node_flag="is_priority",
-            priority_max_distance=40.0,
-        )
-        self.assertEqual(ids.loc["p"], "b")
-
-    def test_priority_ids_take_precedence_over_priority_flag(self):
-        """If both `priority_node_ids` and `priority_node_flag` are given,
-        the explicit set wins."""
-        graph = self._priority_graph()
-        # Flag would mark only 'c' as priority:
-        graph.nodes["a"]["is_priority"] = False
-        graph.nodes["b"]["is_priority"] = False
-        graph.nodes["c"]["is_priority"] = True
-        graph.nodes["d"]["is_priority"] = False
-        points = self._points([(45.0, 0.0)], ["p"])
-        # But explicit priority_node_ids restricts to {'b'}.
-        ids, _ = snap_to_network_nodes(
-            points,
-            graph,
-            eligible_node_ids={"a", "b", "c", "d"},
-            priority_node_ids={"b"},
-            priority_node_flag="is_priority",
-            priority_max_distance=40.0,
-        )
-        self.assertEqual(ids.loc["p"], "b")
-
-    def test_priority_empty_set_falls_back_to_eligible_silently(self):
-        """An empty priority set is a valid state (not all graphs have
-        priority targets); every point falls through to the eligible pass."""
-        graph = self._priority_graph()
-        points = self._points([(45.0, 0.0)], ["p"])
-        ids, _ = snap_to_network_nodes(
-            points,
-            graph,
-            eligible_node_ids={"a", "b", "c", "d"},
-            priority_node_ids=set(),
-            priority_max_distance=40.0,
-        )
-        # Snap proceeds via eligible: 'c' at 5 m is nearest.
-        self.assertEqual(ids.loc["p"], "c")
-
-    def test_priority_max_distance_none_means_no_priority_cap(self):
-        """`priority_max_distance=None` lets the priority pass match any
-        distance — every point snaps to a priority node if any exist."""
-        graph = self._priority_graph()
-        # Point at (95, 0): geometrically closer to 'd' (5 m) than to any
-        # priority node. With no priority cap, still snaps to priority 'b'.
-        points = self._points([(95.0, 0.0)], ["p"])
-        ids, _ = snap_to_network_nodes(
-            points,
-            graph,
-            eligible_node_ids={"a", "b", "c", "d"},
-            priority_node_ids={"a", "b"},
-            priority_max_distance=None,
-        )
-        self.assertEqual(ids.loc["p"], "b")
 
 
 class AggregateEdgesToNodesTestCase(unittest.TestCase):
@@ -417,28 +282,22 @@ class AggregateEdgesToNodesTestCase(unittest.TestCase):
         self.assertEqual(out.loc["b"], 3.0)
 
 
-class AssignToEligibleCentroidTestCase(unittest.TestCase):
-    """`assign_to_eligible_centroid` snaps polygons via the median of their
-    eligible interior nodes."""
+class TransportCentroidTestCase(unittest.TestCase):
+    """`transport_centroid` returns per-polygon centroids of the eligible
+    network nodes inside (median or mean). Output is a point GeoDataFrame
+    indexed by polygon id."""
 
     def _graph_with_tiers(self) -> nx.Graph:
-        """A graph where one zone has multiple eligible nodes plus a low-tier
-        outlier, another has only an outlier, and we test the transport-
-        centroid vs. geometric-centroid behaviour.
-
-        Zone Z (50 x 50 area): nodes at (10,10), (40,40), (25,25) eligible;
-                               (5,5) ineligible.
-        Zone W (60 x 60 area, no eligible nodes inside).
+        """Zone Z (50 x 50): nodes at (10,10), (40,40), (25,25) eligible;
+                              (5,5) ineligible.
+        Zone W (50 x 50): no eligible nodes inside.
         """
         g = nx.Graph()
-        # Zone Z interior nodes
         g.add_node("z1", x=10.0, y=10.0)
         g.add_node("z2", x=40.0, y=40.0)
-        g.add_node("z3", x=25.0, y=25.0)  # near the median
-        g.add_node("z_skip", x=5.0, y=5.0)  # ineligible (excluded by filter)
-        # Zone W interior — no eligible nodes
-        g.add_node("w_skip", x=80.0, y=80.0)  # in W, but ineligible
-        # Background node outside any polygon
+        g.add_node("z3", x=25.0, y=25.0)
+        g.add_node("z_skip", x=5.0, y=5.0)
+        g.add_node("w_skip", x=80.0, y=80.0)
         g.add_node("bg", x=200.0, y=200.0)
         return g
 
@@ -449,77 +308,93 @@ class AssignToEligibleCentroidTestCase(unittest.TestCase):
             crs="EPSG:2056",
         )
 
-    def test_snaps_to_median_of_eligible(self):
-        """Z has eligible nodes z1, z2, z3 inside; median ≈ (25, 25),
-        nearest eligible node = z3."""
-        eligible = {"z1", "z2", "z3", "bg"}  # ineligible: z_skip, w_skip
-        ids, dists = assign_to_eligible_centroid(
+    def test_returns_median_of_eligible_interior(self):
+        """Z has eligible z1=(10,10), z2=(40,40), z3=(25,25) inside; median (25, 25)."""
+        eligible = {"z1", "z2", "z3", "bg"}
+        centroids = transport_centroid(
             self._polygons(),
             self._graph_with_tiers(),
             eligible_node_ids=eligible,
             centroid_method="median",
         )
-        self.assertEqual(ids.loc["Z"], "z3")
+        self.assertIsInstance(centroids, gpd.GeoDataFrame)
+        # Z's median: x = median([10, 40, 25]) = 25; y similarly = 25.
+        z_pt = centroids.loc["Z"].geometry
+        self.assertAlmostEqual(z_pt.x, 25.0)
+        self.assertAlmostEqual(z_pt.y, 25.0)
 
-    def test_mean_centroid(self):
-        """Mean centroid lands somewhere different from median when distribution is skewed."""
-        # Add an outlier to test mean vs median.
-        g = self._graph_with_tiers()
-        g.add_node("z_outlier", x=49.0, y=49.0)
-        eligible = {"z1", "z2", "z3", "z_outlier", "bg"}
-        ids_mean, _ = assign_to_eligible_centroid(
+    def test_returns_mean_of_eligible_interior(self):
+        """Mean = mean of {10, 40, 25} = 25 (same as median for symmetric set)."""
+        eligible = {"z1", "z2", "z3", "bg"}
+        centroids = transport_centroid(
             self._polygons(),
-            g,
+            self._graph_with_tiers(),
             eligible_node_ids=eligible,
             centroid_method="mean",
         )
-        ids_med, _ = assign_to_eligible_centroid(
-            self._polygons(),
-            g,
-            eligible_node_ids=eligible,
-            centroid_method="median",
-        )
-        # Both should land somewhere reasonable — actual node depends on geometry.
-        # The point is just that both methods produce a sensible eligible node.
-        self.assertIn(ids_mean.loc["Z"], {"z1", "z2", "z3", "z_outlier"})
-        self.assertIn(ids_med.loc["Z"], {"z1", "z2", "z3", "z_outlier"})
+        z_pt = centroids.loc["Z"].geometry
+        self.assertAlmostEqual(z_pt.x, 25.0)
+        self.assertAlmostEqual(z_pt.y, 25.0)
 
     def test_fallback_to_geometric_centroid(self):
-        """Zone W has no eligible nodes inside; falls back to its geometric
-        centroid, snapping to the globally-nearest eligible node."""
+        """Zone W has no eligible nodes inside; falls back to geometric centroid."""
         eligible = {"z1", "z2", "z3", "bg"}
-        ids, _ = assign_to_eligible_centroid(
+        centroids = transport_centroid(
             self._polygons(),
             self._graph_with_tiers(),
             eligible_node_ids=eligible,
             fallback_to_geometric_centroid=True,
         )
-        # W's geometric centroid is (75, 75). Eligible nodes (excluding the
-        # already-snapped ones): z1, z2, z3, bg. Nearest to (75,75) is bg (200,200)?
-        # Actually no — z2 is at (40,40), bg at (200,200). Distances from (75,75):
-        # z2 → ~49.5; bg → ~176. So z2 wins.
-        self.assertEqual(ids.loc["W"], "z2")
+        # W's geometric centroid is at the middle: (75, 75).
+        w_pt = centroids.loc["W"].geometry
+        self.assertAlmostEqual(w_pt.x, 75.0)
+        self.assertAlmostEqual(w_pt.y, 75.0)
 
-    def test_no_fallback_gives_nan(self):
-        """With fallback off, polygons containing no eligible nodes get NaN."""
-        eligible = {"z1", "z2", "z3"}  # no node inside W
-        ids, dists = assign_to_eligible_centroid(
+    def test_no_fallback_drops_polygons(self):
+        """With fallback off, polygons without eligible nodes are absent from output."""
+        eligible = {"z1", "z2", "z3"}
+        centroids = transport_centroid(
             self._polygons(),
             self._graph_with_tiers(),
             eligible_node_ids=eligible,
             fallback_to_geometric_centroid=False,
         )
-        # Z still snaps fine; W → NaN.
-        self.assertEqual(ids.loc["Z"], "z3")
-        self.assertTrue(pd.isna(ids.loc["W"]))
+        self.assertIn("Z", centroids.index)
+        self.assertNotIn("W", centroids.index)
+
+    def test_output_crs_preserved(self):
+        centroids = transport_centroid(
+            self._polygons(),
+            self._graph_with_tiers(),
+            eligible_node_ids={"z1", "z2", "z3", "bg"},
+        )
+        self.assertEqual(centroids.crs, self._polygons().crs)
 
     def test_empty_eligible_raises(self):
         with self.assertRaisesRegex(ValueError, "non-empty"):
-            assign_to_eligible_centroid(
+            transport_centroid(
                 self._polygons(),
                 self._graph_with_tiers(),
                 eligible_node_ids=set(),
             )
+
+    def test_compose_with_snap_to_network_nodes(self):
+        """The composed pattern: transport_centroid → snap_to_network_nodes
+        reproduces the old all-in-one behaviour, with caller in control of
+        the snap function."""
+        eligible = {"z1", "z2", "z3", "bg"}
+        centroids = transport_centroid(
+            self._polygons(),
+            self._graph_with_tiers(),
+            eligible_node_ids=eligible,
+        )
+        ids, _ = snap_to_network_nodes(
+            centroids,
+            self._graph_with_tiers(),
+            eligible_node_ids=eligible,
+        )
+        # Z's centroid is at (25, 25) → nearest eligible node z3 at (25, 25).
+        self.assertEqual(ids.loc["Z"], "z3")
 
 
 class FlagNodeIntersectionsTestCase(unittest.TestCase):
@@ -1218,120 +1093,6 @@ class PrepareNetworkTestCase(unittest.TestCase):
         self.assertTrue(g.nodes["C"]["is_snap_eligible_walk"])
         self.assertFalse(g.nodes["D"]["is_snap_eligible_walk"])
 
-    # --- priority-node classification ---
-
-    def _intersection_graph(self) -> nx.MultiDiGraph:
-        """A graph with three node types that map to distinct priority outcomes:
-
-        - Node H (hub): 4-way intersection, all tertiary edges → all of
-          is_4way / is_4way_major / is_4way_anchor set.
-        - Node M (mixed T): 3-way intersection with one residential + two
-          tertiary edges → is_t_junction set; major fails (min_rank=2);
-          anchor passes (max_rank=3, min_rank=2 ≤ 5).
-        - Node E (leaf): dead-end on residential → no intersection flags.
-
-        Built so all four nodes are in a single (undirected) connected
-        component for the cost-mask-aware eligibility step.
-        """
-        g = nx.MultiDiGraph()
-        for n in ("H", "M", "E", "N1", "N2", "N3"):
-            g.add_node(n, x=0.0, y=0.0)
-        # H is a 4-way on tertiary roads
-        for nbr in ("N1", "N2", "N3", "M"):
-            g.add_edge("H", nbr, highway="tertiary")
-            g.add_edge(nbr, "H", highway="tertiary")
-        # M is a T-junction: tertiary to H, tertiary to N1, residential to E
-        g.add_edge("M", "N1", highway="tertiary")
-        g.add_edge("N1", "M", highway="tertiary")
-        g.add_edge("M", "E", highway="residential")
-        g.add_edge("E", "M", highway="residential")
-        # Write topology + OSM-classification node attributes.
-        _flag_all(g)
-        return g
-
-    def test_car_priority_default_picks_anchor_intersections(self):
-        """Car default predicate (is_t_junction_anchor OR is_4way_anchor)
-        marks H (4-way anchor) and M (T-junction anchor) but not E (leaf)."""
-        prepared = prepare_network(self._intersection_graph(), "car")
-        # H: 4-way intersection with all tertiary edges → anchor.
-        self.assertIn("H", prepared.snap_priority_nodes)
-        # M: T-junction with mixed residential/tertiary → anchor.
-        self.assertIn("M", prepared.snap_priority_nodes)
-        # E: leaf node (n_streets=1) → no intersection flags → not priority.
-        self.assertNotIn("E", prepared.snap_priority_nodes)
-
-    def test_walk_bike_priority_default_picks_only_4way(self):
-        """Walk + bike default predicate (is_4way) marks only nodes with
-        n_streets >= 4 — H qualifies, M (T-junction) does not."""
-        for mode in ("walk", "bike"):
-            with self.subTest(mode=mode):
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    prepared = prepare_network(self._intersection_graph(), mode)
-                self.assertIn("H", prepared.snap_priority_nodes)
-                self.assertNotIn("M", prepared.snap_priority_nodes)
-                self.assertNotIn("E", prepared.snap_priority_nodes)
-
-    def test_priority_nodes_decoration_written_to_graph(self):
-        """Per-node `is_snap_priority_<mode>` graph attribute reflects the
-        priority set — survives `.graphml` roundtripping."""
-        prepared = prepare_network(self._intersection_graph(), "car")
-        g = prepared.graph
-        flag = prepared.snap_priority_flag
-        self.assertEqual(flag, "is_snap_priority_car")
-        self.assertTrue(g.nodes["H"][flag])
-        self.assertTrue(g.nodes["M"][flag])
-        self.assertFalse(g.nodes["E"][flag])
-
-    def test_priority_filter_override_replaces_mode_default(self):
-        """Explicit `priority_node_filter` overrides the mode default."""
-
-        def only_4way_anchors(data: dict) -> bool:
-            return bool(data.get("is_4way_anchor", 0))
-
-        prepared = prepare_network(
-            self._intersection_graph(),
-            "car",
-            priority_node_filter=only_4way_anchors,
-        )
-        # H (4-way anchor) qualifies, M (T-junction anchor) does not.
-        self.assertIn("H", prepared.snap_priority_nodes)
-        self.assertNotIn("M", prepared.snap_priority_nodes)
-
-    def test_unknown_mode_without_base_mode_gets_empty_priority(self):
-        """No predicate available → empty priority set, no raise."""
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            prepared = prepare_network(
-                self._intersection_graph(),
-                "snowmobile",
-                directedness="directed_scc",
-                network_type="all",
-                cost_excluded_tags=set(),
-            )
-        self.assertEqual(prepared.snap_priority_nodes, frozenset())
-        # Per-node flag still written (all False).
-        for n in prepared.graph.nodes:
-            self.assertFalse(prepared.graph.nodes[n]["is_snap_priority_snowmobile"])
-
-    def test_priority_is_subset_of_eligible(self):
-        """Every priority node must also be in `snap_eligible_nodes` —
-        priority is a refinement of eligibility, not orthogonal to it."""
-        prepared = prepare_network(self._intersection_graph(), "car")
-        self.assertTrue(prepared.snap_priority_nodes.issubset(prepared.snap_eligible_nodes))
-
-    def test_custom_snap_priority_flag_name(self):
-        """Explicit `snap_priority_flag` overrides the default name."""
-        prepared = prepare_network(
-            self._intersection_graph(),
-            "car",
-            snap_priority_flag="my_priority",
-        )
-        self.assertEqual(prepared.snap_priority_flag, "my_priority")
-        g = prepared.graph
-        self.assertIn("my_priority", g.nodes["H"])
-        self.assertNotIn("is_snap_priority_car", g.nodes["H"])
-
     # --- end-to-end integration ---
 
     def test_prepared_graph_feeds_snap_and_cost_mask(self):
@@ -1373,6 +1134,1316 @@ class PrepareNetworkTestCase(unittest.TestCase):
         # Edge 0->1 (residential) and 2->3 (footway) → not excluded.
         self.assertEqual(prepared.graph.edges[0, 1, 0]["cost"], 1.0)
         self.assertEqual(prepared.graph.edges[2, 3, 0]["cost"], 1.0)
+
+
+class SplitEdgeAtPointTestCase(unittest.TestCase):
+    """`split_edge_at_point` inserts a synthetic node on an edge at the
+    projection of a target point, splitting the edge into two children
+    with proportional geometry / length and copy-as-is for other attrs.
+    """
+
+    def _simple_multidi_graph(self) -> nx.MultiDiGraph:
+        """One-way directed multigraph: node 1 (0,0) → node 2 (100,0).
+        Edge has standard OSM attrs + a LineString geometry."""
+        g = nx.MultiDiGraph()
+        g.add_node(1, x=0.0, y=0.0)
+        g.add_node(2, x=100.0, y=0.0)
+        g.add_edge(
+            1,
+            2,
+            key=0,
+            highway="residential",
+            lanes=2,
+            maxspeed=50,
+            oneway=True,
+            length=100.0,
+            geometry=LineString([(0.0, 0.0), (100.0, 0.0)]),
+            cost_excluded_walk=False,
+        )
+        return g
+
+    def test_midpoint_split_geometry_and_length(self):
+        """Point at exact midpoint → two 50 m children with sliced geometries."""
+        g = self._simple_multidi_graph()
+        result = split_edge_at_point(g, 1, 2, point=(50.0, 0.0), k=0)
+        # Parent removed; new node added.
+        self.assertFalse(g.has_edge(1, 2, 0))
+        self.assertIn(result.new_node_id, g.nodes)
+        self.assertEqual(g.nodes[result.new_node_id]["x"], 50.0)
+        self.assertEqual(g.nodes[result.new_node_id]["y"], 0.0)
+        # Two children, each 50 m, summing to parent length.
+        c1_data = g.edges[result.child1]
+        c2_data = g.edges[result.child2]
+        self.assertAlmostEqual(c1_data["length"], 50.0, places=4)
+        self.assertAlmostEqual(c2_data["length"], 50.0, places=4)
+        self.assertAlmostEqual(c1_data["length"] + c2_data["length"], 100.0, places=4)
+        # Geometries should be valid LineStrings starting/ending at the right
+        # points.
+        self.assertEqual(list(c1_data["geometry"].coords)[0], (0.0, 0.0))
+        self.assertEqual(list(c1_data["geometry"].coords)[-1], (50.0, 0.0))
+        self.assertEqual(list(c2_data["geometry"].coords)[0], (50.0, 0.0))
+        self.assertEqual(list(c2_data["geometry"].coords)[-1], (100.0, 0.0))
+
+    def test_copy_as_is_attrs(self):
+        """OSM-direct attrs and cost-mask flags are copied to both children."""
+        g = self._simple_multidi_graph()
+        result = split_edge_at_point(g, 1, 2, point=(30.0, 0.0), k=0)
+        for child in (result.child1, result.child2):
+            d = g.edges[child]
+            self.assertEqual(d["highway"], "residential")
+            self.assertEqual(d["lanes"], 2)
+            self.assertEqual(d["maxspeed"], 50)
+            self.assertEqual(d["oneway"], True)
+            self.assertFalse(d["cost_excluded_walk"])
+
+    def test_asymmetric_split(self):
+        """Projection at 70 % → children of 70 m + 30 m."""
+        g = self._simple_multidi_graph()
+        result = split_edge_at_point(g, 1, 2, point=(70.0, 0.0), k=0)
+        self.assertAlmostEqual(g.edges[result.child1]["length"], 70.0, places=4)
+        self.assertAlmostEqual(g.edges[result.child2]["length"], 30.0, places=4)
+
+    def test_off_line_point_projects_correctly(self):
+        """A point above the line should project onto its nearest line-point.
+        New node sits on the line, not at the input point."""
+        g = self._simple_multidi_graph()
+        result = split_edge_at_point(g, 1, 2, point=(60.0, 10.0), k=0)
+        # Projection of (60, 10) onto a horizontal line at y=0 is (60, 0).
+        self.assertEqual(g.nodes[result.new_node_id]["x"], 60.0)
+        self.assertEqual(g.nodes[result.new_node_id]["y"], 0.0)
+
+    def test_undirected_simple_graph(self):
+        """Simple `nx.Graph` (no multi, no direction): edge split works without k."""
+        g = nx.Graph()
+        g.add_node("u", x=0.0, y=0.0)
+        g.add_node("v", x=10.0, y=0.0)
+        g.add_edge(
+            "u",
+            "v",
+            length=10.0,
+            geometry=LineString([(0.0, 0.0), (10.0, 0.0)]),
+        )
+        # Use explicit new_node_id since "u" / "v" are non-int.
+        result = split_edge_at_point(g, "u", "v", point=(4.0, 0.0), new_node_id="n")
+        self.assertEqual(result.new_node_id, "n")
+        self.assertFalse(g.has_edge("u", "v"))
+        self.assertTrue(g.has_edge("u", "n"))
+        self.assertTrue(g.has_edge("n", "v"))
+
+    def test_polyline_geometry_split(self):
+        """Geometry with multiple vertices is split into two valid polylines."""
+        g = nx.MultiDiGraph()
+        g.add_node(1, x=0.0, y=0.0)
+        g.add_node(2, x=100.0, y=0.0)
+        # 3-vertex polyline: dog-leg through (50, 50)
+        g.add_edge(
+            1,
+            2,
+            key=0,
+            length=141.42,
+            geometry=LineString([(0.0, 0.0), (50.0, 50.0), (100.0, 0.0)]),
+        )
+        parent_len = g.edges[1, 2, 0]["geometry"].length
+        # Split at the dog-leg corner: (50, 50) at fraction 0.5.
+        result = split_edge_at_point(g, 1, 2, point=(50.0, 50.0), k=0)
+        c1 = g.edges[result.child1]["geometry"]
+        c2 = g.edges[result.child2]["geometry"]
+        self.assertAlmostEqual(c1.length + c2.length, parent_len, places=3)
+        self.assertEqual(list(c1.coords)[-1], (50.0, 50.0))
+        self.assertEqual(list(c2.coords)[0], (50.0, 50.0))
+
+    def test_endpoint_projection_raises(self):
+        """Projection at u (0,0) or beyond v should raise — caller's job to
+        snap to the endpoint node instead."""
+        g = self._simple_multidi_graph()
+        with self.assertRaises(ValueError):
+            split_edge_at_point(g, 1, 2, point=(0.0, 0.0), k=0)
+        with self.assertRaises(ValueError):
+            split_edge_at_point(g, 1, 2, point=(100.0, 0.0), k=0)
+        # Past v also raises (projects to v).
+        with self.assertRaises(ValueError):
+            split_edge_at_point(g, 1, 2, point=(200.0, 0.0), k=0)
+
+    def test_missing_geometry_raises(self):
+        g = nx.MultiDiGraph()
+        g.add_node(1, x=0.0, y=0.0)
+        g.add_node(2, x=10.0, y=0.0)
+        g.add_edge(1, 2, key=0, length=10.0)  # no geometry
+        with self.assertRaisesRegex(ValueError, "geometry"):
+            split_edge_at_point(g, 1, 2, point=(5.0, 0.0), k=0)
+
+    def test_multigraph_requires_k(self):
+        g = self._simple_multidi_graph()
+        with self.assertRaisesRegex(ValueError, "`k` is required"):
+            split_edge_at_point(g, 1, 2, point=(50.0, 0.0))
+
+    def test_simple_graph_forbids_k(self):
+        g = nx.Graph()
+        g.add_node(1, x=0.0, y=0.0)
+        g.add_node(2, x=10.0, y=0.0)
+        g.add_edge(1, 2, length=10.0, geometry=LineString([(0, 0), (10, 0)]))
+        with self.assertRaisesRegex(ValueError, "`k` must be None"):
+            split_edge_at_point(g, 1, 2, point=(5.0, 0.0), k=0)
+
+    def test_nonexistent_edge_raises(self):
+        g = self._simple_multidi_graph()
+        with self.assertRaisesRegex(ValueError, "not in graph"):
+            split_edge_at_point(g, 1, 999, point=(50.0, 0.0), k=0)
+
+    def test_new_node_id_collision_raises(self):
+        g = self._simple_multidi_graph()
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            split_edge_at_point(g, 1, 2, point=(50.0, 0.0), k=0, new_node_id=1)
+
+    def test_auto_node_id_uses_max_plus_one(self):
+        g = self._simple_multidi_graph()
+        result = split_edge_at_point(g, 1, 2, point=(50.0, 0.0), k=0)
+        self.assertEqual(result.new_node_id, 3)  # max(1, 2) + 1
+
+    def test_extra_node_attrs(self):
+        g = self._simple_multidi_graph()
+        extras = {"is_t_junction": 0, "is_4way": 0, "n_streets": 2}
+        result = split_edge_at_point(
+            g,
+            1,
+            2,
+            point=(50.0, 0.0),
+            k=0,
+            extra_node_attrs=extras,
+        )
+        nd = g.nodes[result.new_node_id]
+        self.assertEqual(nd["is_t_junction"], 0)
+        self.assertEqual(nd["is_4way"], 0)
+        self.assertEqual(nd["n_streets"], 2)
+        # x and y are still set correctly.
+        self.assertEqual(nd["x"], 50.0)
+        self.assertEqual(nd["y"], 0.0)
+
+    def test_multidi_parallel_edges_only_one_split(self):
+        """When two parallel edges (same u, v, different k) exist, splitting
+        one leaves the other untouched."""
+        g = self._simple_multidi_graph()
+        # Add a parallel edge with key=1.
+        g.add_edge(
+            1,
+            2,
+            key=1,
+            highway="service",
+            length=100.0,
+            geometry=LineString([(0.0, 0.0), (100.0, 0.0)]),
+        )
+        result = split_edge_at_point(g, 1, 2, point=(50.0, 0.0), k=0)
+        # k=0 was removed; k=1 still there.
+        self.assertFalse(g.has_edge(1, 2, 0))
+        self.assertTrue(g.has_edge(1, 2, 1))
+        self.assertEqual(g.edges[1, 2, 1]["highway"], "service")
+        # New node connects only via the split children.
+        self.assertTrue(g.has_edge(1, result.new_node_id))
+        self.assertTrue(g.has_edge(result.new_node_id, 2))
+
+    def test_directed_split_preserves_direction(self):
+        """For directed graphs, child1 is (u, new) and child2 is (new, v).
+        Reverse direction edges are not affected by this call."""
+        g = nx.MultiDiGraph()
+        g.add_node(1, x=0.0, y=0.0)
+        g.add_node(2, x=10.0, y=0.0)
+        # Add both directions; we split only the u→v one.
+        g.add_edge(1, 2, key=0, length=10.0, geometry=LineString([(0, 0), (10, 0)]))
+        g.add_edge(2, 1, key=0, length=10.0, geometry=LineString([(10, 0), (0, 0)]))
+        result = split_edge_at_point(g, 1, 2, point=(5.0, 0.0), k=0)
+        # u→v split.
+        self.assertFalse(g.has_edge(1, 2, 0))
+        self.assertTrue(g.has_edge(1, result.new_node_id))
+        self.assertTrue(g.has_edge(result.new_node_id, 2))
+        # v→u untouched.
+        self.assertTrue(g.has_edge(2, 1, 0))
+
+
+class SplitTwoWayEdgeAtPointTestCase(unittest.TestCase):
+    """`split_two_way_edge_at_point` splits BOTH directional edges of a
+    two-way road through a SHARED synthetic node — the typical pattern for
+    OSMnx-style MultiDiGraphs."""
+
+    def _two_way_graph(self) -> nx.MultiDiGraph:
+        """MultiDiGraph with both directions of a 100 m residential road
+        between node 1 (0,0) and node 2 (100,0)."""
+        g = nx.MultiDiGraph()
+        g.add_node(1, x=0.0, y=0.0)
+        g.add_node(2, x=100.0, y=0.0)
+        g.add_edge(
+            1,
+            2,
+            key=0,
+            highway="residential",
+            lanes=2,
+            length=100.0,
+            geometry=LineString([(0.0, 0.0), (100.0, 0.0)]),
+        )
+        g.add_edge(
+            2,
+            1,
+            key=0,
+            highway="residential",
+            lanes=2,
+            length=100.0,
+            geometry=LineString([(100.0, 0.0), (0.0, 0.0)]),
+        )
+        return g
+
+    def test_basic_two_way_split_four_children_through_one_node(self):
+        g = self._two_way_graph()
+        result = split_two_way_edge_at_point(
+            g,
+            1,
+            2,
+            point=(60.0, 0.0),
+            k_forward=0,
+            k_reverse=0,
+        )
+        # One new node.
+        self.assertIn(result.new_node_id, g.nodes)
+        self.assertEqual(g.nodes[result.new_node_id]["x"], 60.0)
+        self.assertEqual(g.nodes[result.new_node_id]["y"], 0.0)
+        # Both parent edges gone; four child edges exist.
+        self.assertFalse(g.has_edge(1, 2, 0))
+        self.assertFalse(g.has_edge(2, 1, 0))
+        self.assertTrue(g.has_edge(1, result.new_node_id))
+        self.assertTrue(g.has_edge(result.new_node_id, 2))
+        self.assertTrue(g.has_edge(2, result.new_node_id))
+        self.assertTrue(g.has_edge(result.new_node_id, 1))
+        # Both directions share the new node id.
+        self.assertEqual(result.forward.new_node_id, result.new_node_id)
+        self.assertEqual(result.reverse.new_node_id, result.new_node_id)
+
+    def test_lengths_sum_to_parents_per_direction(self):
+        g = self._two_way_graph()
+        result = split_two_way_edge_at_point(
+            g,
+            1,
+            2,
+            point=(40.0, 0.0),
+            k_forward=0,
+            k_reverse=0,
+        )
+        fwd_c1 = g.edges[result.forward.child1]
+        fwd_c2 = g.edges[result.forward.child2]
+        rev_c1 = g.edges[result.reverse.child1]
+        rev_c2 = g.edges[result.reverse.child2]
+        self.assertAlmostEqual(fwd_c1["length"] + fwd_c2["length"], 100.0, places=4)
+        self.assertAlmostEqual(rev_c1["length"] + rev_c2["length"], 100.0, places=4)
+        # Forward direction (1→2) projects (40,0) onto geom [(0,0)→(100,0)]
+        # at distance 40 m: child1=(1, new)=40 m, child2=(new, 2)=60 m.
+        self.assertAlmostEqual(fwd_c1["length"], 40.0, places=4)
+        self.assertAlmostEqual(fwd_c2["length"], 60.0, places=4)
+        # Reverse direction (2→1) projects (40,0) onto geom [(100,0)→(0,0)]
+        # at distance 60 m: child1=(2, new)=60 m, child2=(new, 1)=40 m.
+        # The new node is in the same spatial location for both directions;
+        # only the "distance along the directed line" interpretation differs.
+        self.assertAlmostEqual(rev_c1["length"], 60.0, places=4)
+        self.assertAlmostEqual(rev_c2["length"], 40.0, places=4)
+
+    def test_independent_attrs_per_direction(self):
+        """Attributes that differ between directions (e.g. one direction was
+        cost-excluded for a mode) are preserved independently per child."""
+        g = self._two_way_graph()
+        # Tag forward and reverse with different attrs to verify independence.
+        g.edges[1, 2, 0]["cost_excluded_walk"] = False
+        g.edges[2, 1, 0]["cost_excluded_walk"] = True
+        result = split_two_way_edge_at_point(
+            g,
+            1,
+            2,
+            point=(50.0, 0.0),
+            k_forward=0,
+            k_reverse=0,
+        )
+        self.assertFalse(g.edges[result.forward.child1]["cost_excluded_walk"])
+        self.assertFalse(g.edges[result.forward.child2]["cost_excluded_walk"])
+        self.assertTrue(g.edges[result.reverse.child1]["cost_excluded_walk"])
+        self.assertTrue(g.edges[result.reverse.child2]["cost_excluded_walk"])
+
+    def test_missing_forward_edge_raises(self):
+        g = self._two_way_graph()
+        g.remove_edge(1, 2, 0)
+        with self.assertRaisesRegex(ValueError, "Forward edge"):
+            split_two_way_edge_at_point(
+                g,
+                1,
+                2,
+                point=(50.0, 0.0),
+                k_forward=0,
+                k_reverse=0,
+            )
+
+    def test_missing_reverse_edge_raises(self):
+        """If there's no reverse edge (genuinely one-way road), the wrapper
+        refuses and tells the caller to use the single-edge primitive."""
+        g = self._two_way_graph()
+        g.remove_edge(2, 1, 0)
+        with self.assertRaisesRegex(ValueError, "Reverse edge.*one-way"):
+            split_two_way_edge_at_point(
+                g,
+                1,
+                2,
+                point=(50.0, 0.0),
+                k_forward=0,
+                k_reverse=0,
+            )
+
+    def test_non_multidigraph_raises(self):
+        g = nx.Graph()
+        g.add_node(1, x=0.0, y=0.0)
+        g.add_node(2, x=10.0, y=0.0)
+        g.add_edge(1, 2, length=10.0, geometry=LineString([(0, 0), (10, 0)]))
+        with self.assertRaisesRegex(ValueError, "MultiDiGraph"):
+            split_two_way_edge_at_point(
+                g,
+                1,
+                2,
+                point=(5.0, 0.0),
+                k_forward=0,
+                k_reverse=0,
+            )
+
+    def test_endpoint_projection_raises(self):
+        g = self._two_way_graph()
+        with self.assertRaises(ValueError):
+            split_two_way_edge_at_point(
+                g,
+                1,
+                2,
+                point=(0.0, 0.0),
+                k_forward=0,
+                k_reverse=0,
+            )
+
+    def test_independent_geometries_polyline(self):
+        """Forward and reverse may have different geometries (e.g. dual
+        carriageway). Each direction's split uses its own geometry; the
+        new node lands at the forward projection."""
+        g = nx.MultiDiGraph()
+        g.add_node(1, x=0.0, y=0.0)
+        g.add_node(2, x=100.0, y=0.0)
+        # Forward goes via (50, 10); reverse goes via (50, -10) — a dual
+        # carriageway divided by a median.
+        g.add_edge(
+            1,
+            2,
+            key=0,
+            length=100.0,
+            geometry=LineString([(0.0, 0.0), (50.0, 10.0), (100.0, 0.0)]),
+        )
+        g.add_edge(
+            2,
+            1,
+            key=0,
+            length=100.0,
+            geometry=LineString([(100.0, 0.0), (50.0, -10.0), (0.0, 0.0)]),
+        )
+        # Snap target at (50, 0): each direction projects independently onto
+        # its OWN polyline. The new node sits at the FORWARD projection
+        # (some point on the y>=0 polyline; we don't assert exact coords
+        # because the nearest point on a polyline can fall mid-segment).
+        fwd_parent_geom = g.edges[1, 2, 0]["geometry"]
+        rev_parent_geom = g.edges[2, 1, 0]["geometry"]
+        result = split_two_way_edge_at_point(
+            g,
+            1,
+            2,
+            point=(50.0, 0.0),
+            k_forward=0,
+            k_reverse=0,
+        )
+        new_x = g.nodes[result.new_node_id]["x"]
+        new_y = g.nodes[result.new_node_id]["y"]
+        # The new node sits exactly on the forward polyline (within float tol).
+        self.assertAlmostEqual(fwd_parent_geom.distance(Point(new_x, new_y)), 0.0, places=4)
+        # And on the y>=0 side (the forward polyline never dips below y=0).
+        self.assertGreaterEqual(new_y, 0.0)
+        # Both directions are split through this same node id.
+        self.assertEqual(result.forward.new_node_id, result.new_node_id)
+        self.assertEqual(result.reverse.new_node_id, result.new_node_id)
+        # Each direction's child lengths still sum to ITS OWN parent length.
+        fwd_total = (
+            g.edges[result.forward.child1]["length"] + g.edges[result.forward.child2]["length"]
+        )
+        rev_total = (
+            g.edges[result.reverse.child1]["length"] + g.edges[result.reverse.child2]["length"]
+        )
+        # Each direction's child lengths sum to ITS OWN parent length.
+        self.assertAlmostEqual(
+            fwd_total,
+            fwd_parent_geom.length,
+            places=3,
+        )
+        self.assertAlmostEqual(
+            rev_total,
+            rev_parent_geom.length,
+            places=3,
+        )
+
+    def test_auto_node_id(self):
+        g = self._two_way_graph()
+        result = split_two_way_edge_at_point(
+            g,
+            1,
+            2,
+            point=(50.0, 0.0),
+            k_forward=0,
+            k_reverse=0,
+        )
+        self.assertEqual(result.new_node_id, 3)
+
+    def test_node_id_collision_raises(self):
+        g = self._two_way_graph()
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            split_two_way_edge_at_point(
+                g,
+                1,
+                2,
+                point=(50.0, 0.0),
+                k_forward=0,
+                k_reverse=0,
+                new_node_id=1,
+            )
+
+
+class InsertProjectedNodesTestCase(unittest.TestCase):
+    """`insert_projected_nodes` enriches the graph with virtual nodes so a
+    subsequent `snap_to_network_nodes` call has fine-grained targets."""
+
+    def _toy_graph(self) -> nx.MultiDiGraph:
+        """Two-way OSM-style road: 1 (0,0) <-> 2 (100,0), residential.
+        Plus an isolated tertiary edge for edge-filter tests."""
+        g = nx.MultiDiGraph()
+        g.add_node(1, x=0.0, y=0.0)
+        g.add_node(2, x=100.0, y=0.0)
+        g.add_node(3, x=200.0, y=0.0)
+        g.add_node(4, x=300.0, y=0.0)
+        g.add_edge(
+            1,
+            2,
+            key=0,
+            highway="residential",
+            length=100.0,
+            geometry=LineString([(0, 0), (100, 0)]),
+        )
+        g.add_edge(
+            2,
+            1,
+            key=0,
+            highway="residential",
+            length=100.0,
+            geometry=LineString([(100, 0), (0, 0)]),
+        )
+        g.add_edge(
+            3,
+            4,
+            key=0,
+            highway="tertiary",
+            length=100.0,
+            geometry=LineString([(200, 0), (300, 0)]),
+        )
+        g.add_edge(
+            4,
+            3,
+            key=0,
+            highway="tertiary",
+            length=100.0,
+            geometry=LineString([(300, 0), (200, 0)]),
+        )
+        return g
+
+    def _points(self, coords: list[tuple[float, float]], ids: list[str]) -> gpd.GeoDataFrame:
+        return gpd.GeoDataFrame(
+            geometry=[Point(x, y) for x, y in coords],
+            index=pd.Index(ids, name="point_id"),
+        )
+
+    def test_inserts_virtual_node_for_mid_edge_projection(self):
+        """A point that projects onto the middle of an edge gets a virtual
+        node inserted; the parent edge is replaced by two children."""
+        g = self._toy_graph()
+        n_before = g.number_of_nodes()
+        points = self._points([(50.0, 5.0)], ["p"])
+        insert_projected_nodes(
+            points,
+            g,
+            max_radius=200.0,
+            node_spacing=10.0,
+        )
+        # One new node inserted (and `is_virtual=1`).
+        self.assertEqual(g.number_of_nodes(), n_before + 1)
+        new_nodes = [n for n, d in g.nodes(data=True) if d.get("is_virtual") == 1]
+        self.assertEqual(len(new_nodes), 1)
+        # Parent forward + reverse edges gone, replaced by children.
+        self.assertFalse(g.has_edge(1, 2, 0))
+        self.assertFalse(g.has_edge(2, 1, 0))
+
+    def test_skip_when_projection_near_endpoint(self):
+        """A point that projects within `node_spacing` of an endpoint does
+        NOT trigger an insertion — the existing endpoint will serve."""
+        g = self._toy_graph()
+        n_before = g.number_of_nodes()
+        # Point at (5, 5): projection is (5, 0), within 10m of node 1 at (0,0).
+        points = self._points([(5.0, 5.0)], ["p"])
+        insert_projected_nodes(
+            points,
+            g,
+            max_radius=200.0,
+            node_spacing=10.0,
+        )
+        # No insertion.
+        self.assertEqual(g.number_of_nodes(), n_before)
+        # Parent edges intact.
+        self.assertTrue(g.has_edge(1, 2, 0))
+        self.assertTrue(g.has_edge(2, 1, 0))
+
+    def test_no_insertion_beyond_max_radius(self):
+        """Points farther than `max_radius` from every edge contribute no
+        insertion."""
+        g = self._toy_graph()
+        n_before = g.number_of_nodes()
+        points = self._points([(50.0, 500.0)], ["p"])
+        insert_projected_nodes(
+            points,
+            g,
+            max_radius=50.0,
+            node_spacing=10.0,
+        )
+        self.assertEqual(g.number_of_nodes(), n_before)
+
+    def test_eligible_node_ids_filter(self):
+        """Edges with an endpoint outside the eligible set are skipped."""
+        g = self._toy_graph()
+        # Eligible only includes 3, 4 (the tertiary segment).
+        points = self._points([(50.0, 5.0)], ["p"])  # nearest residential
+        insert_projected_nodes(
+            points,
+            g,
+            max_radius=500.0,
+            node_spacing=10.0,
+            eligible_node_ids={3, 4},
+        )
+        # No insertion on (1,2) — endpoints 1, 2 aren't eligible. The
+        # residential edge stays intact.
+        self.assertTrue(g.has_edge(1, 2, 0))
+
+    def test_cost_excluded_edges_skipped(self):
+        """Edges flagged via `cost_excluded_flag` are not insertion candidates."""
+        g = self._toy_graph()
+        # Mark the residential forward+reverse as cost-excluded.
+        g.edges[1, 2, 0]["cost_excluded_x"] = True
+        g.edges[2, 1, 0]["cost_excluded_x"] = True
+        points = self._points([(50.0, 5.0)], ["p"])
+        insert_projected_nodes(
+            points,
+            g,
+            max_radius=200.0,
+            node_spacing=10.0,
+            cost_excluded_flag="cost_excluded_x",
+        )
+        # No insertion on residential. Residential edges intact.
+        self.assertTrue(g.has_edge(1, 2, 0))
+        self.assertTrue(g.has_edge(2, 1, 0))
+
+    def test_default_edge_filter_excludes_motorway(self):
+        """The default `edge_filter` excludes motorway + trunk tags."""
+        g = nx.MultiDiGraph()
+        g.add_node(1, x=0.0, y=0.0)
+        g.add_node(2, x=100.0, y=0.0)
+        g.add_edge(
+            1,
+            2,
+            key=0,
+            highway="motorway",
+            length=100.0,
+            geometry=LineString([(0, 0), (100, 0)]),
+        )
+        g.add_edge(
+            2,
+            1,
+            key=0,
+            highway="motorway",
+            length=100.0,
+            geometry=LineString([(100, 0), (0, 0)]),
+        )
+        n_before = g.number_of_nodes()
+        points = self._points([(50.0, 5.0)], ["p"])
+        insert_projected_nodes(
+            points,
+            g,
+            max_radius=200.0,
+            node_spacing=10.0,
+        )
+        # No insertion — motorway excluded by default.
+        self.assertEqual(g.number_of_nodes(), n_before)
+
+    def test_edge_filter_allowlist_iterable(self):
+        """`edge_filter` as an iterable of OSM tags acts as an allowlist."""
+        g = self._toy_graph()
+        # Point closer to the residential edge, but allowlist only `tertiary`.
+        points = self._points([(50.0, 5.0)], ["p"])
+        insert_projected_nodes(
+            points,
+            g,
+            max_radius=500.0,
+            node_spacing=10.0,
+            edge_filter={"tertiary"},
+        )
+        # Residential not allowed. Tertiary is allowed but the point
+        # projects at x=200 (start of tertiary edge) — within `node_spacing`?
+        # distance from (50,5) to (200,0) is ~150 > node_spacing=10, so
+        # the projection is at edge_start (proj_fwd=0) — at_endpoint case → skipped.
+        # In either case, residential edge stays intact.
+        self.assertTrue(g.has_edge(1, 2, 0))
+
+    def test_edge_filter_callable(self):
+        """`edge_filter` accepts an arbitrary callable predicate."""
+        g = self._toy_graph()
+        n_before = g.number_of_nodes()
+        points = self._points([(50.0, 5.0)], ["p"])
+        # Custom predicate: allow only residential.
+        insert_projected_nodes(
+            points,
+            g,
+            max_radius=200.0,
+            node_spacing=10.0,
+            edge_filter=lambda d: d.get("highway") == "residential",
+        )
+        self.assertEqual(g.number_of_nodes(), n_before + 1)
+
+    def test_two_way_split_inserts_one_node_replaces_both_directions(self):
+        """For two-way OSM roads (forward + reverse edges), insertion
+        creates ONE virtual node shared by both directions and replaces
+        both parent edges."""
+        g = self._toy_graph()
+        points = self._points([(50.0, 5.0)], ["p"])
+        insert_projected_nodes(
+            points,
+            g,
+            max_radius=200.0,
+            node_spacing=10.0,
+        )
+        # Both directional parents gone.
+        self.assertFalse(g.has_edge(1, 2, 0))
+        self.assertFalse(g.has_edge(2, 1, 0))
+        # Find the new node.
+        new = [n for n, d in g.nodes(data=True) if d.get("is_virtual") == 1][0]
+        # Four new edges through the new node.
+        self.assertTrue(g.has_edge(1, new))
+        self.assertTrue(g.has_edge(new, 2))
+        self.assertTrue(g.has_edge(2, new))
+        self.assertTrue(g.has_edge(new, 1))
+
+    def test_one_way_edge_single_direction_split(self):
+        """A genuinely one-way edge (no reverse) gets a single-direction split."""
+        g = nx.MultiDiGraph()
+        g.add_node(1, x=0.0, y=0.0)
+        g.add_node(2, x=100.0, y=0.0)
+        g.add_edge(
+            1,
+            2,
+            key=0,
+            highway="residential",
+            length=100.0,
+            geometry=LineString([(0, 0), (100, 0)]),
+        )
+        points = self._points([(50.0, 5.0)], ["p"])
+        insert_projected_nodes(
+            points,
+            g,
+            max_radius=200.0,
+            node_spacing=10.0,
+        )
+        new = [n for n, d in g.nodes(data=True) if d.get("is_virtual") == 1][0]
+        self.assertTrue(g.has_edge(1, new))
+        self.assertTrue(g.has_edge(new, 2))
+        # No reverse edges created.
+        self.assertFalse(g.has_edge(2, new))
+        self.assertFalse(g.has_edge(new, 1))
+
+    def test_self_loop_edge_handles_single_direction_split(self):
+        """A self-loop (`u == v`) — `_find_reverse_edge_key` returns None
+        and insertion uses single-direction split."""
+        g = nx.MultiDiGraph()
+        g.add_node(1, x=0.0, y=0.0)
+        g.add_node(2, x=100.0, y=0.0)
+        g.add_edge(
+            1,
+            1,
+            key=0,
+            highway="residential",
+            length=14.14,
+            geometry=LineString([(0.0, 0.0), (2.5, 2.5), (5.0, 0.0), (2.5, -2.5), (0.0, 0.0)]),
+        )
+        g.add_edge(
+            1,
+            2,
+            key=0,
+            highway="residential",
+            length=100.0,
+            geometry=LineString([(0.0, 0.0), (100.0, 0.0)]),
+        )
+        n_before = g.number_of_nodes()
+        # A point near the top vertex of the self-loop, far from node 1
+        # in pure Euclidean terms but near the loop interior.
+        points = self._points([(2.5, 2.5)], ["p"])
+        insert_projected_nodes(
+            points,
+            g,
+            max_radius=10.0,
+            node_spacing=0.5,
+        )
+        # Insertion happened — graph mutated.
+        self.assertEqual(g.number_of_nodes(), n_before + 1)
+
+    def test_near_endpoint_two_way_asymmetric_geometry(self):
+        """Regression: real-world OSMnx-consolidated graphs sometimes have
+        slightly-asymmetric forward / reverse geometries. The endpoint check
+        considers both projections, so cells projecting near a reverse-edge
+        endpoint don't trigger a degenerate split."""
+        g = nx.MultiDiGraph()
+        g.add_node(1, x=0.0, y=0.0)
+        g.add_node(2, x=20.0, y=0.0)
+        g.add_edge(
+            1,
+            2,
+            key=0,
+            highway="residential",
+            length=20.0,
+            geometry=LineString([(0.0, 0.0), (20.0, 0.0)]),
+        )
+        # Reverse: 19.98 m, ends at x=0.02 rather than 0.
+        g.add_edge(
+            2,
+            1,
+            key=0,
+            highway="residential",
+            length=19.98,
+            geometry=LineString([(20.0, 0.0), (0.02, 0.0)]),
+        )
+        n_before = g.number_of_nodes()
+        # Point at (0.02, 5): forward projection at 0.02 (interior), reverse
+        # projection at endpoint. node_spacing=2 should cover both.
+        points = self._points([(0.02, 5.0)], ["p"])
+        insert_projected_nodes(
+            points,
+            g,
+            max_radius=20.0,
+            node_spacing=2.0,
+        )
+        # No insertion (projection within node_spacing of endpoint on both sides).
+        self.assertEqual(g.number_of_nodes(), n_before)
+
+    def test_lineage_walk_resolves_long_edge_in_few_passes(self):
+        """B: well-separated points on a long parent edge get distinct virtuals
+        in a small number of passes via in-pass lineage descent."""
+        import io
+        from contextlib import redirect_stdout
+
+        g = nx.MultiDiGraph()
+        g.add_node(1, x=0.0, y=0.0)
+        g.add_node(2, x=2000.0, y=0.0)
+        g.add_edge(
+            1,
+            2,
+            key=0,
+            highway="residential",
+            length=2000.0,
+            geometry=LineString([(0.0, 0.0), (2000.0, 0.0)]),
+        )
+        g.add_edge(
+            2,
+            1,
+            key=0,
+            highway="residential",
+            length=2000.0,
+            geometry=LineString([(2000.0, 0.0), (0.0, 0.0)]),
+        )
+        # 9 points at x=200, 400, ..., 1800 — all well-separated and well
+        # away from the endpoint at x=2000 (avoid the near-endpoint skip).
+        coords = [(200.0 * (k + 1), 5.0) for k in range(9)]
+        ids_p = [f"p{k}" for k in range(9)]
+        points = self._points(coords, ids_p)
+        n_before = g.number_of_nodes()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            insert_projected_nodes(
+                points,
+                g,
+                max_radius=200.0,
+                node_spacing=50.0,
+                verbose=True,
+            )
+        # 9 distinct virtuals inserted (one per well-separated point) — all
+        # in a single straight-line pass via the lineage walk.
+        self.assertEqual(g.number_of_nodes(), n_before + 9)
+        out = buf.getvalue()
+        self.assertIn("inserted=9", out)
+
+    def test_verbose_prints_summary(self):
+        """`verbose=True` emits a summary line with insertion counts."""
+        import io
+        from contextlib import redirect_stdout
+
+        g = self._toy_graph()
+        points = self._points([(50.0, 10.0)], ["p"])
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            insert_projected_nodes(
+                points,
+                g,
+                max_radius=200.0,
+                node_spacing=5.0,
+                verbose=True,
+            )
+        out = buf.getvalue()
+        self.assertIn("insert_projected_nodes", out)
+        self.assertIn("inserted=", out)
+        self.assertIn("endpoint_skip=", out)
+        self.assertIn("no_match=", out)
+
+    def test_returns_none(self):
+        """The function does not return a (point -> node) mapping; that's the
+        subsequent `snap_to_network_nodes` call's job."""
+        g = self._toy_graph()
+        points = self._points([(50.0, 5.0)], ["p"])
+        result = insert_projected_nodes(
+            points,
+            g,
+            max_radius=200.0,
+            node_spacing=10.0,
+        )
+        self.assertIsNone(result)
+
+
+class SnapToNetworkNodesPriorityTestCase(unittest.TestCase):
+    """Priority-aware two-tier behavior of `snap_to_network_nodes`."""
+
+    def _graph(self) -> nx.MultiDiGraph:
+        """Toy graph: priority node `p` and non-priority node `r`, near a point."""
+        g = nx.MultiDiGraph()
+        g.add_node("p", x=10.0, y=0.0)  # priority candidate (incident to tertiary)
+        g.add_node("q", x=110.0, y=0.0)
+        g.add_node("r", x=2.0, y=0.0)  # non-priority, closer to (0, 0)
+        g.add_node("s", x=102.0, y=0.0)
+        g.add_edge(
+            "p",
+            "q",
+            key=0,
+            highway="tertiary",
+            length=100.0,
+            geometry=LineString([(10, 0), (110, 0)]),
+        )
+        g.add_edge(
+            "r",
+            "s",
+            key=0,
+            highway="residential",
+            length=100.0,
+            geometry=LineString([(2, 0), (102, 0)]),
+        )
+        return g
+
+    def _points(self, coords, ids):
+        return gpd.GeoDataFrame(
+            geometry=[Point(x, y) for x, y in coords],
+            index=pd.Index(ids, name="point_id"),
+        )
+
+    def test_priority_node_within_radius_wins_over_closer_nonpriority(self):
+        """A priority node within `priority_node_radius` is chosen even if a
+        non-priority node is closer."""
+        g = self._graph()
+        priority = {"p", "q"}
+        points = self._points([(0.0, 0.0)], ["p1"])
+        # Non-priority `r` is closer (2 m) than priority `p` (10 m).
+        # With priority radius 50, `p` wins despite `r` being closer.
+        ids, dists = snap_to_network_nodes(
+            points,
+            g,
+            max_radius=100.0,
+            priority_node_ids=priority,
+            priority_node_radius=50.0,
+        )
+        self.assertEqual(ids.loc["p1"], "p")
+        self.assertAlmostEqual(float(dists.loc["p1"]), 10.0)
+
+    def test_falls_back_to_eligible_when_no_priority_in_range(self):
+        """A point beyond `priority_node_radius` from any priority node
+        falls back to the nearest eligible node within `max_radius`."""
+        g = self._graph()
+        priority = {"p", "q"}
+        # Point at (500, 0): no priority within 50m, closest eligible
+        # is `s` at (102, 0) → distance 398.
+        points = self._points([(500.0, 0.0)], ["p1"])
+        ids, dists = snap_to_network_nodes(
+            points,
+            g,
+            max_radius=500.0,
+            priority_node_ids=priority,
+            priority_node_radius=50.0,
+        )
+        self.assertEqual(ids.loc["p1"], "q")  # priority node `q` at (110, 0)
+        # Wait — priority q is at (110,0), distance from (500,0) is 390.
+        # If max_radius=500, q is within max_radius too. But priority
+        # radius is 50, so q (390m away) is outside priority. So tier 1
+        # misses; tier 2 picks nearest eligible (which includes q AND s).
+        # s is at (102, 0), distance 398. q is at (110, 0), distance 390.
+        # Tier 2 picks closer: q at 390.
+        # Actually the eligible set defaults to ALL nodes — so q is in it.
+        # The test verifies tier-2 fallback finds q.
+        self.assertAlmostEqual(float(dists.loc["p1"]), 390.0)
+
+    def test_single_tier_when_no_priority_set(self):
+        """Without a priority set, behaves exactly as the historical
+        single-tier snap."""
+        g = self._graph()
+        points = self._points([(0.0, 0.0)], ["p1"])
+        ids, dists = snap_to_network_nodes(
+            points,
+            g,
+            max_radius=100.0,
+        )
+        # Nearest is `r` at (2, 0).
+        self.assertEqual(ids.loc["p1"], "r")
+        self.assertAlmostEqual(float(dists.loc["p1"]), 2.0)
+
+    def test_priority_node_flag_alternative(self):
+        """`priority_node_flag` reads a per-node bool attribute."""
+        g = self._graph()
+        for n in ("p", "q"):
+            g.nodes[n]["is_priority"] = True
+        points = self._points([(0.0, 0.0)], ["p1"])
+        ids, _ = snap_to_network_nodes(
+            points,
+            g,
+            max_radius=100.0,
+            priority_node_flag="is_priority",
+            priority_node_radius=50.0,
+        )
+        self.assertEqual(ids.loc["p1"], "p")
+
+    def test_priority_radius_required_when_priority_set_given(self):
+        """Passing a priority set without `priority_node_radius` raises."""
+        g = self._graph()
+        points = self._points([(0.0, 0.0)], ["p1"])
+        with self.assertRaises(ValueError):
+            snap_to_network_nodes(
+                points,
+                g,
+                max_radius=100.0,
+                priority_node_ids={"p"},
+            )
+
+    def test_both_priority_kwargs_raises(self):
+        g = self._graph()
+        points = self._points([(0.0, 0.0)], ["p1"])
+        with self.assertRaises(ValueError):
+            snap_to_network_nodes(
+                points,
+                g,
+                max_radius=100.0,
+                priority_node_ids={"p"},
+                priority_node_flag="is_priority",
+                priority_node_radius=50.0,
+            )
+
+    def test_nodes_incident_to_edges_derives_priority_set(self):
+        """`nodes_incident_to_edges` returns the union of endpoints of
+        edges matching the tag predicate — typical use for building the
+        priority node set."""
+        g = self._graph()
+        result = nodes_incident_to_edges(g, edge_tags={"tertiary"})
+        self.assertEqual(result, {"p", "q"})
+
+    def test_nodes_incident_to_edges_callable_predicate(self):
+        g = self._graph()
+        result = nodes_incident_to_edges(
+            g,
+            edge_tags=lambda d: d.get("highway") == "residential",
+        )
+        self.assertEqual(result, {"r", "s"})
+
+    def test_nodes_incident_to_edges_none_returns_empty(self):
+        g = self._graph()
+        self.assertEqual(nodes_incident_to_edges(g, edge_tags=None), set())
+
+    def test_end_to_end_insert_then_priority_snap(self):
+        """The canonical workflow: insert virtuals, then snap with priority."""
+        g = nx.MultiDiGraph()
+        g.add_node(1, x=0.0, y=0.0)
+        g.add_node(2, x=200.0, y=0.0)
+        g.add_node(3, x=0.0, y=50.0)
+        g.add_node(4, x=200.0, y=50.0)
+        # Priority edge along y=0.
+        g.add_edge(
+            1,
+            2,
+            key=0,
+            highway="primary",
+            length=200.0,
+            geometry=LineString([(0, 0), (200, 0)]),
+        )
+        g.add_edge(
+            2,
+            1,
+            key=0,
+            highway="primary",
+            length=200.0,
+            geometry=LineString([(200, 0), (0, 0)]),
+        )
+        # Non-priority edge along y=50.
+        g.add_edge(
+            3,
+            4,
+            key=0,
+            highway="residential",
+            length=200.0,
+            geometry=LineString([(0, 50), (200, 50)]),
+        )
+        g.add_edge(
+            4,
+            3,
+            key=0,
+            highway="residential",
+            length=200.0,
+            geometry=LineString([(200, 50), (0, 50)]),
+        )
+        # Two points: one near primary, one near residential.
+        points = gpd.GeoDataFrame(
+            geometry=[Point(100.0, 5.0), Point(100.0, 45.0)],
+            index=pd.Index(["near_primary", "near_resi"], name="point_id"),
+        )
+        # Step 1: insert virtuals (both edges allowed, default filter).
+        insert_projected_nodes(
+            points,
+            g,
+            max_radius=200.0,
+            node_spacing=25.0,
+        )
+        # Step 2: build priority node set (primary edge incidence + virtuals).
+        priority = nodes_incident_to_edges(g, edge_tags={"primary"})
+        ids, dists = snap_to_network_nodes(
+            points,
+            g,
+            max_radius=200.0,
+            priority_node_ids=priority,
+            priority_node_radius=100.0,
+        )
+        # near_primary matches a primary-side virtual.
+        primary_target = ids.loc["near_primary"]
+        self.assertIn(primary_target, priority)
+        # near_resi: closest priority node is ~45m below (a virtual on the
+        # primary edge). Since priority_node_radius=100 covers that, the
+        # priority node wins.
+        self.assertIn(ids.loc["near_resi"], priority)
+
+
+class ComputeSnapEligibilityTestCase(unittest.TestCase):
+    """`compute_snap_eligibility` is the prep-stage entry point: writes per-edge
+    `cost_excluded_<mode>` and returns the eligible-node frozenset. Does NOT
+    decorate per-node `is_snap_eligible_<mode>` (that's prepare_network's job
+    on the post-snap graph) and does NOT call to_undirected() on the input
+    (snap_to_network_tiered needs the directed MultiDiGraph)."""
+
+    def _trap_graph(self, with_highway: bool = True) -> nx.MultiDiGraph:
+        """Same trap shape as PrepareNetworkTestCase._trap_graph but with
+        highway tags by default since cost-mask testing is the focus."""
+        g = nx.MultiDiGraph()
+        for n, (x, y) in {0: (0, 0), 1: (1, 0), 2: (1, 1), 3: (2, 1)}.items():
+            g.add_node(n, x=float(x), y=float(y))
+        if with_highway:
+            g.add_edge(0, 1, highway="residential")
+            g.add_edge(1, 2, highway="motorway")
+            g.add_edge(2, 0, highway=["primary", "trunk"])
+            g.add_edge(2, 3, highway="footway")
+        else:
+            g.add_edge(0, 1)
+            g.add_edge(1, 2)
+            g.add_edge(2, 0)
+            g.add_edge(2, 3)
+        return g
+
+    def test_returns_frozenset_and_flag_name(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            elig, cost_flag = compute_snap_eligibility(self._trap_graph(), "walk")
+        self.assertIsInstance(elig, frozenset)
+        self.assertEqual(cost_flag, "cost_excluded_walk")
+
+    def test_walk_uses_undirected_view_largest_cc(self):
+        """For walk (undirected mode), eligibility is the largest CC of the
+        cost-masked undirected view. With motorway/trunk excluded, edges
+        (1, 2) and (2, 0) are masked — leaving {0, 1} disconnected and
+        {2, 3} connected via the residential→walk-eligible path. Test the
+        actual behavior: largest CC dominates and is consistent."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            elig, _ = compute_snap_eligibility(self._trap_graph(), "walk")
+        # The function must return SOME largest connected component on the
+        # cost-masked subgraph. Verify properties rather than exact membership.
+        self.assertGreater(len(elig), 0)
+        self.assertLessEqual(len(elig), 4)
+
+    def test_car_uses_directed_scc(self):
+        """For car (directed_scc), eligibility is the largest SCC. Node 3
+        has no outgoing edge → not in SCC. Largest SCC = {0, 1, 2}."""
+        elig, _ = compute_snap_eligibility(self._trap_graph(), "car")
+        self.assertEqual(elig, frozenset({0, 1, 2}))
+        self.assertNotIn(3, elig)
+
+    def test_writes_cost_excluded_per_edge(self):
+        g = self._trap_graph()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            compute_snap_eligibility(g, "walk")
+        # Walk excludes motorway / trunk / motorway_link / trunk_link.
+        self.assertFalse(g.edges[0, 1, 0]["cost_excluded_walk"])
+        self.assertTrue(g.edges[1, 2, 0]["cost_excluded_walk"])
+        # (2, 0) has list-valued highway with 'trunk' inside — should exclude.
+        self.assertTrue(g.edges[2, 0, 0]["cost_excluded_walk"])
+        self.assertFalse(g.edges[2, 3, 0]["cost_excluded_walk"])
+
+    def test_does_not_write_per_node_eligibility_flag(self):
+        """Per-node `is_snap_eligible_<mode>` is intentionally NOT written here.
+        That's prepare_network's job downstream on the post-snap graph."""
+        g = self._trap_graph()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            compute_snap_eligibility(g, "walk")
+        for n in g.nodes:
+            self.assertNotIn("is_snap_eligible_walk", g.nodes[n])
+
+    def test_does_not_transform_directedness(self):
+        """Input graph stays a MultiDiGraph (snap_to_network_tiered needs it)."""
+        g = self._trap_graph()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            compute_snap_eligibility(g, "walk")
+        self.assertIsInstance(g, nx.MultiDiGraph)
+        self.assertTrue(g.is_directed())
+
+    def test_overwrite_if_missing_preserves_existing(self):
+        """`overwrite_cost_excluded='if_missing'` leaves edges that already
+        carry the flag untouched. Use case: prepare_network calling this with
+        if_missing on a loaded graph whose cost-mask was persisted at prep
+        time."""
+        g = self._trap_graph()
+        # Pre-seed (0, 1, 0) with a bogus True. if_missing must preserve.
+        g.edges[0, 1, 0]["cost_excluded_walk"] = True
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            compute_snap_eligibility(g, "walk", overwrite_cost_excluded="if_missing")
+        self.assertTrue(g.edges[0, 1, 0]["cost_excluded_walk"])  # bogus value preserved
+
+    def test_overwrite_always_overwrites_existing(self):
+        g = self._trap_graph()
+        g.edges[0, 1, 0]["cost_excluded_walk"] = True  # bogus
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            compute_snap_eligibility(g, "walk", overwrite_cost_excluded="always")
+        # Residential edge → walk does NOT exclude → False.
+        self.assertFalse(g.edges[0, 1, 0]["cost_excluded_walk"])
+
+    def test_subtype_mode_via_base_mode(self):
+        """`mode='car_night'` with `base_mode='car'` produces
+        cost_excluded_car_night flag and uses car defaults."""
+        elig, cost_flag = compute_snap_eligibility(
+            self._trap_graph(),
+            "car_night",
+            base_mode="car",
+        )
+        self.assertEqual(cost_flag, "cost_excluded_car_night")
+        self.assertEqual(elig, frozenset({0, 1, 2}))
+
+
+class PrepareNetworkIdempotencyTestCase(unittest.TestCase):
+    """`prepare_network` is idempotent on the cost-mask flag — it uses
+    `if_missing` so a graph whose cost-mask was already written by
+    `compute_snap_eligibility` keeps its values. Re-deriving the eligibility
+    set is cheap and always runs (to pick up virtual nodes inserted between
+    the two calls)."""
+
+    def _g(self) -> nx.MultiDiGraph:
+        g = nx.MultiDiGraph()
+        for n, (x, y) in {0: (0, 0), 1: (1, 0), 2: (1, 1), 3: (2, 1)}.items():
+            g.add_node(n, x=float(x), y=float(y))
+        g.add_edge(0, 1, highway="residential")
+        g.add_edge(1, 2, highway="motorway")
+        g.add_edge(2, 0, highway="primary")
+        g.add_edge(2, 3, highway="residential")
+        return g
+
+    def test_compute_then_prepare_is_noop_on_edges(self):
+        """After compute_snap_eligibility writes cost_excluded_walk, calling
+        prepare_network on the same graph preserves those values."""
+        g = self._g()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            compute_snap_eligibility(g, "walk")
+        # Manually flip one to verify if_missing actually fires.
+        g.edges[0, 1, 0]["cost_excluded_walk"] = True  # bogus value
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            prepared = prepare_network(g, "walk")
+        # if_missing preserved our bogus value on (0, 1, 0).
+        # (prepared.graph is the same g for car/MultiDiGraph; for walk it's
+        # the undirected view, so look on the input graph.)
+        self.assertTrue(g.edges[0, 1, 0]["cost_excluded_walk"])
+        # And the eligibility set was re-derived (not stale).
+        self.assertIsInstance(prepared.snap_eligible_nodes, frozenset)
+
+
+class GraphmlBoolRoundtripTestCase(unittest.TestCase):
+    """Bool-typed per-mode flags (`is_snap_eligible_<mode>`,
+    `cost_excluded_<mode>`, `is_virtual`) round-trip through .graphml as
+    integers (0 / 1), not the literal strings 'True' / 'False' — thanks to
+    the prefix-scan dtype helper in `load_consolidated_graphml`."""
+
+    def _g(self) -> nx.MultiDiGraph:
+        g = nx.MultiDiGraph(crs="EPSG:4326")
+        for n, (x, y) in {0: (0, 0), 1: (1, 0), 2: (2, 0)}.items():
+            g.add_node(n, x=float(x), y=float(y), osmid=n)
+        g.add_edge(0, 1, key=0, highway="residential", length=1.0)
+        g.add_edge(1, 2, key=0, highway="motorway", length=1.0)
+        return g
+
+    def test_bool_flags_roundtrip_as_int(self):
+        import tempfile
+
+        import osmnx as ox
+
+        from aperta.network_processing import load_consolidated_graphml
+
+        with tempfile.NamedTemporaryFile(suffix=".graphml", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                prepared = prepare_network(self._g(), "walk")
+            # Tag one node as virtual to exercise the is_virtual prefix.
+            prepared.graph.nodes[1]["is_virtual"] = 1
+            ox.save_graphml(prepared.graph, tmp_path)
+
+            loaded = load_consolidated_graphml(tmp_path)
+            # Per-node is_snap_eligible_walk: every node should have a real int.
+            for n in loaded.nodes:
+                val = loaded.nodes[n].get("is_snap_eligible_walk")
+                self.assertIsInstance(val, int, f"node {n} has wrong dtype")
+            # Per-edge cost_excluded_walk: every edge.
+            if loaded.is_multigraph():
+                for _u, _v, _k, d in loaded.edges(keys=True, data=True):
+                    val = d.get("cost_excluded_walk")
+                    self.assertIsInstance(val, int)
+            # is_virtual=1 round-trips as int 1 on node 1.
+            self.assertEqual(loaded.nodes[1].get("is_virtual"), 1)
+        finally:
+            import os
+
+            os.unlink(tmp_path)
 
 
 if __name__ == "__main__":

@@ -210,9 +210,15 @@ plt.show()
 
 # %%
 # Each network is saved in two forms:
-#   - `<name>_raw.graphml`  — exactly what OSMnx returned (after simplify=True).
-#   - `<name>.graphml`      — after `consolidate_intersections` (the primary
-#                              output read by downstream notebooks).
+#   - `<name>_raw.graphml`          — exactly what OSMnx returned (after simplify=True).
+#   - `<name>_consolidated.graphml` — after `consolidate_intersections`. This
+#                                     is the primary output read by step 3
+#                                     (unit mapping), which writes its snap-
+#                                     mutated result back to `<name>.graphml`
+#                                     for downstream notebooks. Keeping the
+#                                     consolidated form on a distinct path
+#                                     means step 3 can be re-run repeatably
+#                                     against a pristine pre-snap baseline.
 # The raw form is kept so the before/after comparison plot at the end of this
 # section is reproducible on re-runs (cached cleanly), and so future
 # experiments with different consolidation tolerances don't require re-fetch.
@@ -298,7 +304,7 @@ print(f"Obstacles extracted from raw car graph: "
 
 graphs: dict[str, 'ox.graph'] = {}
 for mode, osm_type, name_stem in MODES:
-    cons_path = PREPARED_DIR / f'{name_stem}.graphml'
+    cons_path = PREPARED_DIR / f'{name_stem}_consolidated.graphml'
     if cons_path.exists():
         print(f"{mode} consolidated network cached at {cons_path} — loading.")
         # `load_consolidated_graphml` (not `ox.load_graphml`) so aperta's
@@ -366,7 +372,7 @@ HWY_SPEEDS = {
     'busway': 30,
 }
 ox.add_edge_speeds(car_graph, hwy_speeds=HWY_SPEEDS)
-ox.save_graphml(car_graph, PREPARED_DIR / 'car_graph.graphml')
+ox.save_graphml(car_graph, PREPARED_DIR / 'car_graph_consolidated.graphml')
 car_speeds = np.array([float(d['speed_kph'])
                        for _, _, d in car_graph.edges(data=True)])
 print(f"Car edge speeds applied. Median {np.median(car_speeds):.0f} km/h, "

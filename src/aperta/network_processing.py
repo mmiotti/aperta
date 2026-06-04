@@ -1,18 +1,20 @@
-"""Graph-construction and -manipulation helpers for transport networks.
+"""Graph-construction and -annotation helpers for transport networks (OSM-flavoured).
 
 Aperta operates on `networkx.Graph` (and its multi/directed variants) as its
-canonical graph type. This module supplies the operations on those graphs
-that don't fit under `routing` (shortest-path queries) or `osm_helpers`
-(OSM-specific download / parsing):
+canonical graph type. This module supplies the operations that take a raw
+(typically OSMnx) graph and produce a richly-annotated one ready for
+downstream snap / route work:
 
 - **Intersection consolidation**: `consolidate_intersections` wraps
   `osmnx.consolidate_intersections` but preserves intersection-attribute
   nodes (traffic signals, stop signs, roundabouts) that the OSMnx default
   drops, which matters for any route-level analysis that counts those
-  features (Section §3.3 of the toolkit paper).
-- **Node snapping**: `snap_to_network_nodes` and `assign_to_eligible_centroid`
-  map non-graph points (cell centroids, addresses) onto the nearest graph
-  node, with optional filtering to a subset of eligible nodes.
+  features (Section §3.3 of the toolkit paper). Calls
+  `flag_node_intersection_topology` and `flag_node_osm_classification` as
+  post-processing.
+- **Highway-class machinery**: `OSM_HIGHWAY_RANKS`,
+  `collapse_osm_highway_lists_by_rank`, `lanes_per_direction`, the per-node
+  topology / OSM-classification flag functions.
 - **Edge / node attribute helpers**: aggregate node attributes onto edges
   (`aggregate_nodes_to_edges`), aggregate edge attributes onto nodes
   (`aggregate_edges_to_nodes`), and write attribute values through to a
@@ -20,25 +22,58 @@ that don't fit under `routing` (shortest-path queries) or `osm_helpers`
 - **Edge betweenness sampling**: `get_nested_edge_betweenness` runs the
   per-origin Dijkstra + path-walking accumulator used by the traffic-flow
   estimation pipeline in `traffic_flows.py`.
-- **Mode-aware graph preparation**: `prepare_network` resolves per-mode
-  defaults (directedness, network type, cost-excluded tags), applies
-  `to_undirected()` where appropriate, and precomputes the largest
-  connected (or strongly-connected) component as a snap-eligible node set.
-  This avoids the trapped-node problem where consolidation isolates short
-  one-way segments from which routing cannot escape.
+- **Graphml round-trip**: `load_consolidated_graphml` with the dtype maps
+  that preserve custom integer flags through `.graphml` serialization.
+
+Sibling modules cover the workflow steps that consume this module's output:
+
+- `aperta.network_snap` — snap-target resolution: `snap_to_network_nodes`,
+  `insert_projected_nodes`, `nodes_incident_to_edges`, `transport_centroid`,
+  `split_edge_at_point`, `split_two_way_edge_at_point`. Re-exported below
+  for back-compat.
+- `aperta.routing_prep` — mode-aware preparation: `prepare_network`,
+  `compute_snap_eligibility`, `PreparedGraph`, `MODE_DEFAULTS`.
+  Re-exported below for back-compat.
+
+New code should import directly from `aperta.network_snap` /
+`aperta.routing_prep`; the re-exports here exist so existing callsites
+(`from aperta.network_processing import prepare_network` etc.) keep working
+without churn.
 """
 
-import warnings
 from collections import defaultdict
-from dataclasses import dataclass
-from typing import Callable, Iterable, Literal, cast
+from typing import Callable, Literal, cast
 
-import geopandas as gpd
 import networkx as nx
 import numpy as np
 import pandas as pd
 
 from aperta.errors import DataError
+
+# Back-compat re-exports — snap mechanics and routing prep moved to dedicated
+# modules to keep this file under the size limit. Keep these here so existing
+# `from aperta.network_processing import …` callsites and `import
+# aperta.network_processing as np` namespace aliases continue to work
+# unchanged. New code should import from `aperta.network_snap` and
+# `aperta.routing_prep` directly.
+from aperta.network_snap import (  # noqa: F401  (re-export)
+    SplitEdgeResult,
+    SplitTwoWayEdgeResult,
+    insert_projected_nodes,
+    nodes_incident_to_edges,
+    snap_to_network_nodes,
+    split_edge_at_point,
+    split_two_way_edge_at_point,
+    transport_centroid,
+)
+from aperta.routing_prep import (  # noqa: F401  (re-export)
+    MODE_DEFAULTS,
+    BaseMode,
+    Directedness,
+    PreparedGraph,
+    compute_snap_eligibility,
+    prepare_network,
+)
 
 # OSM highway-type ranking used by `collapse_osm_highway_lists_by_rank` and
 # `flag_node_osm_classification` (for max/min per-node highway rank). Higher
@@ -307,7 +342,7 @@ def _mean_numeric(values: list):
 # but the merged edge has a single geometry whose actual length is
 # *smaller* than that sum (parallel paths collapse to one). We recompute
 # `length` from `geometry.length` post-consolidation in metric units.
-DEFAULT_EDGE_ATTR_AGGS = {
+_DEFAULT_EDGE_ATTR_AGGS = {
     "lanes": _mean_numeric,
     "maxspeed": _mean_numeric,
 }
@@ -359,7 +394,7 @@ def lanes_per_direction(edge_data: dict) -> float:
 # (callers can override). `name` is the main offender: it lists across
 # merged edges, costs disk space in `.graphml`, and isn't used anywhere
 # in aperta.
-DEFAULT_DROP_EDGE_ATTRS = ["name"]
+_DEFAULT_DROP_EDGE_ATTRS = ["name"]
 
 
 def _int_via_float(value) -> int:
@@ -373,6 +408,26 @@ def _int_via_float(value) -> int:
     return int(float(value))
 
 
+def _int_via_bool_or_float(value) -> int:
+    """Tolerant graphml-cast for attrs that may have been written as Python
+    `bool` (round-trips as `'True'` / `'False'` strings) or as `int` (`'0'`,
+    `'1'`, `'0.0'`, `'1.0'`).
+
+    Used by the prefix-scan dtype map for the per-mode flags
+    (`is_snap_eligible_<mode>`, `cost_excluded_<mode>`) — `prepare_network`
+    writes them as Python `bool` so they stringify as `'True'`/`'False'`,
+    while `insert_projected_nodes` writes `is_virtual=1` (int) which
+    stringifies as `'1'`. Both must come back as `0` / `1`.
+    """
+    if isinstance(value, (bool, int)):
+        return int(value)
+    if value in ("True", "true"):
+        return 1
+    if value in ("False", "false"):
+        return 0
+    return int(float(value))
+
+
 # Per-node attribute dtypes that `consolidate_intersections` writes as
 # ints. OSMnx's own `default_node_dtypes` only knows about its built-in
 # attrs (elevation, x, y, osmid, street_count, lat, lon), so without this
@@ -382,7 +437,7 @@ def _int_via_float(value) -> int:
 # so int round-trips cleanly (`'0'` / `'1'`) and `is_roundabout == 1`
 # works as written. Pass to `ox.load_graphml` via the `node_dtypes`
 # kwarg, or use `load_consolidated_graphml` below.
-CONSOLIDATED_NODE_DTYPES: dict[str, Callable] = {
+_CONSOLIDATED_NODE_DTYPES: dict[str, Callable] = {
     "n_streets": _int_via_float,
     "is_t_junction": _int_via_float,
     "is_4way": _int_via_float,
@@ -414,7 +469,7 @@ CONSOLIDATED_NODE_DTYPES: dict[str, Callable] = {
 #     casts cleanly. Listed here so per-edge-feature aggregation (e.g.
 #     `calibration.calibrate_edge_weights`) doesn't choke on string-typed
 #     numerics post-reload.
-CONSOLIDATED_EDGE_DTYPES: dict[str, Callable] = {
+_CONSOLIDATED_EDGE_DTYPES: dict[str, Callable] = {
     "lanes_per_direction": float,
     "density_norm": float,
     "is_t_junction": float,
@@ -423,38 +478,98 @@ CONSOLIDATED_EDGE_DTYPES: dict[str, Callable] = {
 }
 
 
+# Prefix-scan attribute prefixes for dynamic per-mode bool flags. Graphml
+# stringifies bool/int values; without a dtype cast on load, `'False'`
+# arrives as the literal string and `bool('False') == True` silently
+# inverts downstream tests. `prepare_network` / `compute_snap_eligibility`
+# embed the mode in the flag name (`is_snap_eligible_walk`,
+# `cost_excluded_car_night`, etc.), so we can't hardcode the keys — instead
+# we scan the graphml file's `<key>` elements at load time and add an
+# `_int_via_float` cast for every attribute whose name starts with one of
+# these prefixes (or matches a fixed name like `is_virtual`).
+_PREFIX_SCAN_NODE = ("is_snap_eligible_", "is_virtual")
+_PREFIX_SCAN_EDGE = ("cost_excluded_",)
+
+
+def _scan_graphml_keys(
+    filepath, prefixes: tuple[str, ...], scope: Literal["node", "edge"]
+) -> list[str]:
+    """Return the names of `<key for=scope>` graphml attributes that start
+    with any of `prefixes` (or equal one — handles the no-suffix `is_virtual`
+    case naturally via the prefix-match condition).
+
+    Cheap: parses the `<key>` schema header only, stops before iterating
+    nodes / edges (which is where the cost lives on large graphs).
+    """
+    import xml.etree.ElementTree as ET
+
+    ns = "{http://graphml.graphdrawing.org/xmlns}"
+    out: list[str] = []
+    for _event, elem in ET.iterparse(filepath, events=("end",)):
+        if elem.tag == f"{ns}key" and elem.get("for") == scope:
+            name = elem.get("attr.name", "")
+            if any(name.startswith(p) or name == p for p in prefixes):
+                out.append(name)
+        elif elem.tag == f"{ns}graph":
+            break
+        elem.clear()
+    return out
+
+
 def load_consolidated_graphml(
     filepath, *, node_dtypes: dict | None = None, edge_dtypes: dict | None = None, **kwargs
 ):
-    """Load a graphml saved by `consolidate_intersections`, casting our
-    custom `is_*` / `*_highway_rank` attrs back to float. OSM-specific —
-    expects graphs in the OSMnx node/edge attribute convention; for non-OSM
-    pickle/graphml saves, call `nx.read_graphml` directly and apply your own
-    project-specific dtype casts.
+    """Load a graphml saved by `consolidate_intersections`, casting aperta's
+    custom `is_*` / `*_highway_rank` / `is_snap_eligible_<mode>` /
+    `cost_excluded_<mode>` / `is_virtual` attrs back to their proper types.
+    OSM-specific — expects graphs in the OSMnx node/edge attribute
+    convention; for non-OSM pickle/graphml saves, call `nx.read_graphml`
+    directly and apply your own project-specific dtype casts.
 
-    Thin wrapper around `osmnx.load_graphml` that merges in
-    `CONSOLIDATED_NODE_DTYPES`. OSMnx only auto-casts attrs in its
-    `default_node_dtypes`; without this our custom per-node flags arrive
-    as strings (`'0.0'` / `'1.0'`), which silently breaks arithmetic
-    downstream.
+    Thin wrapper around `osmnx.load_graphml`. Three sources of casts get
+    merged in (in order; later ones win):
+
+    1. `_CONSOLIDATED_NODE_DTYPES` / `_CONSOLIDATED_EDGE_DTYPES` — fixed
+       casts for attrs `consolidate_intersections` writes (e.g.
+       `n_streets`, `is_t_junction`, `lanes_per_direction`).
+    2. **Prefix-scan** of the graphml `<key>` schema for the dynamic
+       per-mode flags written by `prepare_network` /
+       `compute_snap_eligibility` / `insert_projected_nodes`:
+       `is_snap_eligible_<mode>` and `is_virtual` (per-node);
+       `cost_excluded_<mode>` (per-edge). Handles any `mode` label,
+       including subtypes like `car_night`, without hardcoding.
+    3. Caller-supplied `node_dtypes` / `edge_dtypes` overrides.
+
+    Without the prefix-scan, the per-mode bool flags round-trip as the
+    literal strings `'True'` / `'False'`, and `bool('False') == True` would
+    silently invert the `if not d.get(cost_excluded_flag, False)` test in
+    `_compute_snap_eligible_nodes`.
 
     Args:
-        filepath: path to a `.graphml` produced by `consolidate_intersections`.
-        node_dtypes: optional override merged on top of
-            `CONSOLIDATED_NODE_DTYPES` (caller's values win).
-        edge_dtypes: optional override merged on top of
-            `CONSOLIDATED_EDGE_DTYPES` (caller's values win). OSMnx's
-            built-in defaults cover the OSM-native attrs; this adds the
-            aperta-derived ones (currently `lanes_per_direction`).
+        filepath: path to a `.graphml` produced by `consolidate_intersections`
+            or `prepare_network` / `compute_snap_eligibility`.
+        node_dtypes: optional override merged on top (caller's values win).
+        edge_dtypes: optional override merged on top (caller's values win).
         **kwargs: forwarded to `osmnx.load_graphml`.
 
     Returns:
-        `nx.MultiDiGraph`.
+        `nx.MultiDiGraph` for graphs saved from a directed source, or
+        `nx.MultiGraph` for undirected ones. (OSMnx's docstring claims
+        `MultiDiGraph` unconditionally; that's wrong — `nx.read_graphml`
+        honors the file's `<graph edgedefault>` attribute.)
     """
     import osmnx as ox
 
-    merged_node = {**CONSOLIDATED_NODE_DTYPES, **(node_dtypes or {})}
-    merged_edge = {**CONSOLIDATED_EDGE_DTYPES, **(edge_dtypes or {})}
+    auto_node = {
+        name: _int_via_bool_or_float
+        for name in _scan_graphml_keys(filepath, _PREFIX_SCAN_NODE, "node")
+    }
+    auto_edge = {
+        name: _int_via_bool_or_float
+        for name in _scan_graphml_keys(filepath, _PREFIX_SCAN_EDGE, "edge")
+    }
+    merged_node = {**_CONSOLIDATED_NODE_DTYPES, **auto_node, **(node_dtypes or {})}
+    merged_edge = {**_CONSOLIDATED_EDGE_DTYPES, **auto_edge, **(edge_dtypes or {})}
     return ox.load_graphml(filepath, node_dtypes=merged_node, edge_dtypes=merged_edge, **kwargs)
 
 
@@ -607,7 +722,7 @@ def consolidate_intersections(
             edges between the same `(u, v)` are collapsed.
         drop_edge_attrs: edge attributes to drop after consolidation. Use
             for attributes that osmnx's aggregation leaves in a confusing
-            list-of-values form. Defaults to `DEFAULT_DROP_EDGE_ATTRS`.
+            list-of-values form. Defaults to `_DEFAULT_DROP_EDGE_ATTRS`.
 
     Returns:
         Consolidated `nx.MultiDiGraph` with new integer node IDs.
@@ -661,8 +776,8 @@ def consolidate_intersections(
     #      parallel-path merges — the merged edge's actual geometry is
     #      shorter than that sum. `geometry.length` gives metres in our
     #      metric-CRS graphs.
-    drop_attrs = DEFAULT_DROP_EDGE_ATTRS if drop_edge_attrs is None else drop_edge_attrs
-    eff_edge_aggs = DEFAULT_EDGE_ATTR_AGGS if edge_attr_aggs is None else edge_attr_aggs
+    drop_attrs = _DEFAULT_DROP_EDGE_ATTRS if drop_edge_attrs is None else drop_edge_attrs
+    eff_edge_aggs = _DEFAULT_EDGE_ATTR_AGGS if edge_attr_aggs is None else edge_attr_aggs
     for _, _, _, d in consolidated.edges(keys=True, data=True):
         for attr in drop_attrs:
             d.pop(attr, None)
@@ -837,154 +952,6 @@ def flag_node_osm_classification(graph: nx.Graph) -> None:
         graph.nodes[nid]["is_4way_anchor"] = int(is_4 and is_anchor)
 
 
-def _snap_to_subset(
-    points: gpd.GeoDataFrame,
-    graph: nx.Graph,
-    node_ids: list,
-    *,
-    max_distance: float | None,
-) -> tuple[pd.Series, pd.Series]:
-    """Helper: snap each point to its nearest node in `node_ids`. Returns
-    all-NaN series if `node_ids` is empty (rather than raising)."""
-    from aperta import geo_mapping  # local import to avoid module-load cycle
-
-    if not node_ids:
-        nan_ids = pd.Series([pd.NA] * len(points), index=points.index, dtype=object)
-        nan_dists = pd.Series([float("nan")] * len(points), index=points.index, dtype=float)
-        return nan_ids, nan_dists
-    node_x = [graph.nodes[n]["x"] for n in node_ids]
-    node_y = [graph.nodes[n]["y"] for n in node_ids]
-    nodes_gdf = gpd.GeoDataFrame(
-        geometry=gpd.points_from_xy(node_x, node_y),
-        index=pd.Index(node_ids, name="node_id"),
-        crs=points.crs,
-    )
-    return geo_mapping.map_points_to_points(points, nodes_gdf, max_distance=max_distance)
-
-
-def snap_to_network_nodes(
-    points: gpd.GeoDataFrame,
-    graph: nx.Graph,
-    *,
-    max_distance: float | None = None,
-    eligible_node_ids: set | list | pd.Index | None = None,
-    eligible_node_flag: str | None = None,
-    priority_node_ids: set | list | pd.Index | None = None,
-    priority_node_flag: str | None = None,
-    priority_max_distance: float | None = None,
-) -> tuple[pd.Series, pd.Series]:
-    """Snap each row in `points` to its nearest node in `graph`.
-
-    For each point, finds the closest network node by Euclidean distance and
-    returns both the node ID and the distance. The point CRS and the graph
-    coordinates must already agree — this function does no reprojection.
-
-    Two-pass snapping. When either `priority_node_ids` or
-    `priority_node_flag` is given, the function first tries to snap each
-    point to its nearest **priority** node within `priority_max_distance`.
-    Points that don't find a priority node in range fall through to a
-    second pass that snaps to the nearest **eligible** node within
-    `max_distance`. Use this to prefer high-quality snap targets (real
-    intersections, well-connected nodes) while still guaranteeing every
-    point gets snapped to something safe.
-
-    Network nodes must carry `x` and `y` attributes (aperta convention).
-    Typical sources of such graphs are OSMnx (`ox.project_graph(...)` produces
-    nodes with `x` / `y` in the target CRS) or aperta's own
-    `network_processing` builders.
-
-    Args:
-        points: GeoDataFrame of points to snap. Output is indexed by
-            `points.index`.
-        graph: NetworkX (or compatible) graph with `x` / `y` node attributes.
-        max_distance: optional cap. Points farther than this from every
-            eligible node return `NaN` for both ID and distance. `None`
-            means no cap.
-        eligible_node_ids: optional restriction — only nodes in this set are
-            considered as snap targets. Use with `aggregate_edges_to_nodes`
-            to filter out structurally undesirable snap targets (e.g.,
-            motorway nodes, dead-end nodes, pedestrian-only paths for car
-            analyses). `None` (default) considers all graph nodes.
-        eligible_node_flag: optional alternative to `eligible_node_ids` —
-            name of a per-node boolean attribute on `graph` that marks
-            eligible snap targets (e.g., the `snap_eligible_flag` written
-            by `prepare_network`). Useful when the graph has been prepared
-            elsewhere (e.g., loaded from `.graphml`) and the eligible-set
-            travels with it as a node attribute. Ignored if
-            `eligible_node_ids` is also given.
-        priority_node_ids: optional **priority** snap targets — high-quality
-            nodes preferred over plain eligible nodes when within
-            `priority_max_distance`. Use `prepared.snap_priority_nodes`
-            from `prepare_network`. When given (or `priority_node_flag` is),
-            the function runs in two-pass mode: priority first within
-            `priority_max_distance`, eligible fallback within
-            `max_distance`. Points beyond the priority radius fall back to
-            the eligible second pass.
-        priority_node_flag: optional alternative to `priority_node_ids` —
-            name of a per-node bool attribute on `graph` (e.g.,
-            `prepared.snap_priority_flag`). Ignored if `priority_node_ids`
-            is also given.
-        priority_max_distance: optional cap on the priority first pass.
-            Points farther than this from every priority node fall through
-            to the eligible second pass. `None` means no priority-side cap
-            (every point gets snapped to a priority node if any exist).
-
-    Returns:
-        Tuple `(node_ids, distances)`:
-            - `node_ids`: `pd.Series` of nearest-node IDs, indexed by `points.index`.
-            - `distances`: `pd.Series` of distances (in CRS units), indexed by
-              `points.index`.
-    """
-    if eligible_node_ids is None and eligible_node_flag is not None:
-        eligible_node_ids = [
-            n for n, data in graph.nodes(data=True) if data.get(eligible_node_flag)
-        ]
-
-    if eligible_node_ids is None:
-        eligible_node_list = list(graph.nodes)
-    else:
-        eligible_set = set(eligible_node_ids)
-        eligible_node_list = [n for n in graph.nodes if n in eligible_set]
-        if not eligible_node_list:
-            raise ValueError(
-                "Eligibility filter excluded every node in the graph "
-                "(`eligible_node_ids` or `eligible_node_flag`). Cannot snap to "
-                "an empty set of targets."
-            )
-
-    # Resolve priority subset (optional). Empty priority set is fine — it
-    # just yields all-NaN from the first pass, so every point falls through
-    # to the eligible second pass.
-    priority_requested = priority_node_ids is not None or priority_node_flag is not None
-    if not priority_requested:
-        return _snap_to_subset(points, graph, eligible_node_list, max_distance=max_distance)
-
-    if priority_node_ids is None:
-        priority_set = {n for n, data in graph.nodes(data=True) if data.get(priority_node_flag)}
-    else:
-        priority_set = set(priority_node_ids)
-    priority_node_list = [n for n in graph.nodes if n in priority_set]
-
-    # First pass: priority within priority_max_distance.
-    pri_ids, pri_dists = _snap_to_subset(
-        points, graph, priority_node_list, max_distance=priority_max_distance
-    )
-    unmatched = pri_ids.isna()
-    if not unmatched.any():
-        return pri_ids, pri_dists
-
-    # Second pass: eligible (with broader max_distance) for the unmatched.
-    fallback_points = points.loc[unmatched]
-    elig_ids, elig_dists = _snap_to_subset(
-        fallback_points, graph, eligible_node_list, max_distance=max_distance
-    )
-    pri_ids = pri_ids.copy()
-    pri_dists = pri_dists.copy()
-    pri_ids.loc[unmatched] = elig_ids
-    pri_dists.loc[unmatched] = elig_dists
-    return pri_ids, pri_dists
-
-
 def aggregate_edges_to_nodes(
     graph: nx.Graph,
     edge_attribute: str | Callable,
@@ -1076,566 +1043,3 @@ def aggregate_edges_to_nodes(
             else:
                 out[n] = float(_agg(arr))
     return pd.Series(out, name="node_value")
-
-
-def assign_to_eligible_centroid(
-    polygons: gpd.GeoDataFrame,
-    graph: nx.Graph,
-    eligible_node_ids: set | list | pd.Index,
-    *,
-    centroid_method: Literal["median", "mean"] = "median",
-    fallback_to_geometric_centroid: bool = True,
-    max_distance: float | None = None,
-) -> tuple[pd.Series, pd.Series]:
-    """For each polygon in `polygons`, assign it to a network node via a
-    transport-weighted centroid built from the *eligible* network nodes
-    inside the polygon.
-
-    Designed for snapping zones (especially uniformly-tiled units
-    like H3 hexes) whose geometric centroid often lands on an arbitrary
-    minor node — a service road, a dead-end, or worse. Using the
-    median / mean coordinates of the eligible nodes within the polygon
-    produces a "gravitational centre" of the polygon's transportation
-    grid; snapping to the nearest eligible node from that point reliably
-    lands on a more representative node.
-
-    Workflow per polygon:
-        1. Find eligible nodes whose location falls within the polygon.
-        2. Compute their median (or mean) (x, y) — the transport centroid.
-        3. Snap that centroid to the nearest eligible node anywhere.
-
-    Polygons with no eligible node inside fall back to their geometric
-    centroid (snapped to the nearest eligible node anywhere) if
-    `fallback_to_geometric_centroid=True`. Otherwise they get NaN.
-
-    Args:
-        polygons: GeoDataFrame of polygons to snap. Output is indexed by
-            `polygons.index`.
-        graph: NetworkX graph with `x` / `y` node attributes.
-        eligible_node_ids: set of nodes that are valid snap targets.
-            Typically built from `aggregate_edges_to_nodes` + a tier filter
-            (e.g., `nodes where tier in {residential, tertiary, secondary}`).
-        centroid_method: `'median'` (default) or `'mean'`. Median is more
-            robust against outlier nodes (e.g., a single highway-on-ramp
-            node included by accident).
-        fallback_to_geometric_centroid: when True, polygons with no eligible
-            node inside use their geometric centroid (then snapped to the
-            nearest eligible node anywhere — could be outside the polygon).
-            When False, such polygons get NaN ID + NaN distance.
-        max_distance: optional cap on the final snap distance (CRS units).
-
-    Returns:
-        Tuple `(node_ids, distances)` indexed by `polygons.index`.
-    """
-    eligible_set = set(eligible_node_ids)
-    if not eligible_set:
-        raise ValueError("`eligible_node_ids` must be non-empty.")
-
-    # Build a points GeoDataFrame of all eligible nodes (for sjoin + later snap).
-    elig_ids = [n for n in graph.nodes if n in eligible_set]
-    if not elig_ids:
-        raise ValueError(
-            "No eligible nodes present in the graph "
-            "(every id in `eligible_node_ids` is missing from `graph.nodes`)."
-        )
-    elig_x = [graph.nodes[n]["x"] for n in elig_ids]
-    elig_y = [graph.nodes[n]["y"] for n in elig_ids]
-    eligible_gdf = gpd.GeoDataFrame(
-        geometry=gpd.points_from_xy(elig_x, elig_y),
-        index=pd.Index(elig_ids, name="node_id"),
-        crs=polygons.crs,
-    )
-
-    # Spatial join: which eligible nodes fall in which polygon.
-    joined = gpd.sjoin(
-        eligible_gdf[["geometry"]],
-        polygons[["geometry"]],
-        how="inner",
-        predicate="within",
-    )
-    # Group by the polygon-side index column (named after polygons.index.name,
-    # or 'index_right' if anonymous).
-    poly_id_col = polygons.index.name if polygons.index.name is not None else "index_right"
-
-    # Per-polygon transport centroid: median or mean of constituent node coords.
-    transport_xy: dict = {}
-    if poly_id_col in joined.columns:
-        for poly_id, sub in joined.groupby(poly_id_col):
-            x = sub.geometry.x.to_numpy()
-            y = sub.geometry.y.to_numpy()
-            if centroid_method == "median":
-                transport_xy[poly_id] = (float(np.median(x)), float(np.median(y)))
-            elif centroid_method == "mean":
-                transport_xy[poly_id] = (float(np.mean(x)), float(np.mean(y)))
-            else:
-                raise ValueError(
-                    f"`centroid_method` must be 'median' or 'mean', got {centroid_method!r}."
-                )
-
-    # Fallback for polygons with no eligible node inside.
-    missing_ids = polygons.index.difference(pd.Index(list(transport_xy.keys())))
-    if len(missing_ids) > 0 and fallback_to_geometric_centroid:
-        for poly_id in missing_ids:
-            centroid = polygons.loc[poly_id, "geometry"].centroid
-            transport_xy[poly_id] = (float(centroid.x), float(centroid.y))
-
-    # Build a points GeoDataFrame of transport centroids (in polygon order).
-    ordered_ids = [p for p in polygons.index if p in transport_xy]
-    centroids_gdf = gpd.GeoDataFrame(
-        geometry=gpd.points_from_xy(
-            [transport_xy[p][0] for p in ordered_ids],
-            [transport_xy[p][1] for p in ordered_ids],
-        ),
-        index=pd.Index(ordered_ids, name=polygons.index.name),
-        crs=polygons.crs,
-    )
-
-    # Snap each transport centroid to the nearest eligible node.
-    snapped_ids, snapped_dists = snap_to_network_nodes(
-        centroids_gdf,
-        graph,
-        max_distance=max_distance,
-        eligible_node_ids=eligible_set,
-    )
-
-    # Reindex to the full polygons.index (NaN for any that fell through).
-    return (snapped_ids.reindex(polygons.index), snapped_dists.reindex(polygons.index))
-
-
-# --- Mode-aware graph preparation -------------------------------------------
-
-BaseMode = Literal["walk", "bike", "car"]
-Directedness = Literal["undirected", "directed_scc"]
-
-
-# Per-mode default configuration for `prepare_network`. The rationale for each
-# choice is documented in the design memo `project_aperta_node_snap_trap_fix`:
-#   - walk: undirected (walking does not respect one-ways) + `network_type='all'`
-#     (avoids stripping pedestrian paths topologically connected through highway
-#     nodes — the Cambridge MA pitfall) + motorway/trunk excluded at cost time.
-#   - bike: undirected (untagged contraflow is more common than legit-bike-only
-#     one-ways; the permissive default is the right error budget) + `'bike'`.
-#   - car:  directed with snap-to-largest-SCC (one-ways are semantically real
-#     for cars; flipping them produces wrong-direction routes) + `'drive'`.
-# OSM-specific. `network_type` values (`'all'`, `'bike'`, `'drive'`) are OSMnx
-# network filters, and `cost_excluded_tags` reads the OSM `highway` tag.
-# Projects working with non-OSM road networks should override these settings
-# explicitly when calling `prepare_network` (or skip it and write the
-# `is_snap_eligible_*` / `cost_excluded_*` decorations directly).
-MODE_DEFAULTS: dict[BaseMode, dict] = {
-    "walk": {
-        "network_type": "all",
-        "directedness": "undirected",
-        "cost_excluded_tags": frozenset({"motorway", "motorway_link", "trunk", "trunk_link"}),
-    },
-    "bike": {
-        "network_type": "bike",
-        "directedness": "undirected",
-        "cost_excluded_tags": frozenset(),
-    },
-    "car": {
-        "network_type": "drive",
-        "directedness": "directed_scc",
-        "cost_excluded_tags": frozenset(),
-    },
-}
-
-
-# Per-mode default predicates for "priority" snap-target classification.
-# A priority node is a high-quality snap target — typically a well-connected
-# intersection — used as the first-pass choice in two-pass snapping. Cells
-# / zones snap to a priority node within a tight radius if one exists, and
-# fall back to the broader eligible set otherwise. The walk / bike predicate
-# reads only `is_4way` (topology, from `flag_node_intersection_topology`).
-# The car predicate reads `is_*_anchor` attributes, which depend on the OSM
-# `highway` tag and are written by `flag_node_osm_classification` — for
-# non-OSM road networks a project-specific car predicate is required.
-def _priority_walk_bike(node_data: dict) -> bool:
-    """4-way intersections only (well-connected, regardless of road class)."""
-    return bool(node_data.get("is_4way", 0))
-
-
-def _priority_car(node_data: dict) -> bool:
-    """Anchor T-junctions and 4-way intersections: at least one tertiary+
-    road touching, AND not a pure trunk/motorway interchange. OSM-specific:
-    reads `is_*_anchor` written by `flag_node_osm_classification`."""
-    return bool(node_data.get("is_t_junction_anchor", 0) or node_data.get("is_4way_anchor", 0))
-
-
-MODE_PRIORITY_DEFAULTS: dict[BaseMode, Callable[[dict], bool]] = {
-    "walk": _priority_walk_bike,
-    "bike": _priority_walk_bike,
-    "car": _priority_car,
-}
-
-
-@dataclass(frozen=True)
-class PreparedGraph:
-    """Routing-ready graph plus the in-session metadata derived by `prepare_network`.
-
-    `prepare_network` decorates the underlying `graph` in place with two
-    boolean attributes — one per node (`snap_eligible_flag`) and one per
-    edge (`cost_excluded_flag`) — so the trap-fix information survives
-    `.graphml` roundtripping and is available to downstream consumers that
-    receive only the graph (e.g., Pandana). The `PreparedGraph` itself is a
-    thin session-time wrapper that memoizes the snap-eligible node set for
-    direct 1:1 hand-off to `snap_to_network_nodes` and records the
-    resolved-config metadata for introspection.
-
-    Attributes:
-        graph: The routing graph. `MultiGraph` (undirected) when
-            `directedness='undirected'`, `MultiDiGraph` (directed) when
-            `directedness='directed_scc'`.
-        snap_eligible_nodes: Node IDs from which every node in the set is
-            mutually reachable under the chosen directedness — the largest
-            connected component for `'undirected'`, the largest strongly
-            connected component for `'directed_scc'`. Pass as
-            `eligible_node_ids=` to `snap_to_network_nodes` to prevent cells
-            from snapping to trapped nodes. Memoized; the same set is also
-            recoverable from the per-node `snap_eligible_flag` attribute on
-            `graph`.
-        snap_eligible_flag: Name of the per-node boolean attribute written
-            onto `graph` (default `f"is_snap_eligible_{mode}"`).
-        snap_priority_nodes: Subset of `snap_eligible_nodes` classified as
-            high-quality snap targets (e.g., real intersections of suitable
-            road class). Empty if no priority predicate is in effect. Pass
-            as `priority_node_ids=` to `snap_to_network_nodes` for two-pass
-            snapping (priority first within a tight radius, eligible
-            fallback otherwise).
-        snap_priority_flag: Name of the per-node boolean attribute written
-            onto `graph` (default `f"is_snap_priority_{mode}"`). False for
-            every node when no priority predicate is in effect.
-        cost_excluded_flag: Name of the per-edge boolean attribute written
-            onto `graph` (default `f"cost_excluded_{mode}"`). Mode-specific
-            cost functions consult this flag to assign cost = ∞.
-        mode: The user-supplied mode label (free-form string).
-        directedness: Resolved directedness setting.
-        network_type: Resolved OSMnx network-type string (recorded for
-            metadata / warnings; `prepare_network` does not re-fetch).
-    """
-
-    graph: nx.Graph
-    snap_eligible_nodes: frozenset
-    snap_eligible_flag: str
-    snap_priority_nodes: frozenset
-    snap_priority_flag: str
-    cost_excluded_flag: str
-    mode: str
-    directedness: Directedness
-    network_type: str
-
-
-def prepare_network(
-    graph: nx.MultiDiGraph,
-    mode: str,
-    *,
-    base_mode: BaseMode | None = None,
-    directedness: Directedness | None = None,
-    network_type: str | None = None,
-    cost_excluded_tags: Iterable[str] | None = None,
-    snap_eligible_flag: str | None = None,
-    cost_excluded_flag: str | None = None,
-    priority_node_filter: Callable[[dict], bool] | None = None,
-    snap_priority_flag: str | None = None,
-) -> PreparedGraph:
-    """Apply mode-aware graph preparation: directedness + snap-eligibility + cost-exclusion flags.
-
-    Wraps an already-fetched (and typically already-consolidated) graph to
-    produce a `PreparedGraph` ready for trap-free routing. The two axes —
-    `directedness` and `network_type` — each have per-mode defaults
-    (`MODE_DEFAULTS`) that callers can override. The trap-fix outputs
-    (`snap_eligible_flag` per node, `cost_excluded_flag` per edge) are
-    written onto the underlying graph in place so they survive `.graphml`
-    roundtripping and are available to downstream consumers that don't
-    know about `PreparedGraph`.
-
-    The `mode` argument is a free-form string label used for default flag
-    names and for warning-policy lookup. Common cases (`'walk'`, `'bike'`,
-    `'car'`) pick up defaults directly from `MODE_DEFAULTS`. Subtype /
-    context labels (e.g., `'car_night'`, `'ebike25'`) work too; pass
-    `base_mode` to inherit defaults from a known base, and override
-    individual flags as needed. Default flag names embed `mode`, so
-    multiple calls on the same graph with different mode labels accumulate
-    independent decorations (`is_snap_eligible_car_peak`,
-    `is_snap_eligible_car_night`, etc.) instead of overwriting each other.
-
-    Args:
-        graph: Routing graph, typically the output of `fetch_network` +
-            `consolidate_intersections`. Must be directed
-            (`nx.MultiDiGraph`) when `directedness='directed_scc'` is
-            chosen.
-        mode: Free-form mode label. Used to derive default flag names and,
-            if it matches a `BaseMode` (`'walk'`/`'bike'`/`'car'`), to pull
-            defaults from `MODE_DEFAULTS`.
-        base_mode: Optional `BaseMode` for `MODE_DEFAULTS` lookup when
-            `mode` itself is not a `BaseMode` (e.g., `mode='car_night'`,
-            `base_mode='car'`). Resolution order: `base_mode` if given,
-            else `mode` if in `MODE_DEFAULTS`, else no defaults available
-            and all flags must be supplied explicitly.
-        directedness: `'undirected'` applies `to_undirected()` and snaps to
-            the largest connected component. `'directed_scc'` keeps the
-            graph directed and snaps to the largest strongly connected
-            component. `None` resolves from defaults.
-        network_type: The OSMnx `network_type` used to fetch `graph`. Used
-            only for warning-policy decisions and recorded as metadata;
-            this function does not re-fetch. `None` resolves from defaults.
-        cost_excluded_tags: Highway-tag values to mark for cost = ∞
-            downstream (e.g., `{'motorway', 'trunk'}` for walk on
-            `network_type='all'`). `None` resolves from defaults; an empty
-            iterable is a valid explicit override.
-        snap_eligible_flag: Name of the per-node bool attribute to write.
-            `None` defaults to `f"is_snap_eligible_{mode}"`.
-        cost_excluded_flag: Name of the per-edge bool attribute to write.
-            `None` defaults to `f"cost_excluded_{mode}"`.
-        priority_node_filter: Optional predicate `(node_data) -> bool` that
-            classifies each node as a "priority" snap target (high-quality
-            intersection where trips naturally begin / end). Used for the
-            first pass of two-pass snapping; nodes that don't satisfy this
-            but ARE in `snap_eligible_nodes` remain available as fallback.
-            `None` resolves from `MODE_PRIORITY_DEFAULTS` if a base mode is
-            available, otherwise leaves the priority set empty. The
-            predicate consults node attributes typically written by
-            `flag_node_intersection_topology` and (for OSM-derived flags
-            like `is_*_anchor`) `flag_node_osm_classification`.
-        snap_priority_flag: Name of the per-node bool attribute to write
-            for priority nodes. `None` defaults to `f"is_snap_priority_{mode}"`.
-
-    Returns:
-        A `PreparedGraph` carrying the (possibly transformed) routing
-        graph, the snap-eligible node set (also written per-node onto the
-        graph), and the resolved metadata.
-
-    Warns:
-        `UserWarning` on combinations known to silently produce wrong
-        answers (e.g., `walk + network_type='walk'` strips pedestrian
-        paths; `car + directedness='undirected'` routes the wrong way down
-        one-way streets). Warnings are keyed by the resolved base mode, so
-        they fire for subtypes too (`'car_night'` with `base_mode='car'`
-        still warns on `directedness='undirected'`). Deviations from a
-        mode default that are not known-problematic do NOT warn.
-
-    Raises:
-        ValueError: if `mode` has no defaults available (neither
-            `base_mode` nor `mode in MODE_DEFAULTS`) and any of
-            `directedness` / `network_type` / `cost_excluded_tags` is
-            unspecified; or if `directedness='directed_scc'` is requested
-            on an already-undirected graph.
-    """
-    if base_mode is not None and base_mode not in MODE_DEFAULTS:
-        raise ValueError(f"`base_mode` must be one of {list(MODE_DEFAULTS)}; got {base_mode!r}.")
-
-    if base_mode is not None:
-        defaults: dict | None = MODE_DEFAULTS[base_mode]
-        effective_base: BaseMode | None = base_mode
-    elif mode in MODE_DEFAULTS:
-        defaults = MODE_DEFAULTS[cast(BaseMode, mode)]
-        effective_base = cast(BaseMode, mode)
-    else:
-        defaults = None
-        effective_base = None
-
-    def _resolve(flag_value, default_key: str, flag_name: str):
-        if flag_value is not None:
-            return flag_value
-        if defaults is None:
-            raise ValueError(
-                f"`{flag_name}` not provided and no defaults are available for "
-                f"mode={mode!r}. Pass `base_mode` to inherit from a known base, "
-                f"or supply `{flag_name}` explicitly."
-            )
-        return defaults[default_key]
-
-    directedness_r: Directedness = _resolve(directedness, "directedness", "directedness")
-    network_type_r: str = _resolve(network_type, "network_type", "network_type")
-    cost_excluded_tags_r: frozenset = frozenset(
-        _resolve(cost_excluded_tags, "cost_excluded_tags", "cost_excluded_tags")
-    )
-
-    snap_eligible_flag_r: str = (
-        snap_eligible_flag if snap_eligible_flag is not None else f"is_snap_eligible_{mode}"
-    )
-    cost_excluded_flag_r: str = (
-        cost_excluded_flag if cost_excluded_flag is not None else f"cost_excluded_{mode}"
-    )
-    snap_priority_flag_r: str = (
-        snap_priority_flag if snap_priority_flag is not None else f"is_snap_priority_{mode}"
-    )
-    # Resolve priority predicate: explicit arg wins; else mode default; else None.
-    priority_filter_r: Callable[[dict], bool] | None
-    if priority_node_filter is not None:
-        priority_filter_r = priority_node_filter
-    elif effective_base is not None:
-        priority_filter_r = MODE_PRIORITY_DEFAULTS.get(effective_base)
-    else:
-        priority_filter_r = None
-
-    if effective_base is not None:
-        _check_combination(effective_base, directedness_r, network_type_r, cost_excluded_tags_r)
-
-    if directedness_r == "undirected":
-        prepared_graph: nx.Graph = graph.to_undirected()
-    else:
-        if not graph.is_directed():
-            raise ValueError(
-                "`directedness='directed_scc'` requires a directed input graph; "
-                "got an undirected graph."
-            )
-        prepared_graph = graph
-
-    # Write per-edge cost_excluded_flag FIRST so the snap-eligible
-    # computation below can mask cost-excluded edges out of its topology
-    # analysis. Without this ordering, a node connected to the rest of
-    # the largest CC only via cost-excluded edges (e.g., a pedestrian
-    # cell snapped to a motorway-ramp node) would appear topologically
-    # eligible but route to inf at every query — silent zero-accessibility
-    # outliers.
-    if prepared_graph.is_multigraph():
-        for u, v, k, edata in prepared_graph.edges(keys=True, data=True):
-            prepared_graph.edges[u, v, k][cost_excluded_flag_r] = _osm_highway_in_excluded(
-                edata.get("highway"), cost_excluded_tags_r
-            )
-    else:
-        for u, v, edata in prepared_graph.edges(data=True):
-            prepared_graph.edges[u, v][cost_excluded_flag_r] = _osm_highway_in_excluded(
-                edata.get("highway"), cost_excluded_tags_r
-            )
-
-    snap_nodes = _compute_snap_eligible_nodes(prepared_graph, directedness_r, cost_excluded_flag_r)
-
-    # Compute priority nodes (subset of eligible): nodes that satisfy
-    # `priority_filter_r` on their per-node attributes. Empty if no filter.
-    if priority_filter_r is None:
-        priority_nodes: frozenset = frozenset()
-    else:
-        priority_nodes = frozenset(
-            n for n in snap_nodes if priority_filter_r(prepared_graph.nodes[n])
-        )
-
-    # Decorate the graph in place so the trap-fix information rides along
-    # with the graph (e.g., through .graphml roundtripping) and downstream
-    # consumers can use it without knowing about `PreparedGraph`.
-    for n in prepared_graph.nodes:
-        prepared_graph.nodes[n][snap_eligible_flag_r] = n in snap_nodes
-        prepared_graph.nodes[n][snap_priority_flag_r] = n in priority_nodes
-
-    return PreparedGraph(
-        graph=prepared_graph,
-        snap_eligible_nodes=snap_nodes,
-        snap_eligible_flag=snap_eligible_flag_r,
-        snap_priority_nodes=priority_nodes,
-        snap_priority_flag=snap_priority_flag_r,
-        cost_excluded_flag=cost_excluded_flag_r,
-        mode=mode,
-        directedness=directedness_r,
-        network_type=network_type_r,
-    )
-
-
-def _compute_snap_eligible_nodes(
-    graph: nx.Graph,
-    directedness: Directedness,
-    cost_excluded_flag: str,
-) -> frozenset:
-    """Largest CC (undirected) or SCC (directed) of the *cost-masked* subgraph.
-
-    The cost-masked subgraph contains only edges where the per-edge attribute
-    `cost_excluded_flag` is absent or `False`. Computing eligibility on this
-    subgraph (rather than on the raw topology) is what distinguishes
-    "topologically reachable" from "reachable at finite routing cost." A node
-    connected to the rest of the largest CC only via cost-excluded edges
-    (e.g., a pedestrian-network node at a motorway interchange) is in the
-    largest topological CC but practically unreachable at routing time — the
-    cost-masked subgraph correctly identifies it as ineligible.
-
-    When `cost_excluded_tags` is empty (the default for bike + car), no edges
-    carry `cost_excluded_flag=True`, so the cost-masked subgraph equals the
-    full graph and the result matches plain topological analysis.
-    """
-    ok_edges: list
-    if graph.is_multigraph():
-        ok_edges = [
-            (u, v, k)
-            for u, v, k, d in graph.edges(keys=True, data=True)
-            if not d.get(cost_excluded_flag, False)
-        ]
-    else:
-        ok_edges = [
-            (u, v) for u, v, d in graph.edges(data=True) if not d.get(cost_excluded_flag, False)
-        ]
-    subgraph = graph.edge_subgraph(ok_edges)
-    if directedness == "undirected":
-        components = nx.connected_components(subgraph)
-    else:
-        components = nx.strongly_connected_components(subgraph)
-    largest: set = max(components, key=len, default=set())
-    return frozenset(largest)
-
-
-def _osm_highway_in_excluded(highway_value, excluded: frozenset) -> bool:
-    """True if the edge's `highway` tag is in `excluded`. Tolerates list-valued
-    tags (post-`consolidate_intersections` edges can carry a list of highway
-    strings) and `None`.
-    """
-    if highway_value is None:
-        return False
-    if isinstance(highway_value, list):
-        return any(v in excluded for v in highway_value)
-    return highway_value in excluded
-
-
-def _check_combination(
-    base_mode: BaseMode,
-    directedness: Directedness,
-    network_type: str,
-    cost_excluded_tags: frozenset,
-) -> None:
-    """Emit `UserWarning` for combinations known to silently produce wrong
-    answers. Keyed by the resolved base mode, so warnings fire for subtypes
-    (e.g., `'car_night'` with `base_mode='car'` triggers car-rule warnings).
-    Deviations from defaults that are not known-problematic stay silent —
-    warnings are reserved for actual risk, not "this is not the recommended
-    setting".
-    """
-    if base_mode == "walk":
-        if directedness == "directed_scc":
-            warnings.warn(
-                "walk + directedness='directed_scc' is unnecessarily restrictive; "
-                "walking does not need to respect one-ways. Consider 'undirected'.",
-                UserWarning,
-                stacklevel=3,
-            )
-        if network_type == "walk":
-            warnings.warn(
-                "walk + network_type='walk' may strip pedestrian paths topologically "
-                "connected to the rest of the network through highway nodes "
-                "(the Cambridge MA pitfall). Consider network_type='all' with "
-                "cost_excluded_tags={'motorway', 'motorway_link', 'trunk', "
-                "'trunk_link'}.",
-                UserWarning,
-                stacklevel=3,
-            )
-        if network_type == "all" and not cost_excluded_tags:
-            warnings.warn(
-                "walk + network_type='all' with empty cost_excluded_tags: walking "
-                "will be routed across motorways. Consider excluding {'motorway', "
-                "'motorway_link', 'trunk', 'trunk_link'}.",
-                UserWarning,
-                stacklevel=3,
-            )
-    elif base_mode == "car":
-        if directedness == "undirected":
-            warnings.warn(
-                "car + directedness='undirected' treats one-way streets as "
-                "bidirectional. Was this intentional? Routes may go the wrong way "
-                "down one-way streets.",
-                UserWarning,
-                stacklevel=3,
-            )
-        if network_type == "all" and not cost_excluded_tags:
-            warnings.warn(
-                "car + network_type='all' with empty cost_excluded_tags: car routing "
-                "may traverse footways, pedestrian paths, or steps. Consider "
-                "excluding non-drivable highway tags.",
-                UserWarning,
-                stacklevel=3,
-            )

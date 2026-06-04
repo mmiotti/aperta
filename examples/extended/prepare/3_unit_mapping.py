@@ -63,6 +63,7 @@
 # more granular display).
 
 # %%
+import time
 import warnings
 from pathlib import Path
 
@@ -71,11 +72,12 @@ import geopandas as gpd
 import h3
 import matplotlib.pyplot as plt
 import numpy as np
+import osmnx as ox
 import pandas as pd
 import rasterio
 from shapely.geometry import Polygon
 
-from aperta import network_processing
+from aperta import network_processing, network_snap, routing_prep
 
 warnings.filterwarnings('ignore', category=FutureWarning)
 warnings.filterwarnings('ignore', category=UserWarning, module='geopandas')
@@ -186,10 +188,10 @@ poi_numeric_cols = [
 ]
 poi_per_cell = pois.groupby('cell_id')[poi_numeric_cols].sum()
 
-print(f"\nAggregation produced columns:")
-print(f"  population:        1")
+print("\nAggregation produced columns:")
+print("  population:        1")
 print(f"  employment_*:      {len(EMP_COLS)}")
-print(f"  building_count:    1")
+print("  building_count:    1")
 print(f"  POI:               {len(poi_numeric_cols)}")
 
 
@@ -278,116 +280,157 @@ print(f"Zones: {len(zones):,} (avg {len(cells)/len(zones):.1f} cells each).")
 
 
 # %% [markdown]
-# ## 7. Snap units to network nodes — per network
+# ## 7. Enrich networks + snap units to network nodes
 #
-# For each geo layer (cells, zones), find the nearest node on each of the
-# three networks (walk, bike, car). Result is stored as per-mode columns
-# (`node_id_walk`, `node_id_bike`, `node_id_car`, plus `snap_dist_*` in
-# metres) — keeping all three in one DataFrame means downstream OD-pair
-# construction just passes the right `node_column=` argument.
+# Two phases, in order:
 #
-# **Eligibility filter via `prepare_network`.** Each mode's graph is run
-# through `prepare_network` first, which applies the mode's recommended
-# directedness (`undirected` for walk + bike, `directed_scc` for car) and
-# precomputes the snap-eligible node set: the largest connected
-# component for walk/bike, the largest strongly connected component for
-# car. Cells then snap only to nodes in that eligible set. Without this,
-# cells whose centroid happens to lie nearest a node on a small
-# disconnected island (walk/bike) or a one-way trap segment (car) would
-# silently produce zero-accessibility outliers at routing time.
+# **Phase A — Network enrichment (`insert_projected_nodes`).** Mutate
+# each mode's graph by inserting virtual nodes where layer points
+# (cells, zones) would otherwise have no graph node within snap
+# distance. Per layer, the function projects each point onto the
+# nearest filter-eligible edge: if the projection is within
+# `node_spacing` of an existing endpoint, nothing happens; otherwise a
+# virtual node is inserted at the projection and the parent edge is
+# split (`is_virtual=1` is set on the new node; child edges inherit
+# the parent's `highway` tag so downstream priority detection works).
+# The default `edge_filter` excludes motorway / trunk classes — those
+# shouldn't get walkable / cyclable / cell-snappable virtual nodes.
 #
-# **Two-pass snap (priority + eligible fallback).** `prepare_network` also
-# computes a *priority* subset of eligible nodes: well-connected
-# intersections that make better snap targets than dead-end residential
-# cul-de-sacs or one-way passthrough segments. The snap runs in two
-# passes — priority first within a tight radius, eligible fallback for
-# anything that doesn't find a priority node in range. This prevents
-# cells from anchoring trips at structurally inconvenient nodes
-# (cul-de-sac terminus, low-class minor street) when a real intersection
-# is just a short distance away. Per-mode priority criteria (see
-# `network_processing.MODE_PRIORITY_DEFAULTS`):
+# **Phase B — Point-to-node snap (`snap_to_network_nodes`).** With the
+# graph enriched, every cell / zone centroid finds its nearest node
+# directly. For cars we run the two-tier variant: nodes incident to
+# main-road edges (tertiary / secondary / primary) form the priority
+# set, and a centroid within `PRIORITY_NODE_RADIUS_M[layer_name]` of
+# any such node snaps to it (skipping closer non-priority candidates).
+# This preserves the "prefer main roads" preference for car routing
+# regardless of where the centroid happens to fall. Walk + bike use
+# single-tier snap — every eligible node counts equally.
 #
-# - **walk + bike**: 4-way intersections (well-connected, road class
-#   doesn't matter for non-motorised modes).
-# - **car**: anchor T-junctions + 4-way intersections (touches at least
-#   one tertiary+ road, but isn't a pure motorway/trunk interchange).
-#
-# Priority radii: cells use a small radius (100 m) — cells are small
-# enough that a real intersection within 100 m is "close enough", and
-# we accept the cul-de-sac snap otherwise. Zones use a larger radius
-# (500 m) — zone-representative nodes especially benefit from picking
-# real intersections rather than arbitrary minor-road nodes within the
-# zone's extent.
+# **Eligibility filter via `compute_snap_eligibility`.** Per mode,
+# precomputes the snap-eligible node set (largest CC / SCC of the
+# cost-masked subgraph) so points don't snap to disconnected islands
+# (walk / bike) or one-way trap segments (car).
 #
 # Snap distances are reused downstream as the cell-to-network-node
 # first-mile / last-mile component of trip overheads.
 
 # %%
 walk_graph = network_processing.load_consolidated_graphml(
-    PREPARED_DIR / 'walk_graph.graphml')
+    PREPARED_DIR / 'walk_graph_consolidated.graphml')
 bike_graph = network_processing.load_consolidated_graphml(
-    PREPARED_DIR / 'bike_graph.graphml')
+    PREPARED_DIR / 'bike_graph_consolidated.graphml')
 car_graph  = network_processing.load_consolidated_graphml(
-    PREPARED_DIR / 'car_graph.graphml')
+    PREPARED_DIR / 'car_graph_consolidated.graphml')
 
-# Mode-aware preparation: undirected + largest-CC for walk + bike,
-# directed + largest-SCC for car. The returned PreparedGraph objects
-# carry both the snap-eligible node set (largest CC/SCC of the
-# cost-masked subgraph) and the snap-priority node set (well-connected
-# intersections, per `MODE_PRIORITY_DEFAULTS`) used in the two-pass snap
-# below.
-walk_prepared = network_processing.prepare_network(walk_graph, 'walk')
-bike_prepared = network_processing.prepare_network(bike_graph, 'bike')
-car_prepared  = network_processing.prepare_network(car_graph,  'car')
-for label, prepared in [('walk', walk_prepared),
-                        ('bike', bike_prepared),
-                        ('car',  car_prepared)]:
-    n_total = prepared.graph.number_of_nodes()
-    n_elig = len(prepared.snap_eligible_nodes)
-    n_pri = len(prepared.snap_priority_nodes)
+# Compute the snap-eligible node set + per-edge `cost_excluded_<mode>` flag
+# for each mode. Used by both `insert_projected_nodes` (eligibility +
+# cost-mask) and `snap_to_network_nodes` (eligibility).
+walk_eligible, walk_cost_flag = routing_prep.compute_snap_eligibility(walk_graph, 'walk')
+bike_eligible, bike_cost_flag = routing_prep.compute_snap_eligibility(bike_graph, 'bike')
+car_eligible,  car_cost_flag  = routing_prep.compute_snap_eligibility(car_graph,  'car')
+for label, graph, eligible in [('walk', walk_graph, walk_eligible),
+                               ('bike', bike_graph, bike_eligible),
+                               ('car',  car_graph,  car_eligible)]:
+    n_total = graph.number_of_nodes()
+    n_elig = len(eligible)
     print(f"  {label:4s} snap-eligible: {n_elig:>7,} / {n_total:>7,} nodes "
-          f"({100 * n_elig / n_total:.1f}%);  priority: {n_pri:>6,} "
-          f"({100 * n_pri / n_total:.1f}%)")
+          f"({100 * n_elig / n_total:.1f}%)")
 
 
-# Per-layer priority radii for the two-pass snap. Cells get a tight radius (most
-# cells either have a real intersection nearby or accept the cul-de-sac / minor
-# road snap); zones get a wider radius (zone-rep nodes benefit from picking a
-# real intersection with at least one medium / main tier road connected to it
-# within the zone footprint). Radii are similar to / slightly larger than
-# respective hexagon edge lengths.
-PRIORITY_RADIUS_M = {'cells': 75.0, 'zones': 750.0}
+# Per-layer radii.
+# - NODE_SPACING_M: how far apart inserted virtuals can be along an edge.
+#   A projection within this distance of an existing endpoint triggers
+#   no insertion (the endpoint will serve as the snap target instead).
+# - PRIORITY_NODE_RADIUS_M: for cars, the tier-1 radius — a centroid
+#   within this distance of a priority node snaps there in preference
+#   to any closer non-priority node.
+# - MAX_RADIUS_M: maximum snap / insert distance. Points beyond this
+#   from every eligible edge / node stay unsnapped (NaN).
+NODE_SPACING_M = {'cells': 100.0, 'zones': 250.0}
+PRIORITY_NODE_RADIUS_M = {'cells': 100.0, 'zones': 500.0}
+MAX_RADIUS_M = {'cells': 200.0, 'zones': 1_000.0}
+
+# Priority edges for cars (well-connected main roads). The corresponding
+# priority node set is derived from edge incidence.
+CAR_PRIORITY_EDGE_TAGS = frozenset({
+    'tertiary', 'tertiary_link',
+    'secondary', 'secondary_link',
+    'primary', 'primary_link',
+})
 
 
 def snap_layer_to_all_networks(layer: gpd.GeoDataFrame, layer_name: str) -> None:
-    """Mutate `layer` to add node-id + snap-distance columns for each network.
+    """For each network, (1) insert virtual nodes onto edges so the layer's
+    centroids have fine-grained snap targets, then (2) snap each centroid to
+    its nearest node. Mutates `layer` to add `node_id_<mode>` and
+    `snap_dist_<mode>` columns.
 
-    Two-pass snap: priority targets (well-connected intersections) within
-    `PRIORITY_RADIUS_M[layer_name]`, eligible fallback otherwise.
+    For car networks, the snap step is two-tier: centroids within
+    `PRIORITY_NODE_RADIUS_M[layer_name]` of a node incident to a main
+    road snap there; others fall back to the nearest eligible node within
+    `MAX_RADIUS_M`. Walk + bike use single-tier (every eligible node
+    equally weighted).
     """
     centroids = layer.copy()
     centroids['geometry'] = centroids.geometry.centroid
-    priority_radius = PRIORITY_RADIUS_M[layer_name]
-    for label, prepared in [('walk', walk_prepared),
-                            ('bike', bike_prepared),
-                            ('car',  car_prepared)]:
-        nid, dist = network_processing.snap_to_network_nodes(
-            centroids, prepared.graph,
-            eligible_node_ids=prepared.snap_eligible_nodes,
-            priority_node_ids=prepared.snap_priority_nodes,
-            priority_max_distance=priority_radius,
+    node_spacing = NODE_SPACING_M[layer_name]
+    max_radius = MAX_RADIUS_M[layer_name]
+    priority_node_radius = PRIORITY_NODE_RADIUS_M[layer_name]
+    print(f"  {layer_name} ({len(centroids):,} centroids → 3 networks):")
+    for label, graph, eligible, cost_flag in [
+        ('walk', walk_graph, walk_eligible, walk_cost_flag),
+        ('bike', bike_graph, bike_eligible, bike_cost_flag),
+        ('car',  car_graph,  car_eligible,  car_cost_flag),
+    ]:
+        n_nodes_before = graph.number_of_nodes()
+        t0 = time.perf_counter()
+        # Phase A — enrich graph with virtuals near unmatched centroids.
+        network_snap.insert_projected_nodes(
+            centroids, graph,
+            max_radius=max_radius,
+            node_spacing=node_spacing,
+            eligible_node_ids=eligible,
+            cost_excluded_flag=cost_flag,
+            verbose=True,
         )
+        # `insert_projected_nodes` filtered to edges with both endpoints in
+        # `eligible` (the routable-component check), so every inserted virtual
+        # is provably routable. Union them in so Phase B's snap can see them.
+        eligible_now = frozenset(eligible) | {
+            n for n, d in graph.nodes(data=True) if d.get('is_virtual') == 1
+        }
+        # Phase B — point-to-node snap. Cars use the priority-node tier.
+        if label == 'car':
+            priority_nodes = network_snap.nodes_incident_to_edges(
+                graph, edge_tags=CAR_PRIORITY_EDGE_TAGS,
+            )
+            nid, dist = network_snap.snap_to_network_nodes(
+                centroids, graph,
+                max_radius=max_radius,
+                eligible_node_ids=eligible_now,
+                priority_node_ids=priority_nodes,
+                priority_node_radius=priority_node_radius,
+            )
+        else:
+            nid, dist = network_snap.snap_to_network_nodes(
+                centroids, graph,
+                max_radius=max_radius,
+                eligible_node_ids=eligible_now,
+            )
+        elapsed_s = time.perf_counter() - t0
+        n_inserted = graph.number_of_nodes() - n_nodes_before
+        n_matched = int(nid.notna().sum())
+        median_dist = float(dist.median()) if n_matched > 0 else float('nan')
+        print(f"    {label:4s} {elapsed_s:>6.2f}s  "
+              f"matched {n_matched:>6,}/{len(centroids):,}  "
+              f"virtual nodes inserted: {n_inserted:>4,}  "
+              f"median snap dist: {median_dist:>4.0f} m")
         layer[f'node_id_{label}'] = nid
         layer[f'snap_dist_{label}'] = dist
 
 
 for layer, name in [(cells, 'cells'), (zones, 'zones')]:
     snap_layer_to_all_networks(layer, name)
-    print(f"  Snapped {name}: "
-          f"walk {layer['node_id_walk'].notna().sum():>6,} "
-          f"(median dist {layer['snap_dist_walk'].median():.0f} m), "
-          f"bike {layer['node_id_bike'].notna().sum():>6,}, "
-          f"car  {layer['node_id_car'].notna().sum():>6,}")
 
 
 # %% [markdown]
@@ -404,15 +447,36 @@ for layer, name in [(cells, 'cells'), (zones, 'zones')]:
 #   for fine-grained visualisation (same values, more granular display).
 #   `building_id` is the row index of `employment_per_building.gpkg`
 #   loaded by `gpd.read_file`.
+# - `{walk,bike,car}_graph.graphml` — snap-mutated graphs (read by
+#   downstream scripts 4_topography → 5_density → accessibility,
+#   calibrate). The input to this step is `*_consolidated.graphml` from
+#   1_download; the snap mutations (tier-2/3 virtual nodes from
+#   `snap_to_network_tiered`, per-edge `cost_excluded_<mode>` flags from
+#   `compute_snap_eligibility`, and `is_virtual=1` on inserted nodes)
+#   are layered on top and written here. Keeping consolidated input
+#   and snapped output on separate paths means this script is
+#   idempotent — re-runnable against a pristine baseline for A/B
+#   testing of snap parameters without re-running 1_download.
 
 # %%
 cells.to_file(PREPARED_DIR / 'cells.gpkg', driver='GPKG')
 zones.to_file(PREPARED_DIR / 'zones.gpkg', driver='GPKG')
 buildings[['cell_id']].to_csv(PREPARED_DIR / 'building_to_cell.csv')
-print(f"\nSaved:")
+
+ox.save_graphml(walk_graph, PREPARED_DIR / 'walk_graph.graphml')
+ox.save_graphml(bike_graph, PREPARED_DIR / 'bike_graph.graphml')
+ox.save_graphml(car_graph,  PREPARED_DIR / 'car_graph.graphml')
+
+print("\nSaved:")
 print(f"  cells.gpkg              ({len(cells):,} cells)")
 print(f"  zones.gpkg              ({len(zones):,} zones)")
 print(f"  building_to_cell.csv    ({len(buildings):,} rows)")
+print(f"  walk_graph.graphml      ({walk_graph.number_of_nodes():,} nodes, "
+      f"{walk_graph.number_of_edges():,} edges; snap-mutated)")
+print(f"  bike_graph.graphml      ({bike_graph.number_of_nodes():,} nodes, "
+      f"{bike_graph.number_of_edges():,} edges; snap-mutated)")
+print(f"  car_graph.graphml       ({car_graph.number_of_nodes():,} nodes, "
+      f"{car_graph.number_of_edges():,} edges; snap-mutated)")
 
 
 # %% [markdown]
@@ -424,8 +488,8 @@ print(f"  building_to_cell.csv    ({len(buildings):,} rows)")
 # empty-cell filter).
 
 # %%
-print(f"\n--- Per-layer validation (sums should all match) ---")
-print(f"                       cells           zones         input")
+print("\n--- Per-layer validation (sums should all match) ---")
+print("                       cells           zones         input")
 for col, input_total in [
     ('population',       pop_df['population'].sum()),
     ('employment_total', buildings['employment_total'].sum()),
@@ -502,6 +566,61 @@ for ax, col, title, cmap in [
 cells.drop(columns=['_poi_total'], inplace=True)
 plt.suptitle(f'Zoomed to {2 * ZOOM_HALF_WIDTH_M // 1000} km × '
              f'{2 * ZOOM_HALF_WIDTH_M // 1000} km centred on Bern',
+             y=1.02, fontsize=11)
+plt.tight_layout()
+plt.show()
+
+
+# %% [markdown]
+# ## Appendix: snap visual check — original vs virtual nodes
+#
+# Optional diagnostic. Bern 10 km × 10 km crop, two panels (walk / car).
+# Edges in gray, original consolidated nodes in blue, snap-inserted
+# virtual nodes (tagged `is_virtual=1` by tier-2/3 in step 7) in red.
+# Where the red dots concentrate is where the snap fired — typically
+# building clusters and POIs sitting outside `NODE_RADIUS_M[layer]` of
+# any consolidated node. Useful for sanity-checking that virtual nodes
+# land on actual road geometry rather than disconnected fragments.
+
+# %%
+_SNAP_ZOOM_HALF = 5_000  # 10 km × 10 km
+_SNAP_CX, _SNAP_CY = BERN_CENTER_LV95
+
+
+def _split_nodes_by_virtual(graph):
+    old_xy, new_xy = [], []
+    for _, d in graph.nodes(data=True):
+        if d.get('is_virtual', 0) == 1:
+            new_xy.append((d['x'], d['y']))
+        else:
+            old_xy.append((d['x'], d['y']))
+    return old_xy, new_xy
+
+
+def _plot_snap_panel(ax, graph, title):
+    ox.plot_graph(graph, ax=ax, node_size=0, edge_color='#999',
+                  edge_linewidth=0.4, bgcolor='white', show=False, close=False)
+    old_xy, new_xy = _split_nodes_by_virtual(graph)
+    if old_xy:
+        xs, ys = zip(*old_xy)
+        ax.scatter(xs, ys, s=4, c='#1f77b4', edgecolors='none',
+                   label=f'consolidated ({len(old_xy):,})', zorder=4)
+    if new_xy:
+        xs, ys = zip(*new_xy)
+        ax.scatter(xs, ys, s=8, c='#d62728', edgecolors='none',
+                   label=f'snap-inserted virtual ({len(new_xy):,})', zorder=5)
+    ax.set_xlim(_SNAP_CX - _SNAP_ZOOM_HALF, _SNAP_CX + _SNAP_ZOOM_HALF)
+    ax.set_ylim(_SNAP_CY - _SNAP_ZOOM_HALF, _SNAP_CY + _SNAP_ZOOM_HALF)
+    ax.set_title(title, fontsize=11)
+    ax.set_aspect('equal')
+    ax.legend(loc='lower left', fontsize=8, framealpha=0.9)
+
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+_plot_snap_panel(axes[0], walk_graph, 'Walk — consolidated vs snap-inserted nodes')
+_plot_snap_panel(axes[1], car_graph,  'Car — consolidated vs snap-inserted nodes')
+plt.suptitle(f'Snap diagnostic — {2 * _SNAP_ZOOM_HALF // 1000} km × '
+             f'{2 * _SNAP_ZOOM_HALF // 1000} km centred on Bern',
              y=1.02, fontsize=11)
 plt.tight_layout()
 plt.show()

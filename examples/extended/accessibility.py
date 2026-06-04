@@ -72,6 +72,7 @@ from aperta import (
     od_pairs,
     overhead,
     routing,
+    routing_prep,
     visualization as viz,
 )
 
@@ -159,7 +160,6 @@ OVERHEAD_COEF = {
 # === Utility coefficients (per-mode discrete-choice spec) ===================
 # U_ijm = β_asc
 #       + β_time      · t_min                       (linear time, per min)
-#       + β_time_log  · ln(t_min)                   (diminishing marginal cost)
 #       + β_density   · mean(density_norm) along route
 #       + β_bike_score· mean(bike_score)   along route
 # `t_min` is the total cell-to-cell time including per-cell overhead
@@ -171,23 +171,20 @@ OVERHEAD_COEF = {
 UTILITY_COEF = {
     "walk": {
         "asc": 0.0,
-        "time": -0.30,
-        "time_log": -0.0,
+        "time": -1.0,
         "density": 0.0,
-        "bike_score": 0.0
+        "bike_score": 0.5
     },
     "bike_regular": {
-        "asc": 0.0,
-        "time": -0.30,
-        "time_log": -0.0,
-        "density": -0.0,
-        "bike_score": 0.0,
+        "asc": -4.0,
+        "time": -0.6,
+        "density": -0.2,
+        "bike_score": 1.5,
     },
     "car_peak": {
-        "asc": 0.0,
-        "time": -0.30,
-        "time_log": -0.0,
-        "density": -0.0,
+        "asc": -6.0,
+        "time": -0.4,
+        "density": -0.6,
         "bike_score": 0.0
     },
 }
@@ -260,9 +257,9 @@ print(f"Car:  {car_graph.number_of_nodes():>7,} nodes / {car_graph.number_of_edg
 # and bike, directed + largest-SCC snap for car. Each call also tags
 # mode-non-traversable edges (motorway/trunk for walk) as cost-excluded
 # via a per-edge boolean attribute named on `prepared.cost_excluded_flag`.
-walk_prepared = network_processing.prepare_network(walk_graph, "walk")
-bike_prepared = network_processing.prepare_network(bike_graph, "bike")
-car_prepared = network_processing.prepare_network(car_graph, "car")
+walk_prepared = routing_prep.prepare_network(walk_graph, "walk")
+bike_prepared = routing_prep.prepare_network(bike_graph, "bike")
+car_prepared = routing_prep.prepare_network(car_graph, "car")
 walk_graph = walk_prepared.graph
 bike_graph = bike_prepared.graph
 car_graph = car_prepared.graph
@@ -870,7 +867,6 @@ plt.show()
 # ```
 # U_ijm = β_asc
 #       + β_time      · t_min                           (linear time, in min)
-#       + β_time_log  · ln(t_min)                       (diminishing marginal cost)
 #       + β_density   · mean(density_norm)  along route (per-edge density)
 #       + β_bike_score· mean(bike_score)    along route (per-edge quietness)
 # ```
@@ -888,20 +884,6 @@ plt.show()
 # walking — quieter routes are pleasanter on foot too — but neutral for
 # cars. `density_norm` is the same square-root per-edge density we
 # routed on in §2.
-#
-# **Coefficients** — approximations informed by an ongoing project;
-# placeholders pending a public reference:
-#
-# | Coefficient    |    Walk | Bike (regular) | Car (peak)     |
-# |----------------|--------:|---------------:|---------------:|
-# | `β_asc`        |    0    |     −4         |    −6.1        |
-# | `β_time` (/min)|   −0.01 |     −0.02      |    −0.07       |
-# | `β_time_log`   |   −3.3  |     −2.3       |    −0.9        |
-# | `β_density`    |    0    |     −0.25      |    −0.6        |
-# | `β_bike_score` |    0.4  |      1.1       |     0          |
-#
-# Original table in `coefficients/utility_coefficients.csv` — also
-# carries transit and elevation-std columns this tutorial skips.
 
 
 # %%
@@ -980,7 +962,7 @@ def assemble_utility_from_total_time(
 
     For each origin-destination cell pair::
 
-        U = β_asc + β_time × t_min + β_time_log × ln(t_min)
+        U = β_asc + β_time × t_min + 
               + β_density × mean(density_norm) + β_bike_score × mean(bike_score)
 
     where `t_min = total_cost_geo / 60` — total time in minutes including
@@ -1012,7 +994,6 @@ def assemble_utility_from_total_time(
                 u = (
                     coef["asc"]
                     + coef["time"] * t_min
-                    + coef["time_log"] * np.log(t_min)
                     + coef["density"] * density_clean
                     + coef["bike_score"] * bike_clean
                 )
@@ -1602,10 +1583,6 @@ plt.show()
 #   Cells are small enough here that the difference is minor.
 # - **No `overhead_*_dist` term.** The published coefficient table
 #   doesn't have it; production may add it back per regional fit.
-# - **Overhead enters utility through linear time only.** Per-cell
-#   overhead is multiplied by `β_time` but not folded into the
-#   `β_time_log` term. Small distortion at typical overhead magnitudes
-#   (~tens of seconds).
 # - **Edge weights are paper-derived, not re-calibrated** for this
 #   region. To re-derive them from ground-truth travel times, see
 #   `calibrate_edge_weights.ipynb`; to add a traffic-flow / congestion

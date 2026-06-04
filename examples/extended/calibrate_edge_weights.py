@@ -70,7 +70,7 @@ import osmnx as ox
 import pandas as pd
 from shapely.geometry import Point
 
-from aperta import calibration, geo_processing, network_processing
+from aperta import calibration, geo_processing, network_processing, routing_prep
 
 warnings.filterwarnings('ignore', category=FutureWarning)
 warnings.filterwarnings('ignore', category=UserWarning, module='geopandas')
@@ -95,7 +95,7 @@ print(f"Car graph: {car_graph.number_of_nodes():,} nodes / "
 # calibration below prevents trip endpoints from snapping to trapped nodes
 # (which would otherwise produce spurious routing failures and contaminate
 # the OLS fit).
-car_prepared = network_processing.prepare_network(car_graph, 'car')
+car_prepared = routing_prep.prepare_network(car_graph, 'car')
 car_graph = car_prepared.graph
 print(f"  Snap-eligible (largest SCC): {len(car_prepared.snap_eligible_nodes):,} nodes "
       f"({100 * len(car_prepared.snap_eligible_nodes) / car_graph.number_of_nodes():.1f}%)")

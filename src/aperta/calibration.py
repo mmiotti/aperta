@@ -46,7 +46,7 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 
-from aperta import geo_mapping, geo_processing, network_processing, routing
+from aperta import geo_mapping, geo_processing, network_snap, routing
 
 # Used to convert km/h → m/s.
 _KMH_TO_MS = 1.0 / 3.6
@@ -184,10 +184,10 @@ def _filter_and_snap_legs(
             geometry=gpd.points_from_xy(legs[f"{side}_x"], legs[f"{side}_y"]),
             index=legs.index,
         )
-        node_ids, dists = network_processing.snap_to_network_nodes(
+        node_ids, dists = network_snap.snap_to_network_nodes(
             points,
             graph,
-            max_distance=snap_max_distance,
+            max_radius=snap_max_distance,
             eligible_node_ids=eligible_node_ids,
             eligible_node_flag=eligible_node_flag,
         )
@@ -351,7 +351,7 @@ def calibrate_edge_weights(
         eligible_node_ids: optional set / list / Index of node IDs to restrict
             trip-endpoint snap targets to. Forwarded to
             `snap_to_network_nodes`. Typically `prepared.snap_eligible_nodes`
-            from `network_processing.prepare_network` — prevents trips from
+            from `routing_prep.prepare_network` — prevents trips from
             snapping to trapped nodes and contaminating the calibration fit.
         eligible_node_flag: alternative to `eligible_node_ids` — name of a
             per-node bool attribute on `graph` marking eligible snap targets

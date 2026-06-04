@@ -74,9 +74,11 @@ import aperta.accessibility as accessibility
 import aperta.geo_mapping as geo_mapping
 import aperta.geo_processing as geo_processing
 import aperta.network_processing as network_processing
+import aperta.network_snap as network_snap
 import aperta.od_pairs as od_pairs
 import aperta.overhead as overhead
 import aperta.routing as routing
+import aperta.routing_prep as routing_prep
 import aperta.utility as utility
 import aperta.visualization as viz
 
@@ -173,7 +175,7 @@ print(f"{len(cells):,} cells in {len(zones):,} zones")
 # (motorway / trunk).
 graph = ox.graph_from_place(PLACE, network_type='all', simplify=True)
 graph = ox.project_graph(graph, to_crs=boundary_proj_crs)
-prepared = network_processing.prepare_network(graph, 'walk')
+prepared = routing_prep.prepare_network(graph, 'walk')
 graph = prepared.graph
 print(f"Network: {graph.number_of_nodes():,} nodes, {graph.number_of_edges():,} edges")
 
@@ -242,7 +244,7 @@ WALK_SPEED_MS = 1.4
 cell_centroids_gdf = gpd.GeoDataFrame(
     geometry=cells.geometry.centroid, index=cells.index, crs=cells.crs,
 )
-cells['node_id'], dist_to_node = network_processing.snap_to_network_nodes(
+cells['node_id'], dist_to_node = network_snap.snap_to_network_nodes(
     cell_centroids_gdf, graph,
     eligible_node_ids=prepared.snap_eligible_nodes,
 )
@@ -264,8 +266,8 @@ cells['walk_overhead_s'] = dist_to_node / WALK_SPEED_MS
 # touches them, exclude the top tier (motorways / trunk roads) and the bottom
 # tier (pedestrian-only paths), then snap each zone to the eligible node
 # nearest to the *median* coordinates of the zone's eligible interior nodes —
-# the zone's transport-weighted centroid. This is what
-# `assign_to_eligible_centroid` does.
+# the zone's transport-weighted centroid. This is what `transport_centroid`
+# (followed by `snap_to_network_nodes`) does.
 
 # %%
 # Map OSM highway tags to an ordinal road class (1 = pedestrian-only / off-road
@@ -308,8 +310,11 @@ print(f"{len(eligible_zone_nodes):,} / {graph.number_of_nodes():,} graph nodes "
 # Snap each zone via the median of its eligible interior nodes (transport
 # centroid), falling back to the geometric centroid for any zone with no
 # eligible node inside.
-zones['node_id'], _ = network_processing.assign_to_eligible_centroid(
+zone_centroids = network_snap.transport_centroid(
     zones, graph, eligible_node_ids=eligible_zone_nodes,
+)
+zones['node_id'], _ = network_snap.snap_to_network_nodes(
+    zone_centroids, graph, eligible_node_ids=eligible_zone_nodes,
 )
 
 # %%
@@ -635,14 +640,14 @@ plt.show()
 # %%
 bike_graph = ox.graph_from_place(PLACE, network_type='bike', simplify=True)
 bike_graph = ox.project_graph(bike_graph, to_crs=boundary_proj_crs)
-bike_prepared = network_processing.prepare_network(bike_graph, 'bike')
+bike_prepared = routing_prep.prepare_network(bike_graph, 'bike')
 bike_graph = bike_prepared.graph
 print(f"Bike network: {bike_graph.number_of_nodes():,} nodes, "
       f"{bike_graph.number_of_edges():,} edges")
 
 # Per-cell snapping (centroid → nearest bike-network node), capturing the
 # centroid→node distance for the per-cell first-mile overhead below.
-cells['bike_node_id'], bike_dist_to_node = network_processing.snap_to_network_nodes(
+cells['bike_node_id'], bike_dist_to_node = network_snap.snap_to_network_nodes(
     cell_centroids_gdf, bike_graph,
     eligible_node_ids=bike_prepared.snap_eligible_nodes,
 )
@@ -654,8 +659,11 @@ bike_node_road_class = network_processing.aggregate_edges_to_nodes(
 bike_eligible_nodes = bike_node_road_class[
     (bike_node_road_class >= 2) & (bike_node_road_class <= 4)
 ].index
-zones['bike_node_id'], _ = network_processing.assign_to_eligible_centroid(
+bike_zone_centroids = network_snap.transport_centroid(
     zones, bike_graph, eligible_node_ids=bike_eligible_nodes,
+)
+zones['bike_node_id'], _ = network_snap.snap_to_network_nodes(
+    bike_zone_centroids, bike_graph, eligible_node_ids=bike_eligible_nodes,
 )
 
 # %% [markdown]

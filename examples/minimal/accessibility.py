@@ -32,9 +32,10 @@ import geopandas as gpd
 import aperta.accessibility as accessibility
 import aperta.geo_mapping as geo_mapping
 import aperta.geo_processing as geo_processing
-import aperta.network_processing as network_processing
+import aperta.network_snap as network_snap
 import aperta.od_pairs as od_pairs
 import aperta.routing as routing
+import aperta.routing_prep as routing_prep
 import aperta.visualization as viz
 
 PLACE = 'Cambridge, Massachusetts, USA'
@@ -53,7 +54,7 @@ graph = ox.project_graph(
     ox.graph_from_place(PLACE, network_type='all', simplify=True),
     to_crs=crs,
 )
-prepared = network_processing.prepare_network(graph, 'walk')
+prepared = routing_prep.prepare_network(graph, 'walk')
 
 # %% [markdown]
 # ## 2. H3 cells (origins) + supermarkets (destinations)
@@ -66,7 +67,7 @@ cells = geo_processing.build_h3_grid(
 cell_centroids = gpd.GeoDataFrame(
     geometry=cells.geometry.centroid, index=cells.index, crs=cells.crs,
 )
-cells['node_id'], _ = network_processing.snap_to_network_nodes(
+cells['node_id'], _ = network_snap.snap_to_network_nodes(
     cell_centroids, prepared.graph,
     eligible_node_ids=prepared.snap_eligible_nodes,
 )
