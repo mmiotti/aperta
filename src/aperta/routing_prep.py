@@ -294,8 +294,7 @@ def compute_snap_eligibility(
             `consolidate_intersections`. Must be directed (`nx.MultiDiGraph`).
         mode: Free-form mode label. If it matches a `BaseMode`
             (`'walk'`/`'bike'`/`'car'`), pulls defaults from `MODE_DEFAULTS`.
-        base_mode, directedness, network_type, cost_excluded_tags,
-            cost_excluded_flag: same semantics as `prepare_network`.
+        base_mode, directedness, network_type, cost_excluded_tags, cost_excluded_flag: same semantics as `prepare_network`.
         overwrite_cost_excluded: `'always'` (default) rewrites
             `cost_excluded_<mode>` on every edge; `'if_missing'` preserves
             existing values.

@@ -22,7 +22,6 @@ scaffold.
 | `geo_processing` | Geometry helpers — H3 grids, line bearings, KDTree-based buffer aggregations, raster sampling, Copernicus GLO-30 DEM download (`fetch_copernicus_dem` requires `aperta[topo]`). |
 | `geo_mapping` | Spatial-join wrappers between points, polygons, and filtered lines. |
 | `data_processing` | Tabular helpers — dedup indices after a spatial join, add straight-line distance, weighted mean per group. |
-| `osm_helpers` | OSM data fetching + per-edge categorization via `osmnx`. Requires `aperta[osm]`. |
 | `visualization` | Plot helpers — choropleth panels, multi-panel comparisons, per-edge `LineCollection` rendering, styled colorbars. |
 | `errors` | aperta-specific exception types. |
 
@@ -61,7 +60,6 @@ geo_mapping
 network_processing
 network_snap
 data_processing
-osm_helpers
 ```
 
 ```{toctree}

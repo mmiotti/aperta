@@ -9,7 +9,7 @@ outputs.
 |---|---|---|---|
 | Minimal | [`minimal`](minimal) | ~10 s | Every aperta primitive exercised exactly once, OSM data only (Cambridge MA). The "what does aperta do?" demo. |
 | Walkthrough | [`walkthrough`](walkthrough) | ~1 min | Guided tour of every primitive on real OSM data (Central Paris): tiered ODs, geo-keyed reindex, overheads, three accessibility metrics, path-first per-edge feature aggregation, cross-modal logsum. Covers the full accessibility surface end-to-end. |
-| Calibration | [`calibration`](calibration) | ~30 min | Consolidated calibration workflow on the Canton of Zurich (fetched inline from OSM): traffic-flow estimation via nested-betweenness sampling with survey-derived P(C), then flow-aware edge-weight calibration against Google-Maps peak-hour travel times. |
+| Calibration | [`calibration`](calibration.ipynb) | ~30 min | Consolidated calibration workflow on the Canton of Zurich (fetched inline from OSM): traffic-flow estimation via nested-betweenness sampling with survey-derived P(C), then flow-aware edge-weight calibration against Google-Maps peak-hour travel times. |
 
 The **calibration notebook** fetches the OSM car network for the Canton
 of Zurich inline via `osmnx`; the only external inputs are ground-truth
