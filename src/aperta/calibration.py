@@ -45,7 +45,6 @@ import geopandas as gpd
 import networkx as nx
 import numpy as np
 import pandas as pd
-from sklearn.metrics import r2_score, root_mean_squared_error
 
 from aperta import data_processing, geo_mapping, geo_processing, network_snap, routing
 
@@ -190,6 +189,26 @@ def _build_predictors(
     return X, feat_cols, kinds
 
 
+def _r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """R² (coefficient of determination). Matches sklearn.metrics.r2_score
+    for a single-output regression: `1 − SS_res / SS_tot`, where `SS_tot`
+    uses the mean of the observed values."""
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    ss_res = float(((y_true - y_pred) ** 2).sum())
+    ss_tot = float(((y_true - y_true.mean()) ** 2).sum())
+    if ss_tot == 0.0:
+        return 0.0 if ss_res == 0.0 else float("-inf")
+    return 1.0 - ss_res / ss_tot
+
+
+def _root_mean_squared_error(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Root mean squared error. Matches sklearn.metrics.root_mean_squared_error."""
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    return float(np.sqrt(((y_true - y_pred) ** 2).mean()))
+
+
 def _metrics_by_distance(
     observed: pd.Series, predicted: pd.Series, dist_line: pd.Series
 ) -> pd.DataFrame:
@@ -211,8 +230,8 @@ def _metrics_by_distance(
             }
         else:
             rows[label] = {
-                "r2": r2_score(observed[mask], predicted[mask]),
-                "rmse": root_mean_squared_error(observed[mask], predicted[mask]),
+                "r2": _r2_score(observed[mask], predicted[mask]),
+                "rmse": _root_mean_squared_error(observed[mask], predicted[mask]),
                 "bias": predicted[mask].sum() / observed[mask].sum(),
                 "n": mask.sum(),
             }
