@@ -45,9 +45,9 @@ from aperta.od_pairs import (
     TieredODNodePairs,
     TieredODPairs,
     aggregate_across_modes,
-    dest_values,
     get_euclidean_dists,
     get_pairs,
+    lookup_dest_column_node,
 )
 
 # Per-cell population values; distinct so summation bugs are detectable.
@@ -275,7 +275,7 @@ class CustomZoneCentroidsTestCase(unittest.TestCase):
 
 
 class SharedNodeDedupTestCase(unittest.TestCase):
-    """Multiple cells sharing a node: dedup, and populations sum in dest_values."""
+    """Multiple cells sharing a node: dedup, and populations sum in lookup_dest_column_node."""
 
     def test_shared_dest_node(self):
         cells = gpd.GeoDataFrame(
@@ -299,7 +299,7 @@ class SharedNodeDedupTestCase(unittest.TestCase):
         )
         pairs = get_pairs(cells, r_cells=2.0, node_column="node_id", zones=zones, r_zones=2.0)
         self.assertCountEqual(pairs.cells_to_cells["N0"].tolist(), ["N0", "N1"])
-        vals = dest_values("population", pairs, cells, "node_id", zones=zones)
+        vals = lookup_dest_column_node("population", pairs, cells, "node_id", zones=zones)
         n0_dests = pairs.cells_to_cells["N0"]
         n0_vals = dict(zip(n0_dests.tolist(), vals.cells_to_cells["N0"].tolist()))
         self.assertEqual(n0_vals["N0"], 30)  # 10 + 20
@@ -307,7 +307,7 @@ class SharedNodeDedupTestCase(unittest.TestCase):
 
 
 class DestValuesTestCase(unittest.TestCase):
-    """`dest_values` looks up the per-tier value matching each tier's destinations."""
+    """`lookup_dest_column_node` looks up the per-tier value matching each tier's destinations."""
 
     @classmethod
     def setUpClass(cls):
@@ -332,7 +332,7 @@ class DestValuesTestCase(unittest.TestCase):
             r_medium=3.5,
             zones_centroids=self.custom_centroids,
         )
-        vals = dest_values("population", pairs, self.cells, "node_id", zones=self.zones)
+        vals = lookup_dest_column_node("population", pairs, self.cells, "node_id", zones=self.zones)
         for ot_pairs, ot_vals in [
             (pairs.cells_to_cells, vals.cells_to_cells),
             (pairs.cells_to_zones, vals.cells_to_zones),
@@ -351,12 +351,12 @@ class DestValuesTestCase(unittest.TestCase):
             self.cells, r_cells=1.5, node_column="node_id", zones=self.zones, r_zones=2.5
         )
         with self.assertRaisesRegex(ValueError, "zones"):
-            dest_values("population", pairs, self.cells, "node_id")
+            lookup_dest_column_node("population", pairs, self.cells, "node_id")
 
     def test_raises_on_missing_column(self):
         pairs = get_pairs(self.cells, r_cells=1.5, node_column="node_id")
         with self.assertRaisesRegex(ValueError, "unknown_col"):
-            dest_values("unknown_col", pairs, self.cells, "node_id")
+            lookup_dest_column_node("unknown_col", pairs, self.cells, "node_id")
 
     def test_cells_to_zones_looks_up_zones_column(self):
         # r_cells=0, r_medium=r_zones=3.0 → all non-same-zone pairs (d ∈ {1,1,2})
@@ -369,7 +369,7 @@ class DestValuesTestCase(unittest.TestCase):
             r_zones=3.0,
             r_medium=3.0,
         )
-        vals = dest_values("population", pairs, self.cells, "node_id", zones=self.zones)
+        vals = lookup_dest_column_node("population", pairs, self.cells, "node_id", zones=self.zones)
         assert vals.cells_to_zones is not None
         # N0 (in Z0) → ZN1 and ZN2 at middle tier. Z1 pop = 500+600=1100,
         # Z2 pop = 700+800+900=2400.
@@ -386,7 +386,7 @@ class ConservationTestCase(unittest.TestCase):
         cls.nodes, cls.cells, cls.zones = _build_world()
 
     def _check_conservation(self, pairs):
-        vals = dest_values("population", pairs, self.cells, "node_id", zones=self.zones)
+        vals = lookup_dest_column_node("population", pairs, self.cells, "node_id", zones=self.zones)
         total = sum(_CELL_POPULATIONS)
         cell_to_zone = self.cells.set_index("node_id")["zone_id"]
         zone_to_node = self.zones["node_id"]
@@ -613,6 +613,50 @@ class GetPairsMaskFiltersTestCase(unittest.TestCase):
         assert pairs.zones_to_zones is not None
         # ZN2 is Z2's zone node — it should NOT appear as a zones_to_zones origin.
         self.assertNotIn("ZN2", pairs.zones_to_zones.keys())
+
+    # ----- rogue cells: NaN zone_id or zone_id not in zones.index -----
+    def test_rogue_cells_get_empty_cells_to_cells_entry(self):
+        """Cells with NaN zone_id (or zone_id not in `zones.index`) are
+        invisible to the zone-iterating tier loops, but `get_pairs` still
+        populates them with empty `cells_to_cells` entries so downstream
+        node-keyed lookups don't `KeyError`.
+        """
+        cells = self.cells.copy()
+        # Mark C0's zone_id as NaN — its node N0 should still appear in
+        # cells_to_cells (with an empty array, since its zone hierarchy
+        # is missing).
+        cells.loc["C0", "zone_id"] = np.nan
+        with self.assertLogs(level="WARNING") as log_ctx:
+            pairs = get_pairs(
+                cells,
+                r_cells=1.5,
+                node_column="node_id",
+                zones=self.zones,
+                r_zones=2.5,
+            )
+        self.assertIn("N0", pairs.cells_to_cells)
+        self.assertEqual(len(pairs.cells_to_cells["N0"]), 0)
+        # And the warning should mention the rogue-cell count.
+        self.assertTrue(any("origin cells have no parent zone" in m for m in log_ctx.output))
+
+    def test_rogue_cells_respect_orig_cells_mask(self):
+        """The post-loop rogue-cell touch only adds origins in `orig_node_set`
+        (when an `orig_cells` mask is provided). Rogue cells outside the
+        mask still don't appear.
+        """
+        cells = self.cells.copy()
+        cells.loc["C0", "zone_id"] = np.nan
+        # Mask EXCLUDES C0.
+        orig = ~cells.index.isin(["C0"])
+        pairs = get_pairs(
+            cells,
+            r_cells=1.5,
+            node_column="node_id",
+            zones=self.zones,
+            r_zones=2.5,
+            orig_cells=orig,
+        )
+        self.assertNotIn("N0", pairs.cells_to_cells)
 
     # ----- dest_cells: filter cell-tier destinations -----
     def test_dest_cells_filters_destinations(self):
@@ -1050,7 +1094,10 @@ class CellsToZonesMiddleTierTestCase(unittest.TestCase):
         assert pairs.zones_to_zones is not None
         self.assertEqual(set(pairs.zones_to_zones["ZA"]), {"ZC"})
         self.assertEqual(set(pairs.zones_to_zones["ZC"]), {"ZA"})
-        self.assertNotIn("ZB", pairs.zones_to_zones)  # ZB has no far-tier dests
+        # ZB has no far-tier dests, but every valid origin zone appears as
+        # a key under the populate-empty-arrays convention.
+        self.assertIn("ZB", pairs.zones_to_zones)
+        self.assertEqual(len(pairs.zones_to_zones["ZB"]), 0)
 
     def test_r_medium_auto_inference(self):
         """Default r_medium = min(r_cells * 10, r_zones)."""

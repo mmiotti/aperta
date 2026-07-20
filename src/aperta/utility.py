@@ -132,8 +132,8 @@ class Utility:
 
 
 def route_utility(
-    pairs: TieredODPairs,
     graph: nx.Graph,
+    pairs: TieredODPairs,
     weight: str,
     utility: Utility,
     *,
@@ -159,8 +159,8 @@ def route_utility(
     and all route features.
 
     Args:
-        pairs: tiered destination IDs (typically from `od_pairs.get_pairs`).
         graph: routable networkx graph.
+        pairs: tiered destination IDs (typically from `od_pairs.get_pairs`).
         weight: edge attribute name used for routing AND as the cost
             contribution to utility (multiplied by `utility.cost_coefficient`).
         utility: the `Utility` spec.
@@ -169,9 +169,9 @@ def route_utility(
             convention as unreachable / masked-out).
 
     Returns:
-        `TieredODPairs` of route-utility values (float64 by default).
-        Unreachable / masked-out destinations are `np.nan` (NOT `np.inf` —
-        utility is a signed quantity).
+        `TieredODPairs` of route-utility values (dtype = `dtype`, default
+        `np.float32`). Unreachable / masked-out destinations are `np.nan`
+        (NOT `np.inf` — utility is a signed quantity).
     """
     has_route_features = len(utility.route_features) > 0
 
@@ -182,8 +182,8 @@ def route_utility(
             for rf in utility.route_features
         ]
         costs, aggs = tiered_path_aggregate(
-            pairs,
             graph,
+            pairs,
             weight,
             edge_aggregations=path_aggs,
             mask=mask,
@@ -193,8 +193,8 @@ def route_utility(
     else:
         # No route features → skip path retrieval, faster.
         costs = tiered_path_costs(
-            pairs,
             graph,
+            pairs,
             weight,
             mask=mask,
             cutoff=cutoff,
@@ -278,7 +278,7 @@ def add_endpoint_utility(
     nodes (`zones` is used). If multiple cells / zones map to the same
     network node, their feature values are averaged.
 
-    Destination features are looked up via `od_pairs.dest_values` —
+    Destination features are looked up via `od_pairs.lookup_dest_column_node` —
     cell-tier dests look up in `cells`, while `cells_to_zones` and
     `zones_to_zones` dests look up in `zones`. Missing feature columns at
     a given tier silently contribute zero to that tier (the OD pairs still
@@ -307,9 +307,10 @@ def add_endpoint_utility(
             Default `'node_id'`.
 
     Returns:
-        `TieredODPairs` of full per-OD utility (float64).
+        `TieredODPairs` of full per-OD utility. The dtype is inherited from
+        `route_util` (typically `np.float32`).
     """
-    # Pre-compute destination-feature ODMs (tier-aware via dest_values).
+    # Pre-compute destination-feature ODMs (tier-aware via lookup_dest_column_node).
     dest_value_odms: dict[str, tuple[TieredODPairs, float]] = {}
     for feature_col, beta in utility.destination_features.items():
         if cells is None or feature_col not in cells.columns:
@@ -317,7 +318,7 @@ def add_endpoint_utility(
                 f"Destination feature {feature_col!r} not in cells.columns "
                 f"(needed for cell-tier destination lookups)."
             )
-        d = od_pairs.dest_values(
+        d = od_pairs.lookup_dest_column_node(
             feature_col,
             pairs,
             cells,
@@ -351,9 +352,13 @@ def add_endpoint_utility(
         for origin, u_arr in route_tier.items():
             u = u_arr + utility.constant
             for lookup, beta in origin_lookups.values():
-                val = lookup.get(origin)
-                if val is not None:
-                    u = u + beta * float(val)
+                # Fail loud on missing origin — silently dropping the
+                # term produces a looks-finite-but-wrong utility that
+                # is far worse to debug than a KeyError. Origins in
+                # `route_utility` come from the same routing pass whose
+                # cells/zones frame built `lookup`; a miss means the
+                # frames diverged.
+                u = u + beta * float(lookup[origin])
             for dest_odm, beta in dest_value_odms.values():
                 d_arr = getattr(dest_odm, tier_attr)
                 if d_arr is None:

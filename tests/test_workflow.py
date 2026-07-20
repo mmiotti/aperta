@@ -132,7 +132,10 @@ class WorkflowTestCase(unittest.TestCase):
         self.assertEqual(set(pairs.cells_to_zones["a0"]), {"b0"})
         self.assertEqual(set(pairs.cells_to_zones["a1"]), {"b0"})
         # Cells in ZC have no middle-tier dests (no other zone within d<5).
-        self.assertNotIn("c0", pairs.cells_to_zones)
+        # `get_pairs` populates every valid origin with a (possibly empty)
+        # destination array — c0 is a key but its destination set is empty.
+        self.assertIn("c0", pairs.cells_to_zones)
+        self.assertEqual(len(pairs.cells_to_zones["c0"]), 0)
         # Far (zones_to_zones): ZA-ZC (d=10) and ZB-ZC (d=7), both in [5, 15).
         self.assertEqual(set(pairs.zones_to_zones["a0"]), {"c0"})
         self.assertEqual(set(pairs.zones_to_zones["b0"]), {"c0"})
@@ -144,7 +147,9 @@ class WorkflowTestCase(unittest.TestCase):
         self.assertEqual(sorted(dists.cells_to_cells["a0"].tolist()), [0.0, 1.0])
 
         # ===== Phase 3 (cont.): per-tier destination weights =============
-        pop = od_pairs.dest_values("population", pairs, self.cells, "node_id_nw", zones=self.zones)
+        pop = od_pairs.lookup_dest_column_node(
+            "population", pairs, self.cells, "node_id_nw", zones=self.zones
+        )
         assert pop.cells_to_zones is not None and pop.zones_to_zones is not None
         # Cell-tier dests for a0 are {a0 (pop 10), a1 (pop 20)} → sum 30.
         self.assertEqual(sorted(pop.cells_to_cells["a0"].tolist()), [10.0, 20.0])
@@ -154,7 +159,7 @@ class WorkflowTestCase(unittest.TestCase):
         np.testing.assert_array_equal(pop.zones_to_zones["a0"], np.array([110.0]))
 
         # ===== Phase 5: routed travel costs ==============================
-        times = routing.tiered_path_costs(pairs, self.graph, "length")
+        times = routing.tiered_path_costs(self.graph, pairs, "length")
         assert times.cells_to_zones is not None and times.zones_to_zones is not None
         # cells_to_cells for a0: {a0→a1=1, a0→a0=0}.
         self.assertEqual(sorted(times.cells_to_cells["a0"].tolist()), [0.0, 1.0])

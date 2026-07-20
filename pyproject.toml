@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aperta"
-version = "0.2.0a0"
+version = "0.3.0a0"
 description = "Python toolkit for cross-modal accessibility analysis on transport networks."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -83,6 +83,16 @@ examples = [
     "jupytext>=1.16",
     "contextily>=1.4",
 ]
+# Dev tooling that backs the pre-commit hooks + CI jobs (lint, typecheck,
+# notebook-pair sync, unit tests). Install with `pip install -e '.[dev]'`
+# inside an env where the project is already editable-installed, then
+# `pre-commit install --hook-type pre-push` to activate the hooks.
+dev = [
+    "pre-commit>=4.0",
+    "ruff>=0.6",
+    "mypy>=1.10",
+    "jupytext>=1.16",
+]
 # Building the Sphinx docs site (read by .readthedocs.yaml).
 docs = [
     "sphinx>=8.0",
@@ -124,6 +134,7 @@ module = [
     "numba.*",
     "pyaxis.*",
     "requests.*",
+    "sklearn.*",
 ]
 ignore_missing_imports = true
 

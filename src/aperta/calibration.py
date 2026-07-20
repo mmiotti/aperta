@@ -45,8 +45,9 @@ import geopandas as gpd
 import networkx as nx
 import numpy as np
 import pandas as pd
+from sklearn.metrics import r2_score, root_mean_squared_error
 
-from aperta import geo_mapping, geo_processing, network_snap, routing
+from aperta import data_processing, geo_mapping, geo_processing, network_snap, routing
 
 # Used to convert km/h → m/s.
 _KMH_TO_MS = 1.0 / 3.6
@@ -58,177 +59,96 @@ class CalibrationResult:
 
     Attributes:
         coefficients: DataFrame indexed by feature name with columns
-            `kind` (multiplier / additive_route / additive_endpoint / const /
-            baseline), `coef` (fitted value), `p` (p-value),
-            `mean_effect` (coef × mean of column, in seconds).
-        r_squared: OLS R² on the held-in trips.
-        n_used: number of ground-truth rows that survived snap + filter +
-            successful routing.
-        predicted_times: per-trip predicted time (Series indexed by trip_id);
-            comparable to `ground_truth.loc[predicted_times.index, 'time_measured']`.
-        observed_times: per-trip observed time (same index as predicted).
-        routed_distances: per-trip routed distance (m); useful for
-            distance-band breakdowns.
-        rmse: overall RMSE on the held-in trips, in seconds.
-        rmse_by_distance: Series of RMSE per distance band, indexed by
-            band label (`'< 10 km'`, `'10-25 km'`, `'>= 25 km'`).
-        edge_duration_attr: name of the per-edge attribute written to
-            `graph` by the final iteration (default `'duration_calibrated'`).
-            Downstream routing can use this as the cost.
-        iter_log: DataFrame, one row per iteration, columns r_squared, rmse,
-            n_used — useful to inspect convergence.
+            `coef` (fitted value) and `p` (p-value). Includes the OLS
+            constant (`const`, if `constant` was set), `baseline_time`
+            (the α scale on baseline duration), and one row per
+            multiplier / additive_route / additive_endpoint feature.
+
+        n_used: Number of ground-truth trips that survived snap +
+            distance filters and entered the OLS fit.
+
+        Three per-distance-band metrics frames are reported, each a
+        DataFrame indexed by distance band (`"all"`, `"< 5 km"`,
+        `"5-25 km"`, `">= 25 km"`) with columns `r2`, `rmse`, `bias`.
+        Each measures fit between observed times and a different
+        prediction mechanism on the same trip set:
+
+          * `metrics_baseline` — predict via routing with
+            `length / speed_kph` only (the un-calibrated graph). Invariant
+            to the user's prior coefficient choices. Quantifies the lift
+            the calibration provides over the raw speed_kph attribute.
+          * `metrics_calibrated` — predict via routing on the
+            CALIBRATED graph (final α + coefs applied to edge weights;
+            Dijkstra re-runs to pick paths under those weights, and the
+            sum of weights along the chosen path is the prediction). This
+            is the production-relevant number — what you'd actually get
+            if you deployed the calibrated graph for routing.
+          * `metrics_regression` — OLS R² of the final iteration's
+            linear-model fit. The OLS sits on the iteration-N routing's
+            paths (NOT the final-coefs routing's paths), so this is an
+            upper bound on calibrated R². The gap between regression and
+            calibrated R² is a convergence diagnostic: small gap →
+            calibration converged at this `n_iterations`; large gap →
+            bumping `n_iterations` would tighten things.
+
+        Quick overall-fit access: `result.metrics_calibrated.loc['all', 'r2']`.
     """
 
     coefficients: pd.DataFrame
-    r_squared: float
+    metrics_baseline: pd.DataFrame
+    metrics_calibrated: pd.DataFrame
+    metrics_regression: pd.DataFrame
     n_used: int
-    predicted_times: pd.Series
-    observed_times: pd.Series
-    routed_distances: pd.Series
-    rmse: float
-    rmse_by_distance: pd.Series
-    edge_duration_attr: str
-    iter_log: pd.DataFrame
 
 
-def _baseline_edge_duration(graph: nx.MultiDiGraph, baseline_speed_attr: str) -> dict:
-    """Per-edge baseline duration in seconds: length / (speed / 3.6)."""
-    out: dict = {}
-    for u, v, k, data in graph.edges(keys=True, data=True):
-        speed = float(data[baseline_speed_attr])
-        length = float(data["length"])
-        if speed <= 0:
-            raise ValueError(
-                f"Edge ({u},{v},{k}) has non-positive "
-                f"{baseline_speed_attr}={speed!r}; calibration needs "
-                "a positive baseline speed."
-            )
-        out[(u, v, k)] = length / (speed * _KMH_TO_MS)
-    return out
-
-
-def _apply_edge_durations(
-    graph: nx.MultiDiGraph,
-    baseline_duration: dict,
-    alpha: float,
-    multiplier_coefs: dict[str, float],
-    additive_route_coefs: dict[str, float],
-    out_attr: str,
-    min_edge_duration: float = 0.01,
-) -> None:
-    """Write per-edge predicted duration to `out_attr`.
-
-        edge_duration = α · baseline + baseline · Σ_m coef_m · m_value
-                                     + Σ_a coef_a · a_value
-
-    `α` calibrates the overall baseline scale; multiplier coefs scale the
-    baseline by per-feature amounts (added — not multiplied — to the α
-    baseline term, since they enter as `baseline · feature` in the linear
-    OLS model). Mirrors the per-edge formula in
-    `examples/swiss/prepare/4_edge_weights.ipynb`, minus the floor / cap.
-
-    Per-edge duration is clipped to `min_edge_duration` seconds. Without
-    this, a single transient negative coefficient (mid-iteration OLS noise,
-    common when starting from zero on a noisy feature) can produce a
-    negative edge weight, which scipy's Dijkstra refuses to handle. The
-    clip is wide of any physically meaningful duration so well-conditioned
-    fits are unaffected.
-    """
-    for u, v, k, data in graph.edges(keys=True, data=True):
-        base = baseline_duration[(u, v, k)]
-        mult_term = base * sum(c * float(data.get(f, 0.0)) for f, c in multiplier_coefs.items())
-        add_term = sum(c * float(data.get(f, 0.0)) for f, c in additive_route_coefs.items())
-        data[out_attr] = max(alpha * base + mult_term + add_term, min_edge_duration)
-
-
-def _filter_and_snap_legs(
-    legs: pd.DataFrame,
-    graph: nx.MultiDiGraph,
+def apply_edge_durations(
+    graph: nx.MultiGraph,
     *,
-    min_trip_distance: float,
-    max_trip_distance: float,
-    max_dist_to_line_ratio: float,
-    snap_max_distance: float,
-    eligible_node_ids=None,
-    eligible_node_flag: str | None = None,
-) -> pd.DataFrame:
-    """Apply trip filters + snap origin / dest to nearest network nodes.
+    multiplier_features: dict[str, float] | None = None,
+    additive_route_features: dict[str, float] | None = None,
+    alpha: float = 1.0,
+    out_attr: str = "duration",
+    baseline_duration_attr: str = "speed_kph",
+    min_speed_kph: float = 1.0,
+    max_speed_kph: float = 120.0,
+) -> None:
+    """Write per-edge duration to `out_attr` (mutates `graph` in place):
 
-    Adds columns: `nx_node_orig`, `nx_node_dest`, `snap_dist_orig`,
-    `snap_dist_dest`. Drops rows where either snap fails or distance
-    is beyond `snap_max_distance`. `eligible_node_ids` / `eligible_node_flag`
-    are forwarded to `snap_to_network_nodes` to restrict snap targets to
-    trap-free nodes (typically `prepared.snap_eligible_nodes` from
-    `prepare_network`).
+        edge_duration = α · base + base · Σ_m c_m · m_value + Σ_a c_a · a_value
+
+    where `base = baseline_duration_attr` (usually: speed limit for
+    cars, a fixed speed for active modes) before any features are added.
+
+    Term semantics:
+      - **α · base** — global scale on the network-derived baseline. `α=1.0`
+        (default) is the prior; trust the network's `speed_kph` as-is.
+        After calibration, pass the fitted `α` (from
+        `CalibrationResult.coefficients` row `baseline_time`) to apply
+        the calibrated weights to a fresh graph for downstream routing.
+      - **base · multiplier_features[f] · edge[f]** — speed-like correction:
+        per-feature coefficient scales the baseline by `f`'s value on
+        that edge (e.g. `slope_climb · 8.0` on a 10 % climb adds 80 %
+        to that edge's baseline time).
+      - **additive_route_features[f] · edge[f]** — raw seconds per edge,
+        independent of length / speed (e.g. `is_traffic_signal · 5.0`
+        adds 5 s on signalised intersections).
     """
-    if "dist_line" not in legs.columns:
-        legs = legs.copy()
-        dx = legs["dest_x"] - legs["orig_x"]
-        dy = legs["dest_y"] - legs["orig_y"]
-        legs["dist_line"] = np.hypot(dx, dy)
-
-    n_in = len(legs)
-    legs = legs[(legs["dist_line"] >= min_trip_distance) & (legs["dist_line"] < max_trip_distance)]
-    if "dist_measured" in legs.columns:
-        ratio = legs["dist_measured"] / legs["dist_line"]
-        legs = legs[ratio < max_dist_to_line_ratio]
-    logging.info(
-        f"  Trip filter: {n_in:,} → {len(legs):,} legs after dist_line "
-        f"[{min_trip_distance:.0f}, {max_trip_distance:.0f}] m + "
-        f"dist_measured/dist_line < {max_dist_to_line_ratio}."
-    )
-
-    legs = legs.copy()
-    for side in ("orig", "dest"):
-        points = gpd.GeoDataFrame(
-            geometry=gpd.points_from_xy(legs[f"{side}_x"], legs[f"{side}_y"]),
-            index=legs.index,
-        )
-        node_ids, dists = network_snap.snap_to_network_nodes(
-            points,
-            graph,
-            max_radius=snap_max_distance,
-            eligible_node_ids=eligible_node_ids,
-            eligible_node_flag=eligible_node_flag,
-        )
-        legs[f"nx_node_{side}"] = node_ids
-        legs[f"snap_dist_{side}"] = dists
-
-    n_before = len(legs)
-    legs = legs.dropna(subset=["nx_node_orig", "nx_node_dest"])
-    logging.info(
-        f"  Snap filter: {n_before:,} → {len(legs):,} legs within "
-        f"{snap_max_distance:.0f} m of a network node."
-    )
-    return legs
+    multiplier_features = multiplier_features or {}
+    additive_route_features = additive_route_features or {}
+    for u, v, k, data in graph.edges(keys=True, data=True):
+        length = float(data["length"])
+        base = float(data[baseline_duration_attr])
+        mult_term = base * sum(c * float(data.get(f, 0.0)) for f, c in multiplier_features.items())
+        add_term = sum(c * float(data.get(f, 0.0)) for f, c in additive_route_features.items())
+        duration = alpha * base + mult_term + add_term
+        max_duration = length / (min_speed_kph * _KMH_TO_MS)
+        min_duration = length / (max_speed_kph * _KMH_TO_MS)
+        data[out_attr] = max(min(duration, max_duration), min_duration)
 
 
-def _join_endpoint_features(
-    routed: pd.DataFrame, legs: pd.DataFrame, graph: nx.MultiDiGraph, endpoint_features: list[str]
-) -> pd.DataFrame:
-    """Add per-trip columns `<feature>_orig` and `<feature>_dest` from node attrs."""
-    if not endpoint_features:
-        return routed
-    nodes_iter = graph.nodes(data=True)
-    node_attrs = pd.DataFrame.from_dict(
-        {n: {f: d.get(f, np.nan) for f in endpoint_features} for n, d in nodes_iter},
-        orient="index",
-    )
-    aligned_legs = legs.loc[legs.index.intersection(routed.index)]
-    for side in ("orig", "dest"):
-        node_ids = aligned_legs[f"nx_node_{side}"]
-        for f in endpoint_features:
-            routed.loc[node_ids.index, f"{f}_{side}"] = node_ids.map(node_attrs[f]).values
-    # Snap distance is on legs, not on graph nodes — propagate it through too.
-    for side in ("orig", "dest"):
-        col = f"snap_dist_{side}"
-        if col in legs.columns:
-            routed.loc[aligned_legs.index, col] = aligned_legs[col].reindex(routed.index).values
-    return routed
-
-
-def _build_design_matrix(
+def _build_predictors(
     routed: pd.DataFrame,
+    baseline_edge_attr: str,
     multiplier_features: list[str],
     additive_route_features: list[str],
     additive_endpoint_features: list[str],
@@ -245,14 +165,13 @@ def _build_design_matrix(
     coefficient is the calibrated multiplier on the per-edge baseline (the
     `α` term in the model docstring).
     """
-    rows = {"baseline_time": routed["cost"].astype(float)}
+    rows = {"baseline_time": routed[baseline_edge_attr].astype(float)}
     kinds = ["baseline"]
     feat_cols = ["baseline_time"]
     for f in multiplier_features:
-        col = f"{f}__mult"
-        rows[col] = (routed["cost"] * routed[f]).astype(float)
+        rows[f] = (routed["cost"] * routed[f]).astype(float)
         kinds.append("multiplier")
-        feat_cols.append(col)
+        feat_cols.append(f)
     for f in additive_route_features:
         rows[f] = routed[f].astype(float)
         kinds.append("additive_route")
@@ -271,22 +190,102 @@ def _build_design_matrix(
     return X, feat_cols, kinds
 
 
-def _rmse_by_distance(observed: pd.Series, predicted: pd.Series, dist_line: pd.Series) -> pd.Series:
-    """RMSE per distance band — `< 10 km` / `10-25 km` / `>= 25 km`."""
+def _metrics_by_distance(
+    observed: pd.Series, predicted: pd.Series, dist_line: pd.Series
+) -> pd.DataFrame:
+    """Error metrics for all trips and per distance band."""
+
     bands = [
-        ("< 10 km", dist_line < 10_000),
-        ("10-25 km", (dist_line >= 10_000) & (dist_line < 25_000)),
+        ("all", dist_line > 0),
+        ("< 5 km", dist_line < 5_000),
+        ("5-25 km", (dist_line >= 5_000) & (dist_line < 25_000)),
         (">= 25 km", dist_line >= 25_000),
     ]
     rows = {}
     for label, mask in bands:
-        idx = observed.index[mask.reindex(observed.index, fill_value=False)]
-        if len(idx) == 0:
-            rows[label] = np.nan
+        if mask.sum() < 3:
+            rows[label] = {
+                "r2": np.nan,
+                "rmse": np.nan,
+                "bias": np.nan,
+            }
         else:
-            err = (predicted.loc[idx] - observed.loc[idx]).to_numpy()
-            rows[label] = float(np.sqrt((err**2).mean()))
-    return pd.Series(rows)
+            rows[label] = {
+                "r2": r2_score(observed[mask], predicted[mask]),
+                "rmse": root_mean_squared_error(observed[mask], predicted[mask]),
+                "bias": predicted[mask].sum() / observed[mask].sum(),
+                "n": mask.sum(),
+            }
+    return pd.DataFrame.from_dict(rows, orient="index")
+
+
+def _apply_and_route(
+    graph: nx.MultiDiGraph,
+    trips: pd.DataFrame,
+    multiplier_features: dict[str, float] | None = None,
+    additive_route_features: dict[str, float] | None = None,
+    endpoint_features: dict[str, float] | None = None,
+    baseline_duration_attr: str = "__baseline_duration",
+    min_speed_kph: float = 1.0,
+    max_speed_kph: float = 120.0,
+    edge_duration_attr: str = "duration_calibrated",
+    edge_feature_aggs: dict[str, str] | None = None,
+    alpha: float = 1.0,
+    const: float = 0.0,
+):
+
+    # Apply edge weights
+    apply_edge_durations(
+        graph,
+        multiplier_features=multiplier_features,
+        additive_route_features=additive_route_features,
+        alpha=alpha,
+        out_attr=edge_duration_attr,
+        baseline_duration_attr=baseline_duration_attr,
+        min_speed_kph=min_speed_kph,
+        max_speed_kph=max_speed_kph,
+    )
+
+    # Route and collect travel times + features
+    routed = routing.shortest_path_metrics_one_to_one(
+        graph,
+        list(trips.index),
+        trips["nx_node_orig"],
+        trips["nx_node_dest"],
+        weight=edge_duration_attr,
+        length_attr="length",
+        edge_features=edge_feature_aggs,
+    )
+
+    routed["cost_net"] = routed["cost"]
+    routed["cost"] = routed["cost_net"] + const
+
+    # Apply origin/destination costs
+    if not endpoint_features:
+        return routed
+    routed = routed.join(
+        trips[["nx_node_orig", "nx_node_dest", "snap_dist_orig", "snap_dist_dest"]]
+    )
+    nodes_iter = graph.nodes(data=True)
+    node_attrs = pd.DataFrame.from_dict(
+        {n: {f: d.get(f, np.nan) for f in endpoint_features} for n, d in nodes_iter},
+        orient="index",
+    )
+    features = []
+    values = []
+    for side in ("orig", "dest"):
+        for f in endpoint_features:
+            features.append(f"{f}_{side}")
+            values.append(endpoint_features[f])
+            # Snap distance was read directly from trips table
+            if f == "snap_dist":
+                continue
+            routed[f"{f}_{side}"] = routed[f"nx_node_{side}"].map(node_attrs[f]).values
+    routed["cost"] = routed["cost"] + (routed[features] * np.array(values)[np.newaxis, :]).sum(
+        axis=1
+    )
+
+    return routed
 
 
 def calibrate_edge_weights(
@@ -297,11 +296,11 @@ def calibrate_edge_weights(
     multiplier_features: dict[str, float] | None = None,
     additive_route_features: dict[str, float] | None = None,
     additive_endpoint_features: dict[str, float] | None = None,
-    constant: bool = True,
+    min_speed_kph: float = 1.0,
+    max_speed_kph: float = 120.0,
+    constant: float | None = None,
     n_iterations: int = 3,
-    snap_max_distance: float = 300.0,
-    min_trip_distance: float = 3_000.0,
-    max_trip_distance: float = 100_000.0,
+    max_distance: float = 300.0,
     max_dist_to_line_ratio: float = 4.0,
     edge_duration_attr: str = "duration_calibrated",
     eligible_node_ids=None,
@@ -337,12 +336,12 @@ def calibrate_edge_weights(
         additive_endpoint_features: `{node_attr: initial_coef}`. Each adds
             `coef · value_at_origin + coef · value_at_destination` to total
             trip duration. Use for snap distance, local density at endpoints.
+        min_speed_kph: minimum edge speed (including node effects) in km/h.
+        max_speed_kph: maximum edge speed (including node effects) in km/h.
         constant: include an intercept in the OLS fit.
         n_iterations: number of route-fit cycles. 2-3 usually converges.
-        snap_max_distance: drop trips where origin or destination is farther
+        max_distance: drop trips where origin or destination is farther
             than this from any network node (metres).
-        min_trip_distance: drop trips with `dist_line` below this (metres).
-        max_trip_distance: drop trips with `dist_line` above this (metres).
         max_dist_to_line_ratio: if `dist_measured` is present, drop trips
             where `dist_measured / dist_line` exceeds this (long detours are
             usually data noise).
@@ -365,190 +364,174 @@ def calibrate_edge_weights(
         ValueError: if any required column is missing or every trip filters
             out before fitting.
     """
-    try:
-        import statsmodels.api as sm
-    except ImportError as e:
-        raise ImportError(
-            "calibrate_edge_weights needs `statsmodels` (install with "
-            "`pip install 'aperta[examples]'` or `pip install statsmodels`)."
-        ) from e
+
+    import statsmodels.api as sm
 
     multiplier_features = dict(multiplier_features or {})
     additive_route_features = dict(additive_route_features or {})
     additive_endpoint_features = dict(additive_endpoint_features or {})
+    r2_tolerance = 0.0001
 
+    # 1: Data preparation
     required = {"orig_x", "orig_y", "dest_x", "dest_y", "time_measured"}
     missing = required - set(ground_truth.columns)
+    n_in = len(ground_truth)
     if missing:
         raise ValueError(f"`ground_truth` is missing required columns: {sorted(missing)}")
+    if n_iterations < 1:
+        raise ValueError("`n_iterations` must be at least 1")
+    trips = ground_truth
+    if "dist_line" not in trips.columns:
+        trips = data_processing.add_straight_line_dist(trips)
+    if "dist_measured" in trips.columns and max_dist_to_line_ratio:
+        ratio = trips["dist_measured"] / trips["dist_line"]
+        trips = trips[ratio < max_dist_to_line_ratio]
+    elif max_dist_to_line_ratio:
+        raise ValueError(
+            "`ground_truth` is missing `dist_measured` (required for `max_dist_to_line_ratio`)"
+        )
 
-    logging.info(
-        f"Calibration: {len(ground_truth):,} input trips, "
-        f"{len(multiplier_features)} multiplier + "
-        f"{len(additive_route_features)} additive-route + "
-        f"{len(additive_endpoint_features)} additive-endpoint features."
-    )
+    # 2: Snap origins and destinations
+    for side in ("orig", "dest"):
+        geom = gpd.points_from_xy(trips[f"{side}_x"], trips[f"{side}_y"])
+        points = gpd.GeoDataFrame(geometry=geom, index=trips.index)
+        node_ids, dists = network_snap.snap_to_network_nodes(
+            points,
+            graph,
+            max_distance=max_distance,
+            eligible_node_ids=eligible_node_ids,
+            eligible_node_flag=eligible_node_flag,
+        )
+        trips[f"nx_node_{side}"] = node_ids
+        trips[f"snap_dist_{side}"] = dists
 
-    # 1. Pre-snap + filter once — depends only on the graph topology, not on
-    #    the (iteratively changing) edge weights.
-    legs = _filter_and_snap_legs(
-        ground_truth,
-        graph,
-        min_trip_distance=min_trip_distance,
-        max_trip_distance=max_trip_distance,
-        max_dist_to_line_ratio=max_dist_to_line_ratio,
-        snap_max_distance=snap_max_distance,
-        eligible_node_ids=eligible_node_ids,
-        eligible_node_flag=eligible_node_flag,
-    )
-    if len(legs) == 0:
+    trips = trips.dropna(subset=["nx_node_orig", "nx_node_dest"])
+    if len(trips) == 0:
         raise ValueError("No trips remain after snap + filter.")
+    logging.info(f"  {n_in:,} → {len(trips):,} trips left after filters.")
 
-    # 2. Baseline per-edge duration (length / speed) computed once — feeds
-    #    into every iteration's edge-duration formula.
-    baseline_duration = _baseline_edge_duration(graph, baseline_speed_attr)
-
-    # 4. Iterate: apply current coefs → route → fit → update coefs.
-    #    α (baseline scale) starts at 1.0; multiplier/additive/endpoint
-    #    coefs start at user-supplied initial values. After each OLS fit,
-    #    α + coefs are read directly from the fit (NO cumulative rescaling
-    #    of baseline_duration — that was a confusing earlier design that
-    #    made α drift across iterations even when the model was stable).
     alpha = 1.0
     cur_mult = dict(multiplier_features)
     cur_add = dict(additive_route_features)
     cur_end = dict(additive_endpoint_features)
+    const = constant if constant is not None else 0
+
+    # 3: write baseline duration
+    baseline_duration_attr = "__baseline_duration"
+    length = nx.get_edge_attributes(graph, "length")
+    baseline_speed = nx.get_edge_attributes(graph, baseline_speed_attr)
+    baseline_duration = {
+        k: length[k] / (np.minimum(max_speed_kph, np.maximum(min_speed_kph, v)) * _KMH_TO_MS)
+        for k, v in baseline_speed.items()
+    }
+    nx.set_edge_attributes(graph, baseline_duration, baseline_duration_attr)
 
     # Aggregation per feature: multiplier features get length-weighted-avg
     # (so they enter as a speed-like correction); additive route features
     # get summed along the path.
     edge_feature_aggs: dict[str, str] = {
-        **{f: "length_weighted" for f in cur_mult},
-        **{f: "sum" for f in cur_add},
+        **{baseline_duration_attr: "sum"},
+        **{f: "length_weighted" for f in multiplier_features},
+        **{f: "sum" for f in additive_route_features},
     }
+    r2_prev = 0.0
 
-    iter_log_rows = []
-    fit_result = None
-    routed = None
-    feat_cols: list[str] = []
-    kinds: list[str] = []
+    # `final_*` track the latest fit; updated every iteration. Guarantees a
+    # valid result even when convergence stops on iter 1 (e.g. when the
+    # initial guess produces R² below `r2_tolerance` and the conditional
+    # branch below doesn't fire).
+    final_coefs: pd.DataFrame | None = None
+    final_m_baseline = final_m_calib = final_m_regr = None
 
-    for iteration in range(1, n_iterations + 1):
-        # 4a. Write per-edge duration into the graph (scipy CSR is rebuilt
-        # per call inside shortest_path_metrics_one_to_one — cheap relative
-        # to the actual Dijkstras).
-        _apply_edge_durations(
-            graph, baseline_duration, alpha, cur_mult, cur_add, edge_duration_attr
-        )
-
-        # 4b. Route every trip + aggregate features along the path.
-        routed = routing.shortest_path_metrics_one_to_one(
+    for iteration in range(1, n_iterations + 2):
+        # 4.1: Apply edge weights based on current coefficient values and route trips
+        routed = _apply_and_route(
             graph,
-            list(legs.index),
-            legs["nx_node_orig"],
-            legs["nx_node_dest"],
-            weight=edge_duration_attr,
-            length_attr="length",
-            edge_features=edge_feature_aggs,
+            trips,
+            cur_mult,
+            cur_add,
+            cur_end,
+            baseline_duration_attr,
+            min_speed_kph,
+            max_speed_kph,
+            edge_duration_attr,
+            edge_feature_aggs,
+            alpha,
+            const,
         )
-        routed = _join_endpoint_features(routed, legs, graph, list(cur_end))
 
-        # 4c. OLS fit.
-        X, feat_cols, kinds = _build_design_matrix(
-            routed, list(cur_mult), list(cur_add), list(cur_end), constant
+        # 4.2: Build OLS design matrix
+        X, feat_cols, kinds = _build_predictors(
+            routed,
+            baseline_duration_attr,
+            list(cur_mult),
+            list(cur_add),
+            list(cur_end),
+            constant is not None,
         )
-        y = legs.loc[routed.index, "time_measured"]
+
+        # 4.3: Run OLS
+        y = trips.loc[routed.index, "time_measured"]
         valid = X.notna().all(axis=1) & y.notna()
         X_f, y_f = X[valid], y[valid]
-        if len(y_f) < len(feat_cols) + 1:
-            raise ValueError(
-                f"Iteration {iteration}: only {len(y_f)} valid rows for "
-                f"{len(feat_cols)} feature columns — calibration ill-posed."
-            )
         fit_result = sm.OLS(y_f, X_f).fit()
 
-        # 4d. Update coefficient state for next iteration directly from the
-        #     OLS fit (no rescaling — coefs are in the units of the model
-        #     equation; the per-edge formula in _apply_edge_durations uses
-        #     them as-is).
-        coefs = fit_result.params
-        alpha = float(coefs["baseline_time"])
-        cur_mult = {f: float(coefs[f"{f}__mult"]) for f in cur_mult}
-        cur_add = {f: float(coefs[f]) for f in cur_add}
-        # Endpoint coefs are stored per (feature, side); the per-edge
-        # formula doesn't use them. Average the two sides so cur_end stays
-        # a single-value dict (only relevant for the next iteration's
-        # design matrix, which rebuilds the per-side columns anyway).
-        cur_end = {f: (float(coefs[f"{f}_orig"]) + float(coefs[f"{f}_dest"])) / 2 for f in cur_end}
+        # 4.4: Gather error metrics
+        dist_line = ground_truth.loc[valid.index, "dist_line"]
+        m_baseline = _metrics_by_distance(y_f, routed[baseline_duration_attr][valid], dist_line)
+        m_calib_net = _metrics_by_distance(y_f, routed["cost_net"][valid], dist_line)
+        m_calib = _metrics_by_distance(y_f, routed["cost"][valid], dist_line)
+        m_regr = _metrics_by_distance(y_f, fit_result.fittedvalues, dist_line)
 
-        edge_feature_aggs = {
-            **{f: "length_weighted" for f in cur_mult},
-            **{f: "sum" for f in cur_add},
-        }
+        # 4.5: Record this iteration's result unconditionally — the
+        # convergence check below decides whether to *continue*, but a valid
+        # result is always available.
+        final_coefs = pd.DataFrame({"coef": fit_result.params, "p": fit_result.pvalues}).round(3)
+        final_m_baseline, final_m_calib, final_m_regr = m_baseline, m_calib, m_regr
 
-        # 4e. Iteration log.
-        pred = fit_result.fittedvalues
-        rmse_iter = float(np.sqrt(((pred - y_f) ** 2).mean()))
-        iter_log_rows.append(
-            {
-                "iteration": iteration,
-                "r_squared": float(fit_result.rsquared),
-                "rmse": rmse_iter,
-                "n_used": int(len(y_f)),
-                "alpha": alpha,
-            }
-        )
-        logging.info(
-            f"  Iter {iteration}/{n_iterations}: R²={fit_result.rsquared:.4f}, "
-            f"RMSE={rmse_iter:.1f} s, n={len(y_f):,}, α={alpha:.3f}"
-        )
-
-    assert fit_result is not None and routed is not None
-
-    # 5. Write final per-edge duration (with the LAST iteration's coefs).
-    _apply_edge_durations(graph, baseline_duration, alpha, cur_mult, cur_add, edge_duration_attr)
-
-    # 6. Assemble outputs.
-    coef_df = pd.DataFrame(
-        {
-            "kind": kinds,
-            "coef": fit_result.params.values,
-            "p": fit_result.pvalues.values,
-        },
-        index=feat_cols,
-    )
-    # Mean effect (coef × mean of column) — same convention as lumos.
-    X, _, _ = _build_design_matrix(
-        routed,
-        list(multiplier_features),
-        list(additive_route_features),
-        list(additive_endpoint_features),
-        constant,
-    )
-    y = legs.loc[routed.index, "time_measured"]
-    valid = X.notna().all(axis=1) & y.notna()
-    coef_df["mean_effect"] = [
-        float((X.loc[valid, c] * coef_df.loc[c, "coef"]).mean()) for c in coef_df.index
-    ]
-    coef_df = coef_df.round(4)
-
-    predicted = pd.Series(fit_result.fittedvalues, index=y[valid].index, name="predicted_time")
-    observed = y[valid].rename("observed_time")
-    dist_routed = routed.loc[valid.index[valid], "distance"].rename("routed_distance")
-    rmse_overall = float(np.sqrt(((predicted - observed) ** 2).mean()))
-    rmse_band = _rmse_by_distance(observed, predicted, legs["dist_line"])
+        # 4.6: Decide whether to update coefficients for the next iteration.
+        if iteration <= n_iterations and m_calib.at["all", "r2"] >= r2_prev + r2_tolerance:
+            logging.info(
+                f"  Iter {iteration}/{n_iterations}: "
+                f"R² (baseline) = {m_baseline.at['all', 'r2']:.3f}, "
+                f"R² (calibration, a-priori, net) = {m_calib_net.at['all', 'r2']:.3f}, "
+                f"R² (calibration, a-priori, gross) = {m_calib.at['all', 'r2']:.3f}, "
+                f"R² (regression) = {m_regr.at['all', 'r2']:.3f}, n={len(y_f):,}"
+            )
+            r2_prev = m_calib.at["all", "r2"]
+            c = fit_result.params
+            if constant is not None:
+                const = float(c["const"])
+            alpha = c["baseline_time"]
+            for name in cur_mult:
+                cur_mult[name] = float(c[name])
+            for name in cur_add:
+                cur_add[name] = float(c[name])
+            for name in cur_end:
+                # Average origin and destination impact
+                cur_end[name] = (float(c[f"{name}_orig"]) + float(c[f"{name}_dest"])) / 2
+            for name, r in final_coefs.iterrows():
+                if name == "baseline_time":
+                    avg = routed[baseline_duration_attr].mean()
+                elif name == "const":
+                    avg = const
+                else:
+                    avg = routed[name].mean()
+                logging.info(f"    {name:.<20s}: {r['coef']:7.3f} (p={r['p']:.3g}, avg={avg:.3g})")
+        else:
+            logging.info(f".  Calibration completed after {iteration} iterations")
+            for band in m_calib.index:
+                logging.info(
+                    f"    {band:.<10s}: {m_baseline.at[band, 'r2']:.3f} → {m_calib.at[band, 'r2']:.3f}"
+                )
+            break
 
     return CalibrationResult(
-        coefficients=coef_df,
-        r_squared=float(fit_result.rsquared),
+        coefficients=final_coefs,
+        metrics_baseline=final_m_baseline,
+        metrics_calibrated=final_m_calib,
+        metrics_regression=final_m_regr,
         n_used=int(valid.sum()),
-        predicted_times=predicted,
-        observed_times=observed,
-        routed_distances=dist_routed,
-        rmse=rmse_overall,
-        rmse_by_distance=rmse_band,
-        edge_duration_attr=edge_duration_attr,
-        iter_log=pd.DataFrame(iter_log_rows).set_index("iteration"),
     )
 
 
@@ -581,7 +564,7 @@ def snap_counters_to_edges(
     counters: gpd.GeoDataFrame,
     graph: nx.MultiDiGraph,
     *,
-    search_radius: float | pd.Series = 50.0,
+    max_distance: float | pd.Series = 50.0,
     bearing_tol_deg: float = 20.0,
     bearing_column: str = "bearing_deg",
     eligible_edges: Callable[[pd.Series, gpd.GeoDataFrame], gpd.GeoDataFrame] | None = None,
@@ -610,7 +593,7 @@ def snap_counters_to_edges(
             graph node coordinates.
         graph: routable nx graph. Edge attributes must include `geometry`
             (LineString) and whatever `eligible_edges` reads.
-        search_radius: max cartesian distance for candidate edges (CRS
+        max_distance: max cartesian distance for candidate edges (CRS
             units). Pass a scalar for one global radius or a `pd.Series`
             aligned to `counters.index` for per-counter radii (e.g. wider
             for highway counters which sit further from the carriageway).
@@ -683,7 +666,7 @@ def snap_counters_to_edges(
     matches = geo_mapping.map_points_to_filtered_lines(
         counters,
         edges_gdf,
-        search_radius=search_radius,
+        max_distance=max_distance,
         eligible_lines=eligible_edges,
         accept=_accept,
     )

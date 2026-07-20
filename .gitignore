@@ -69,3 +69,8 @@ cache/
 **/diagnose_*.py
 **/diagnose_*.ipynb
 **/verify_filter_fix.**
+
+# Parked / experimental code — alternate backends or work-in-progress
+# primitives kept locally but not part of the published library.
+_experimental/
+**/_experimental/

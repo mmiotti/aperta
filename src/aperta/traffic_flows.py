@@ -21,55 +21,23 @@ estimation cheap and consistent with the rest of the pipeline; it does not
 aim to replace a dedicated traffic-assignment tool. An iterative
 congestion-aware variant is theoretically possible as a future extension.
 
-This module supplies the sampling primitives (`nested_node_sample`) and the
-normalisation step (`estimate_edge_flows`) that turns raw sampled-betweenness
-counts into a per-edge volume calibrated against an expected total
-vehicle-kilometres figure. The routing + per-edge accumulation itself lives
-in `network_processing.get_nested_edge_betweenness`. A simpler alternative
-for small study areas — radius-limited Brandes betweenness without explicit
-OD sampling — also lives in `network_processing`.
+This module supplies the sampling primitive `nested_node_sample`. The
+routing + per-edge accumulation itself lives in
+`network_processing.get_nested_edge_betweenness`. A simpler alternative
+for small study areas — radius-limited Brandes betweenness without
+explicit OD sampling — also lives in `network_processing`. Downstream
+callers apply their own normalisation of the raw sampled-betweenness
+counts (e.g. scaling to an expected vehicle-kilometres total).
 """
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Callable
 
-import networkx as nx
 import numpy as np
 import pandas as pd
 from numba import njit
 
-from aperta import network_processing
 from aperta.od_pairs import TieredODPairs
-
-
-def estimate_edge_flows(
-    graph: nx.MultiGraph,
-    weight: str,
-    expected_km_driven: int | float,
-    nested_node_sample: dict,
-    *,
-    cutoff: float | None = None,
-) -> pd.Series:
-    """Traffic-flow estimation from a nested OD sample, normalised to
-    `expected_km_driven` total vehicle-kilometres.
-
-    Routes each sampled (origin, dest) pair via scipy Dijkstra, accumulates
-    per-edge usage counts (see `network_processing.get_nested_edge_betweenness`),
-    then scales so that `sum(flow_e × length_e)` matches `expected_km_driven`.
-
-    `cutoff` (optional): network-distance limit in `weight`
-    units passed through to the per-origin Dijkstra. Set this to the
-    upstream sampling radius (e.g. `r_zones` from `od_pairs.get_pairs`) —
-    sampled destinations are guaranteed reachable within that radius, so
-    the cutoff is correctness-preserving and gives a large speed-up on
-    country-scale graphs. Default `None` = no cutoff.
-    """
-    bc = network_processing.get_nested_edge_betweenness(
-        graph, nested_node_sample, weight, cutoff=cutoff
-    )
-    lengths = nx.get_edge_attributes(graph, "length")
-    factor = expected_km_driven / sum(v * lengths[k] for k, v in bc.items())
-    return bc * factor
 
 
 @njit(cache=True)
@@ -136,14 +104,15 @@ def nested_node_sample(
     pairs: TieredODPairs,
     weights: TieredODPairs,
     costs: TieredODPairs,
+    *,
     cell_to_zone_node: dict,
-    orig_weights: np.ndarray | pd.Series,
+    orig_weights: np.ndarray | pd.Series | None,
     cost_to_weight: Callable,
     n_orig: int,
     n_dest: int,
     random_state: np.random.RandomState,
-    *,
     mask: TieredODPairs | None = None,
+    chosen: np.ndarray | None = None,
 ) -> dict:
     """Sample `n_dest` destinations for `n_orig` weighted-sampled origin cells,
     integrating all three tiers (cell, middle, far) into one combined pool.
@@ -164,25 +133,51 @@ def nested_node_sample(
     Args:
         pairs: destination IDs per tier.
         weights: destination weights per tier (e.g. populations), same shape as
-            `pairs`. Typically the output of `od_pairs.dest_values`.
+            `pairs`. Typically the output of `od_pairs.lookup_dest_column_node`.
         costs: per-pair costs (e.g. line distances), same shape as `pairs`.
             Typically the output of `od_pairs.get_euclidean_dists`.
         cell_to_zone_node: `{cell_node -> zone_node}` mapping; build via
             `od_pairs.build_cell_to_zone_node_map`.
         orig_weights: per-origin sampling weights, aligned position-wise with
-            `list(pairs.cells_to_cells.keys())`.
+            `list(pairs.cells_to_cells.keys())`. Required when `chosen` is
+            None; ignored when `chosen` is provided.
         cost_to_weight: monotone-decreasing function mapping a cost (e.g. distance
             in metres) to a per-pair weight. Vectorized — receives a 1-D array.
-        n_orig, n_dest: number of origins to sample; number of destinations per
-            sampled origin. Sampling is with replacement on both ends; repeats in
-            the origin sample are deduped (each origin processed once).
+        n_orig, n_dest: number of origins to sample; number of destinations
+            sampled PER origin-pick. Origin sampling is with replacement
+            (popular origins can appear multiple times in the underlying
+            `random_state.choice`); each duplicate pick generates its own
+            batch of `n_dest` destinations, all i.i.d. from the same
+            per-origin score distribution. So an origin picked `k` times
+            ends up with a length-`k × n_dest` destination array — and
+            contributes `k×` the flow downstream when
+            `get_nested_edge_betweenness` walks predecessors, while still
+            running only ONE Dijkstra from that origin (no wasted routing
+            work; only the destination set grows).
+            Total OD pairs sampled is exactly `n_orig × n_dest`
+            regardless of duplicate distribution — useful for AADT scaling
+            (denominator = `n_orig × n_dest`, no dedup correction needed).
+            When `chosen` is provided, `n_orig` is ignored (sample size
+            comes from `len(chosen)`); `n_dest` still controls
+            destinations-per-pick.
         random_state: numpy RandomState; the only source of randomness.
         mask: optional boolean `TieredODPairs` (build via `od_pairs.make_mask`).
             Destinations where the mask is `False` are removed from the sampling
             pool. Missing origins or missing tiers in the mask are treated as
             "no filter" for that origin / tier.
+        chosen: optional pre-sampled origin array (with replacement, so
+            duplicates carry their `n_picks` weight). When provided, the
+            internal `random_state.choice(origins, n_orig, True, p)` is
+            skipped; `orig_weights` and `n_orig` are ignored. Useful when
+            the caller pre-samples origins externally to restrict the
+            upstream `tiered_path_costs` work to only origins that will
+            actually contribute — every entry of `chosen` must be a key
+            in `pairs.cells_to_cells`.
 
-    Returns: `{origin_cell_node -> np.ndarray[dest_node]}` of length `n_dest`.
+    Returns: `{origin_cell_node -> np.ndarray[dest_node]}` where each value
+        array has length `n_picks × n_dest` (= `n_dest` for origins picked
+        once, longer for origins picked multiple times by the
+        with-replacement origin sampling).
     """
     if pairs.cells_to_cells is None:
         raise ValueError("`pairs.cells_to_cells` is None; cell-tier is required.")
@@ -191,10 +186,55 @@ def nested_node_sample(
     cell_pairs = pairs.cells_to_cells
     cell_costs_dict = costs.cells_to_cells
     cell_weights_dict = weights.cells_to_cells
-    origins = np.asarray(list(cell_pairs.keys()))
-    p = np.asarray(orig_weights, dtype=float)
-    p = p / p.sum()
-    chosen = random_state.choice(origins, n_orig, True, p)
+
+    # Origin sampling: either internal (from `orig_weights`) or
+    # caller-supplied (`chosen`). The caller-supplied path is the
+    # standard way to restrict upstream `tiered_path_costs` work to
+    # origins that will actually be sampled — by pre-selecting origins
+    # and passing them here, callers can skip routing the long tail of
+    # rarely-picked cells. Exactly one of the two paths must be used.
+    if chosen is None and orig_weights is None:
+        raise ValueError(
+            "nested_node_sample: provide either `orig_weights` (for internal "
+            "sampling) or `chosen` (for pre-sampled origins)."
+        )
+    if chosen is not None and orig_weights is not None:
+        raise ValueError(
+            "nested_node_sample: `orig_weights` and `chosen` are mutually "
+            "exclusive — pass one or the other."
+        )
+    if chosen is None:
+        origins = np.asarray(list(cell_pairs.keys()))
+        p = np.asarray(orig_weights, dtype=float)
+        p = p / p.sum()
+        chosen = random_state.choice(origins, n_orig, True, p)
+    else:
+        chosen = np.asarray(chosen)
+        # Validate: every pre-sampled origin must be a key in
+        # `pairs.cells_to_cells`. Since `get_pairs` populates an entry
+        # (possibly empty) for every valid origin, this catches genuine
+        # user errors — pre-sampled origins not covered by
+        # `get_pairs(orig_cells=...)`, or NaN values that slipped into
+        # `chosen` from cells with unsnapped node IDs.
+        missing = set(chosen.tolist()) - set(cell_pairs.keys())
+        if missing:
+            n_nan = sum(1 for x in missing if isinstance(x, float) and np.isnan(x))
+            if n_nan:
+                raise ValueError(
+                    f"nested_node_sample: {len(missing)} entries in `chosen` "
+                    f"are not present in `pairs.cells_to_cells`, of which "
+                    f"{n_nan} are NaN. Pre-sampling from a cells DataFrame "
+                    f"with NaN `node_id` values produces NaN draws — filter "
+                    f"`cells = cells[cells['<node_column>'].notna()]` (and "
+                    f"any other NaN-bearing columns used as weights or "
+                    f"zone identifiers) before building `chosen`."
+                )
+            raise ValueError(
+                f"nested_node_sample: {len(missing)} entries in `chosen` are "
+                f"not present in `pairs.cells_to_cells`. Did you restrict "
+                f"`get_pairs(orig_cells=...)` to cover the pre-sampled set? "
+                f"Example missing: {sorted(missing)[:3]}."
+            )
 
     # Pre-compute per-zone shared dest arrays + scores for the FAR tier
     # (zones_to_zones). Reused across every cell in that zone during sampling.
@@ -210,14 +250,16 @@ def nested_node_sample(
     empty_score = np.empty(0)
 
     # Group sampled origins by zone — shared work (far tier) is done once per
-    # zone-group. Dedupe so a duplicated origin in `chosen` doesn't trigger
-    # redundant work (the original also overwrote duplicate dict keys silently).
-    seen: set = set()
+    # zone-group. Count occurrences via `Counter` so duplicate picks in
+    # `chosen` (with-replacement origin sampling lets popular origins appear
+    # multiple times) generate proportionally more destination samples
+    # downstream — each unique origin still runs one Dijkstra in the
+    # consumer (`get_nested_edge_betweenness`), but its dest array gets
+    # `n_picks × n_dest` entries instead of `n_dest`, so each pick
+    # contributes its share of routing-effort to the flow estimate.
+    chosen_counts: dict = Counter(chosen.tolist())
     chosen_by_zone: dict = defaultdict(list)
-    for c in chosen:
-        if c in seen:
-            continue
-        seen.add(c)
+    for c in chosen_counts:
         chosen_by_zone[cell_to_zone_node.get(c)].append(c)
 
     out: dict = {}
@@ -228,6 +270,10 @@ def nested_node_sample(
         )
         for c in cells_here:
             # Cell tier (cells_to_cells): per-cell origin + per-cell dest.
+            # `get_pairs` populates an entry for every valid origin
+            # (possibly empty array for isolated cells), so direct
+            # lookups are safe — see the upfront validation against
+            # `cell_pairs.keys()` above.
             cell_dests = cell_pairs[c]
             cell_costs = cell_costs_dict[c]
             cell_weights = cell_weights_dict[c]
@@ -254,7 +300,19 @@ def nested_node_sample(
 
             all_dests = np.concatenate([cell_dests, cz_dests, zone_dests])
             all_score = np.concatenate([cell_score, cz_score, zone_score])
-            rvals = random_state.random(n_dest)
+            # An origin with NO destinations across any tier (truly
+            # isolated cell — no in-radius cells, no zones in [r_cells,
+            # r_zones]) can't generate flow. Skip rather than crash on
+            # the empty `cumsum` inside `_weighted_sample_indices`.
+            if all_score.size == 0 or all_score.sum() <= 0:
+                continue
+            # Sample `n_picks × n_dest` destinations: this origin was
+            # drawn `n_picks` times by the with-replacement origin
+            # sampling at the top, so it generates that many "trips"-
+            # worth of destinations. All drawn i.i.d. from the same
+            # per-origin score distribution — see `n_dest_total` docstring.
+            n_picks = chosen_counts[c]
+            rvals = random_state.random(n_dest * n_picks)
             indices = _weighted_sample_indices(all_score, rvals)
             out[c] = all_dests[indices]
     return out

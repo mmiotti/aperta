@@ -1,9 +1,9 @@
 """Tests for the geo-keyed branch of the tiered OD API:
 
 - `od_pairs.reindex_by_geo_unit` — node-keyed → geo-unit-keyed conversion.
-- `od_pairs.dest_values_geo`     — destination value lookup on geo-keyed pairs.
+- `od_pairs.lookup_dest_column_geo`     — destination value lookup on geo-keyed pairs.
 - `overhead.add_geo_overheads`   — generic origin/dest overhead application.
-- `overhead.add_origin_cell_overhead` — convenience wrapper for per-cell origin
+- `add_geo_overheads` — bake per-cell + auto-derived per-zone origin
   overhead baking at all tiers.
 
 Run with:
@@ -21,10 +21,10 @@ from shapely.geometry import Point
 from aperta.od_pairs import (
     TieredODGeoPairs,
     TieredODNodePairs,
-    dest_values_geo,
+    lookup_dest_column_geo,
     reindex_by_geo_unit,
 )
-from aperta.overhead import add_geo_overheads, add_origin_cell_overhead
+from aperta.overhead import add_geo_overheads
 
 # ---------------------------------------------------------------------------
 # Fixture: a small node-keyed (pairs, odm) on which reindex semantics are
@@ -231,7 +231,7 @@ class ReindexByGeoUnitTestCase(unittest.TestCase):
 
 
 class DestValuesGeoTestCase(unittest.TestCase):
-    """`dest_values_geo` — destination value lookup on geo-keyed pairs."""
+    """`lookup_dest_column_geo` — destination value lookup on geo-keyed pairs."""
 
     def setUp(self):
         self.cells, self.zones = _build_fixture()
@@ -246,26 +246,26 @@ class DestValuesGeoTestCase(unittest.TestCase):
         )
 
     def test_cells_to_cells_values_per_cell_no_summing(self):
-        """Unlike node-keyed `dest_values` (which sums values across cells at
-        a node), `dest_values_geo` returns the per-cell value directly."""
-        v = dest_values_geo("population", self.pairs_geo, self.cells, zones=self.zones)
+        """Unlike node-keyed `lookup_dest_column_node` (which sums values across cells at
+        a node), `lookup_dest_column_geo` returns the per-cell value directly."""
+        v = lookup_dest_column_geo("population", self.pairs_geo, self.cells, zones=self.zones)
         # Origin C0: dests [C0, C1, C2] → populations [10, 20, 5].
         np.testing.assert_array_equal(v.cells_to_cells["C0"], np.array([10.0, 20.0, 5.0]))
 
     def test_cells_to_zones_per_zone(self):
-        v = dest_values_geo("population", self.pairs_geo, self.cells, zones=self.zones)
+        v = lookup_dest_column_geo("population", self.pairs_geo, self.cells, zones=self.zones)
         # C0 → Z1 with population 7.
         assert v.cells_to_zones is not None
         np.testing.assert_array_equal(v.cells_to_zones["C0"], np.array([7.0]))
 
     def test_zones_to_zones_per_zone(self):
-        v = dest_values_geo("population", self.pairs_geo, self.cells, zones=self.zones)
+        v = lookup_dest_column_geo("population", self.pairs_geo, self.cells, zones=self.zones)
         # Z0 → Z1 with population 7.
         np.testing.assert_array_equal(v.zones_to_zones["Z0"], np.array([7.0]))
 
     def test_missing_column_raises(self):
         with self.assertRaisesRegex(ValueError, "missing column"):
-            dest_values_geo("nonexistent", self.pairs_geo, self.cells, zones=self.zones)
+            lookup_dest_column_geo("nonexistent", self.pairs_geo, self.cells, zones=self.zones)
 
 
 class AddGeoOverheadsTestCase(unittest.TestCase):
@@ -374,7 +374,7 @@ class AddGeoOverheadsTestCase(unittest.TestCase):
 
 
 class AddOriginCellOverheadTestCase(unittest.TestCase):
-    """`add_origin_cell_overhead` — per-cell at cells_to_cells and
+    """`add_geo_overheads` — per-cell at cells_to_cells and
     cells_to_zones tiers, per-zone-mean at the zones_to_zones tier."""
 
     def setUp(self):
@@ -390,7 +390,12 @@ class AddOriginCellOverheadTestCase(unittest.TestCase):
         )
 
     def test_per_cell_baked_at_cell_tier(self):
-        out = add_origin_cell_overhead(self.costs, self.pairs, self.cells, "walk_overhead_s")
+        out = add_geo_overheads(
+            self.costs,
+            self.pairs,
+            origin_cell=self.cells["walk_overhead_s"],
+            cell_to_zone=self.cells["zone_id"],
+        )
         # C0 has overhead 30 → +30 on every cell-tier outgoing cost.
         np.testing.assert_array_equal(
             out.cells_to_cells["C0"], self.costs.cells_to_cells["C0"] + 30.0
@@ -401,14 +406,24 @@ class AddOriginCellOverheadTestCase(unittest.TestCase):
         )
 
     def test_per_cell_baked_at_middle_tier(self):
-        out = add_origin_cell_overhead(self.costs, self.pairs, self.cells, "walk_overhead_s")
+        out = add_geo_overheads(
+            self.costs,
+            self.pairs,
+            origin_cell=self.cells["walk_overhead_s"],
+            cell_to_zone=self.cells["zone_id"],
+        )
         # C0 overhead 30 → +30 on cells_to_zones origin C0.
         np.testing.assert_array_equal(
             out.cells_to_zones["C0"], self.costs.cells_to_zones["C0"] + 30.0
         )
 
     def test_zone_mean_baked_at_zone_tier(self):
-        out = add_origin_cell_overhead(self.costs, self.pairs, self.cells, "walk_overhead_s")
+        out = add_geo_overheads(
+            self.costs,
+            self.pairs,
+            origin_cell=self.cells["walk_overhead_s"],
+            cell_to_zone=self.cells["zone_id"],
+        )
         # Z0 contains C0, C1, C2 with overheads 30, 60, 45 → mean 45.
         np.testing.assert_array_equal(
             out.zones_to_zones["Z0"], self.costs.zones_to_zones["Z0"] + 45.0
@@ -419,7 +434,7 @@ class AddOriginCellOverheadTestCase(unittest.TestCase):
         )
 
     def test_works_when_zone_tier_absent(self):
-        """No zone tier in costs → no zone_id_column requirement."""
+        """No zone tier in costs → no cell_to_zone requirement."""
         cells_only_costs = TieredODGeoPairs(
             cells_to_cells=dict(self.costs.cells_to_cells),
         )
@@ -428,8 +443,10 @@ class AddOriginCellOverheadTestCase(unittest.TestCase):
         )
         # Remove zone_id column to prove it's not required when no zone tier.
         cells_no_zone = self.cells.drop(columns="zone_id")
-        out = add_origin_cell_overhead(
-            cells_only_costs, cells_only_pairs, cells_no_zone, "walk_overhead_s"
+        out = add_geo_overheads(
+            cells_only_costs,
+            cells_only_pairs,
+            origin_cell=cells_no_zone["walk_overhead_s"],
         )
         np.testing.assert_array_equal(
             out.cells_to_cells["C0"], self.costs.cells_to_cells["C0"] + 30.0

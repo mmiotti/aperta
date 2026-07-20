@@ -10,6 +10,7 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 
+from aperta.errors import DataError
 from aperta.od_pairs import TieredODNodePairs
 from aperta.routing import (
     NodeAggregation,
@@ -18,6 +19,7 @@ from aperta.routing import (
     apply_edge_weights,
     floor_intrazonal_costs,
     mask_excluded_edges,
+    shortest_path_costs_one_to_one,
     tiered_path_aggregate,
     tiered_path_costs,
 )
@@ -55,11 +57,13 @@ class SetMinIntrazonalCostTestCase(unittest.TestCase):
         np.testing.assert_array_equal(out.cells_to_cells["a"], np.array([1.0, 5.0, 200.0]))
         np.testing.assert_array_equal(out.cells_to_cells["b"], np.array([1.0, 300.0]))
 
-    def test_other_tiers_unchanged(self):
-        """cells_to_zones and zones_to_zones pass through untouched."""
+    def test_other_tiers_values_unchanged_when_above_floor(self):
+        """Other tiers get a fresh dict but keep their values when already above the floor."""
         costs = self._costs()
         out = floor_intrazonal_costs(costs, min_cost=10.0)
-        self.assertIs(out.zones_to_zones, costs.zones_to_zones)
+        # Zone-tier entry (1500) is above the floor, so its value passes through.
+        np.testing.assert_array_equal(out.zones_to_zones["Z"], costs.zones_to_zones["Z"])
+        # `cells_to_zones` is None in the fixture; None passes through as None.
         self.assertIsNone(out.cells_to_zones)
 
     def test_dict_per_origin(self):
@@ -149,7 +153,7 @@ class TieredPathAggregateTestCase(unittest.TestCase):
         pairs = self._pairs()
         graph = self._graph()
         agg = [PathAggregation("attr_total", "attr", "sum")]
-        costs, aggs = tiered_path_aggregate(pairs, graph, weight="w", edge_aggregations=agg)
+        costs, aggs = tiered_path_aggregate(graph, pairs, weight="w", edge_aggregations=agg)
         # Self-pair a→a: cost 0, sum over 0 edges = 0.
         self.assertEqual(costs.cells_to_cells["a"][0], 0.0)
         self.assertEqual(aggs["attr_total"].cells_to_cells["a"][0], 0.0)
@@ -165,8 +169,8 @@ class TieredPathAggregateTestCase(unittest.TestCase):
         pairs = self._pairs()
         graph = self._graph()
         agg = [PathAggregation("attr", "attr", "sum")]
-        costs_agg, _ = tiered_path_aggregate(pairs, graph, weight="w", edge_aggregations=agg)
-        costs_only = tiered_path_costs(pairs, graph, weight="w")
+        costs_agg, _ = tiered_path_aggregate(graph, pairs, weight="w", edge_aggregations=agg)
+        costs_only = tiered_path_costs(graph, pairs, weight="w")
         np.testing.assert_array_almost_equal(
             costs_agg.cells_to_cells["a"], costs_only.cells_to_cells["a"]
         )
@@ -176,7 +180,7 @@ class TieredPathAggregateTestCase(unittest.TestCase):
         pairs = self._pairs()
         graph = self._graph()
         agg = [PathAggregation("attr_mean", "attr", "mean")]
-        _, aggs = tiered_path_aggregate(pairs, graph, weight="w", edge_aggregations=agg)
+        _, aggs = tiered_path_aggregate(graph, pairs, weight="w", edge_aggregations=agg)
         # a→a: NaN (no edges to average).
         self.assertTrue(np.isnan(aggs["attr_mean"].cells_to_cells["a"][0]))
         # a→b: single edge of attr=10 → mean = 10.
@@ -192,7 +196,7 @@ class TieredPathAggregateTestCase(unittest.TestCase):
             PathAggregation("attr_min", "attr", "min"),
             PathAggregation("attr_max", "attr", "max"),
         ]
-        _, aggs = tiered_path_aggregate(pairs, graph, weight="w", edge_aggregations=agg)
+        _, aggs = tiered_path_aggregate(graph, pairs, weight="w", edge_aggregations=agg)
         # a→c via b: edges attr=10, 20.
         self.assertEqual(aggs["attr_min"].cells_to_cells["a"][2], 10.0)
         self.assertEqual(aggs["attr_max"].cells_to_cells["a"][2], 20.0)
@@ -203,7 +207,7 @@ class TieredPathAggregateTestCase(unittest.TestCase):
         graph = self._graph()
         # Custom: squared-sum, e.g. for a "squared distance" interpretation.
         agg = [PathAggregation("sq_sum", "attr", aggregator=lambda arr: float((arr**2).sum()))]
-        _, aggs = tiered_path_aggregate(pairs, graph, weight="w", edge_aggregations=agg)
+        _, aggs = tiered_path_aggregate(graph, pairs, weight="w", edge_aggregations=agg)
         # a→c via b: 10² + 20² = 500.
         self.assertEqual(aggs["sq_sum"].cells_to_cells["a"][2], 500.0)
 
@@ -213,7 +217,7 @@ class TieredPathAggregateTestCase(unittest.TestCase):
         graph = self._graph()
         # Custom attribute: 1.0 per edge — counts edges in the path.
         agg = [PathAggregation("edge_count", lambda u, v, d: 1.0, "sum")]
-        _, aggs = tiered_path_aggregate(pairs, graph, weight="w", edge_aggregations=agg)
+        _, aggs = tiered_path_aggregate(graph, pairs, weight="w", edge_aggregations=agg)
         self.assertEqual(aggs["edge_count"].cells_to_cells["a"][0], 0.0)  # self
         self.assertEqual(aggs["edge_count"].cells_to_cells["a"][1], 1.0)  # 1 edge
         self.assertEqual(aggs["edge_count"].cells_to_cells["a"][2], 2.0)  # 2 edges
@@ -227,7 +231,7 @@ class TieredPathAggregateTestCase(unittest.TestCase):
             PathAggregation("avg", "attr", "mean"),
             PathAggregation("worst", "attr", "max"),
         ]
-        _, aggs = tiered_path_aggregate(pairs, graph, weight="w", edge_aggregations=agg)
+        _, aggs = tiered_path_aggregate(graph, pairs, weight="w", edge_aggregations=agg)
         # All three should be filled for a→c.
         self.assertEqual(aggs["total"].cells_to_cells["a"][2], 30.0)
         self.assertEqual(aggs["avg"].cells_to_cells["a"][2], 15.0)
@@ -242,7 +246,7 @@ class TieredPathAggregateTestCase(unittest.TestCase):
         # No edges between a and x.
         pairs = TieredODNodePairs(cells_to_cells={"a": np.array(["a", "x"])})
         agg = [PathAggregation("attr_total", "attr", "sum")]
-        costs, aggs = tiered_path_aggregate(pairs, g, weight="w", edge_aggregations=agg)
+        costs, aggs = tiered_path_aggregate(g, pairs, weight="w", edge_aggregations=agg)
         # Self-pair: cost 0, sum 0.
         self.assertEqual(costs.cells_to_cells["a"][0], 0.0)
         # Unreachable: cost inf, aggregation NaN.
@@ -262,7 +266,7 @@ class TieredPathAggregateTestCase(unittest.TestCase):
         g.add_edge("b", "a", w=5.0, attr=10.0)
         pairs = TieredODNodePairs(cells_to_cells={"a": np.array(["b"])})
         agg = [PathAggregation("attr_total", "attr", "sum")]
-        costs, aggs = tiered_path_aggregate(pairs, g, weight="w", edge_aggregations=agg)
+        costs, aggs = tiered_path_aggregate(g, pairs, weight="w", edge_aggregations=agg)
         # Router picks w=1 edge → cost 1, attr 99.
         self.assertEqual(costs.cells_to_cells["a"][0], 1.0)
         self.assertEqual(aggs["attr_total"].cells_to_cells["a"][0], 99.0)
@@ -294,7 +298,7 @@ class TieredPathAggregateTestCase(unittest.TestCase):
             PathAggregation("attr_sum", "attr", "sum"),
             PathAggregation("attr_mean", "attr", "mean"),
         ]
-        costs, aggs = tiered_path_aggregate(pairs, g, weight="w", edge_aggregations=agg)
+        costs, aggs = tiered_path_aggregate(g, pairs, weight="w", edge_aggregations=agg)
         # a→c (forward): cost 3, attr_sum 30, attr_mean 15
         self.assertEqual(costs.cells_to_cells["a"][0], 3.0)
         self.assertEqual(aggs["attr_sum"].cells_to_cells["a"][0], 30.0)
@@ -319,7 +323,7 @@ class TieredPathAggregateTestCase(unittest.TestCase):
             }
         )
         agg = [PathAggregation("attr_sum", "attr", "sum")]
-        costs, aggs = tiered_path_aggregate(pairs, g, weight="w", edge_aggregations=agg)
+        costs, aggs = tiered_path_aggregate(g, pairs, weight="w", edge_aggregations=agg)
         self.assertEqual(costs.cells_to_cells["a"][0], 3.0)
         self.assertEqual(costs.cells_to_cells["c"][0], 3.0)
         self.assertEqual(aggs["attr_sum"].cells_to_cells["a"][0], 30.0)
@@ -333,7 +337,7 @@ class TieredPathAggregateTestCase(unittest.TestCase):
         mask = TieredODNodePairs(cells_to_cells={"a": np.array([True, True, False])})
         agg = [PathAggregation("attr_total", "attr", "sum")]
         costs, aggs = tiered_path_aggregate(
-            pairs, graph, weight="w", edge_aggregations=agg, mask=mask
+            graph, pairs, weight="w", edge_aggregations=agg, mask=mask
         )
         self.assertEqual(costs.cells_to_cells["a"][1], 1.0)  # b — routed
         self.assertTrue(np.isinf(costs.cells_to_cells["a"][2]))  # c — masked out
@@ -341,13 +345,13 @@ class TieredPathAggregateTestCase(unittest.TestCase):
 
     def test_empty_aggregations_raises(self):
         with self.assertRaisesRegex(ValueError, "non-empty"):
-            tiered_path_aggregate(self._pairs(), self._graph(), weight="w", edge_aggregations=[])
+            tiered_path_aggregate(self._graph(), self._pairs(), weight="w", edge_aggregations=[])
 
     def test_duplicate_aggregation_names_raises(self):
         with self.assertRaisesRegex(ValueError, "unique"):
             tiered_path_aggregate(
-                self._pairs(),
                 self._graph(),
+                self._pairs(),
                 weight="w",
                 edge_aggregations=[
                     PathAggregation("x", "attr", "sum"),
@@ -358,8 +362,8 @@ class TieredPathAggregateTestCase(unittest.TestCase):
     def test_unknown_aggregator_raises(self):
         with self.assertRaisesRegex(ValueError, "Unknown aggregator"):
             tiered_path_aggregate(
-                self._pairs(),
                 self._graph(),
+                self._pairs(),
                 weight="w",
                 edge_aggregations=[PathAggregation("x", "attr", "nope")],
             )
@@ -375,7 +379,7 @@ class TieredPathAggregateTestCase(unittest.TestCase):
         g.add_edge("b", "c", w=2.0)
         pairs = TieredODNodePairs(cells_to_cells={"a": np.array(["a", "b", "c"])})
         node_agg = [NodeAggregation("signals", "traffic_signal", "sum")]
-        _, aggs = tiered_path_aggregate(pairs, g, weight="w", node_aggregations=node_agg)
+        _, aggs = tiered_path_aggregate(g, pairs, weight="w", node_aggregations=node_agg)
         # a→a: just 'a' (signal=0) → 0
         self.assertEqual(aggs["signals"].cells_to_cells["a"][0], 0.0)
         # a→b: [a, b] → 0 + 1 = 1
@@ -393,7 +397,7 @@ class TieredPathAggregateTestCase(unittest.TestCase):
         g.add_edge("b", "c", w=2.0)
         pairs = TieredODNodePairs(cells_to_cells={"a": np.array(["a", "b", "c"])})
         node_agg = [NodeAggregation("signals", "signal", "sum", include_endpoints=False)]
-        _, aggs = tiered_path_aggregate(pairs, g, weight="w", node_aggregations=node_agg)
+        _, aggs = tiered_path_aggregate(g, pairs, weight="w", node_aggregations=node_agg)
         # a→a: [a] → interior is [] → sum 0
         self.assertEqual(aggs["signals"].cells_to_cells["a"][0], 0.0)
         # a→b: [a, b] → interior is [] → sum 0
@@ -413,7 +417,7 @@ class TieredPathAggregateTestCase(unittest.TestCase):
         edge_agg = [PathAggregation("dist", "length", "sum")]
         node_agg = [NodeAggregation("max_elev", "elev", "max")]
         _, aggs = tiered_path_aggregate(
-            pairs, g, weight="w", edge_aggregations=edge_agg, node_aggregations=node_agg
+            g, pairs, weight="w", edge_aggregations=edge_agg, node_aggregations=node_agg
         )
         # a→c via b: edges length 10 + 20 = 30
         self.assertEqual(aggs["dist"].cells_to_cells["a"][0], 30.0)
@@ -423,8 +427,8 @@ class TieredPathAggregateTestCase(unittest.TestCase):
     def test_duplicate_name_across_edge_and_node_raises(self):
         with self.assertRaisesRegex(ValueError, "unique"):
             tiered_path_aggregate(
-                self._pairs(),
                 self._graph(),
+                self._pairs(),
                 weight="w",
                 edge_aggregations=[PathAggregation("shared", "attr", "sum")],
                 node_aggregations=[NodeAggregation("shared", "x", "sum")],
@@ -451,7 +455,7 @@ class AggregateAlongPathsTestCase(unittest.TestCase):
         paths = [["a"], ["a", "b"], ["a", "b", "c"]]
         edge_agg = [PathAggregation("attr_total", "attr", "sum")]
         costs, aggs = aggregate_along_paths(
-            paths, self._graph(), weight="w", edge_aggregations=edge_agg
+            self._graph(), paths, weight="w", edge_aggregations=edge_agg
         )
         np.testing.assert_array_equal(costs, np.array([0.0, 1.0, 3.0]))
         np.testing.assert_array_equal(aggs["attr_total"], np.array([0.0, 10.0, 30.0]))
@@ -461,7 +465,7 @@ class AggregateAlongPathsTestCase(unittest.TestCase):
         paths = [["a", "b"], [], ["a", "b", "c"]]
         edge_agg = [PathAggregation("attr_total", "attr", "sum")]
         costs, aggs = aggregate_along_paths(
-            paths, self._graph(), weight="w", edge_aggregations=edge_agg
+            self._graph(), paths, weight="w", edge_aggregations=edge_agg
         )
         self.assertEqual(costs[0], 1.0)
         self.assertTrue(np.isinf(costs[1]))
@@ -476,10 +480,10 @@ class AggregateAlongPathsTestCase(unittest.TestCase):
         node_agg_with = [NodeAggregation("s_with", "signal", "sum", include_endpoints=True)]
         node_agg_int = [NodeAggregation("s_int", "signal", "sum", include_endpoints=False)]
         _, aggs_with = aggregate_along_paths(
-            paths, self._graph(), weight="w", node_aggregations=node_agg_with
+            self._graph(), paths, weight="w", node_aggregations=node_agg_with
         )
         _, aggs_int = aggregate_along_paths(
-            paths, self._graph(), weight="w", node_aggregations=node_agg_int
+            self._graph(), paths, weight="w", node_aggregations=node_agg_int
         )
         # All three nodes: 0+1+0=1. Interior only [b]: 1.
         self.assertEqual(aggs_with["s_with"][0], 1.0)
@@ -489,7 +493,7 @@ class AggregateAlongPathsTestCase(unittest.TestCase):
         """`paths=[]` returns zero-length arrays, no errors."""
         edge_agg = [PathAggregation("attr_total", "attr", "sum")]
         costs, aggs = aggregate_along_paths(
-            [], self._graph(), weight="w", edge_aggregations=edge_agg
+            self._graph(), [], weight="w", edge_aggregations=edge_agg
         )
         self.assertEqual(len(costs), 0)
         self.assertEqual(len(aggs["attr_total"]), 0)
@@ -526,15 +530,15 @@ class CutoffCorrectnessTestCase(unittest.TestCase):
     def test_costs_with_loose_cutoff_match_no_cutoff(self):
         """Generous cutoff must agree with the no-cutoff call bit-for-bit."""
         pairs, graph = self._pairs(), self._graph()
-        c_unbounded = tiered_path_costs(pairs, graph, weight="w")
-        c_capped = tiered_path_costs(pairs, graph, weight="w", cutoff=1_000)
+        c_unbounded = tiered_path_costs(graph, pairs, weight="w")
+        c_capped = tiered_path_costs(graph, pairs, weight="w", cutoff=1_000)
         np.testing.assert_array_equal(c_unbounded.cells_to_cells["a"], c_capped.cells_to_cells["a"])
 
     def test_costs_beyond_cutoff_are_inf(self):
         """Tight cutoff → destinations beyond it are inf."""
         pairs, graph = self._pairs(), self._graph()
         # Shortest path a→c is 3 (via b). Cutoff at 2 makes c unreachable.
-        c = tiered_path_costs(pairs, graph, weight="w", cutoff=2.0)
+        c = tiered_path_costs(graph, pairs, weight="w", cutoff=2.0)
         self.assertEqual(c.cells_to_cells["a"][0], 0.0)  # a→a
         self.assertEqual(c.cells_to_cells["a"][1], 1.0)  # a→b
         self.assertTrue(np.isinf(c.cells_to_cells["a"][2]))  # a→c beyond cutoff
@@ -544,10 +548,10 @@ class CutoffCorrectnessTestCase(unittest.TestCase):
         pairs, graph = self._pairs(), self._graph()
         agg = [PathAggregation("attr_total", "attr", "sum")]
         c_unbounded, a_unbounded = tiered_path_aggregate(
-            pairs, graph, weight="w", edge_aggregations=agg
+            graph, pairs, weight="w", edge_aggregations=agg
         )
         c_capped, a_capped = tiered_path_aggregate(
-            pairs, graph, weight="w", edge_aggregations=agg, cutoff=1_000
+            graph, pairs, weight="w", edge_aggregations=agg, cutoff=1_000
         )
         np.testing.assert_array_equal(c_unbounded.cells_to_cells["a"], c_capped.cells_to_cells["a"])
         np.testing.assert_array_equal(
@@ -559,7 +563,7 @@ class CutoffCorrectnessTestCase(unittest.TestCase):
         """Cutoff makes a→c unreachable; cost=inf, aggregation=NaN."""
         pairs, graph = self._pairs(), self._graph()
         agg = [PathAggregation("attr_total", "attr", "sum")]
-        c, a = tiered_path_aggregate(pairs, graph, weight="w", edge_aggregations=agg, cutoff=2.0)
+        c, a = tiered_path_aggregate(graph, pairs, weight="w", edge_aggregations=agg, cutoff=2.0)
         self.assertEqual(c.cells_to_cells["a"][1], 1.0)  # a→b reachable
         self.assertEqual(a["attr_total"].cells_to_cells["a"][1], 10.0)
         self.assertTrue(np.isinf(c.cells_to_cells["a"][2]))
@@ -575,7 +579,7 @@ class CutoffCorrectnessTestCase(unittest.TestCase):
         g.add_edge("b", "c", w=2.0)
         pairs = TieredODNodePairs(cells_to_cells={"a": np.array(["a", "b", "c"])})
         node_agg = [NodeAggregation("signals", "signal", "sum")]
-        _, a = tiered_path_aggregate(pairs, g, weight="w", node_aggregations=node_agg, cutoff=1_000)
+        _, a = tiered_path_aggregate(g, pairs, weight="w", node_aggregations=node_agg, cutoff=1_000)
         self.assertEqual(a["signals"].cells_to_cells["a"][0], 0.0)  # [a]: 0
         self.assertEqual(a["signals"].cells_to_cells["a"][1], 1.0)  # [a,b]: 1
         self.assertEqual(a["signals"].cells_to_cells["a"][2], 1.0)  # [a,b,c]: 1
@@ -588,8 +592,8 @@ class CutoffCorrectnessTestCase(unittest.TestCase):
         g.add_edge("a", "b", w=1.0)
         g.add_edge("a", "b", w=5.0)
         pairs = TieredODNodePairs(cells_to_cells={"a": np.array(["b"])})
-        c_ig = tiered_path_costs(pairs, g, weight="w")
-        c_sp = tiered_path_costs(pairs, g, weight="w", cutoff=10.0)
+        c_ig = tiered_path_costs(g, pairs, weight="w")
+        c_sp = tiered_path_costs(g, pairs, weight="w", cutoff=10.0)
         self.assertEqual(c_ig.cells_to_cells["a"][0], 1.0)
         self.assertEqual(c_sp.cells_to_cells["a"][0], 1.0)
 
@@ -638,6 +642,128 @@ class MaskExcludedEdgesTestCase(unittest.TestCase):
         self.assertEqual(g.edges[0, 1, 0]["cost"], float("inf"))
         self.assertEqual(g.edges[1, 2, 0]["cost"], 20.0)
         self.assertEqual(g.edges[2, 3, 0]["cost"], 30.0)
+
+
+class ShortestPathCostsOneToOneTestCase(unittest.TestCase):
+    """`shortest_path_costs_one_to_one` returns just per-trip path costs
+    via `nx.bidirectional_dijkstra` — no path reconstruction, no per-edge
+    feature aggregation. Drop semantics match the full-metrics function."""
+
+    def _graph(self) -> nx.MultiDiGraph:
+        # 0 → 1 (5) → 2 (10) → 3 (1) ; also a direct 0 → 3 via 99 (cost 100).
+        # Plus an isolated node 50.
+        g = nx.MultiDiGraph()
+        g.add_edge(0, 1, key=0, length=5.0, cost=5.0)
+        g.add_edge(1, 2, key=0, length=10.0, cost=10.0)
+        g.add_edge(2, 3, key=0, length=1.0, cost=1.0)
+        g.add_edge(0, 99, key=0, length=50.0, cost=50.0)
+        g.add_edge(99, 3, key=0, length=50.0, cost=50.0)
+        g.add_node(50)
+        return g
+
+    def test_basic_one_to_one(self):
+        g = self._graph()
+        out = shortest_path_costs_one_to_one(
+            g, trip_ids=["a"], origins=[0], destinations=[3], weight="cost"
+        )
+        self.assertIsInstance(out, pd.Series)
+        self.assertEqual(out.name, "cost")
+        # 0 → 1 → 2 → 3 wins over 0 → 99 → 3 (16 vs 100).
+        self.assertEqual(out["a"], 16.0)
+
+    def test_multiple_pairs_preserve_trip_id_index(self):
+        g = self._graph()
+        out = shortest_path_costs_one_to_one(
+            g,
+            trip_ids=["t1", "t2", "t3"],
+            origins=[0, 1, 0],
+            destinations=[3, 3, 1],
+            weight="cost",
+        )
+        self.assertEqual(list(out.index), ["t1", "t2", "t3"])
+        self.assertEqual(out["t1"], 16.0)  # 0→1→2→3
+        self.assertEqual(out["t2"], 11.0)  # 1→2→3
+        self.assertEqual(out["t3"], 5.0)  # 0→1
+
+    def test_self_pair_yields_zero(self):
+        g = self._graph()
+        out = shortest_path_costs_one_to_one(
+            g, trip_ids=["self"], origins=[2], destinations=[2], weight="cost"
+        )
+        self.assertEqual(out["self"], 0.0)
+
+    def test_no_path_trip_dropped_from_output(self):
+        g = self._graph()
+        # Node 50 is isolated → unreachable from 0.
+        out = shortest_path_costs_one_to_one(
+            g,
+            trip_ids=["ok", "unreachable"],
+            origins=[0, 0],
+            destinations=[3, 50],
+            weight="cost",
+        )
+        self.assertIn("ok", out.index)
+        self.assertNotIn("unreachable", out.index)
+
+    def test_unknown_endpoint_trip_dropped_from_output(self):
+        g = self._graph()
+        out = shortest_path_costs_one_to_one(
+            g,
+            trip_ids=["ok", "unknown_dest", "unknown_orig"],
+            origins=[0, 0, 999],
+            destinations=[3, 999, 3],
+            weight="cost",
+        )
+        self.assertIn("ok", out.index)
+        self.assertNotIn("unknown_dest", out.index)
+        self.assertNotIn("unknown_orig", out.index)
+
+    def test_mismatched_lengths_raise(self):
+        g = self._graph()
+        with self.assertRaises(DataError):
+            shortest_path_costs_one_to_one(
+                g, trip_ids=["a", "b"], origins=[0], destinations=[3], weight="cost"
+            )
+
+    def test_empty_input_returns_empty_series(self):
+        g = self._graph()
+        out = shortest_path_costs_one_to_one(
+            g, trip_ids=[], origins=[], destinations=[], weight="cost"
+        )
+        self.assertEqual(len(out), 0)
+        self.assertEqual(out.name, "cost")
+        self.assertEqual(out.dtype, float)
+
+    def test_picks_min_weight_parallel_edge(self):
+        # When two parallel edges between the same (u, v) have different
+        # costs, bidirectional_dijkstra picks the cheaper one — we just
+        # check the resulting total reflects that.
+        g = nx.MultiDiGraph()
+        g.add_edge(0, 1, key=0, length=5.0, cost=5.0)
+        g.add_edge(0, 1, key=1, length=2.0, cost=2.0)  # cheaper parallel
+        out = shortest_path_costs_one_to_one(
+            g, trip_ids=["p"], origins=[0], destinations=[1], weight="cost"
+        )
+        self.assertEqual(out["p"], 2.0)
+
+    def test_matches_full_metrics_costs(self):
+        # Cost-only output must match the `cost` column of the full-metrics
+        # function on the same inputs — proves the lean optimisation is
+        # numerically equivalent.
+        from aperta.routing import shortest_path_metrics_one_to_one
+
+        g = self._graph()
+        trip_ids = ["a", "b", "c"]
+        origins = [0, 1, 0]
+        dests = [3, 3, 1]
+        lean = shortest_path_costs_one_to_one(
+            g, trip_ids=trip_ids, origins=origins, destinations=dests, weight="cost"
+        )
+        full = shortest_path_metrics_one_to_one(
+            g, trip_ids=trip_ids, origins=origins, destinations=dests, weight="cost"
+        )
+        for t in trip_ids:
+            self.assertEqual(lean[t], full.loc[t, "cost"])
 
 
 if __name__ == "__main__":

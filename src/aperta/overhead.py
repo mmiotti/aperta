@@ -9,87 +9,48 @@ time, station-access time, etc.). The "overhead" is the extra cost between
 the actual unit and its assigned network node — at the origin (first mile)
 and at the destination (last mile).
 
-**Four kinds of overhead.** Aperta supports four overhead categories,
-organised by *which side* (origin / destination) and *what granularity*
-(cell-specific within one node, or node-level for all cells at one node):
+**Two supported sides:** origin (first-mile, added to every OD leaving that
+unit) and destination (last-mile, added to every OD arriving at that unit).
+Applied to a **geo-keyed** cost `TieredODGeoPairs` via `add_geo_overheads`,
+which auto-derives the zone-tier overhead from the cell-tier one when only
+the cell side is passed (see the function's docstring for the footgun this
+protects against).
 
-- (1) origin × cell-specific: per-cell first-mile.
-- (2) origin × node-level: origin overhead at node.
-- (3) destination × node-level: destination overhead at node.
-- (4) destination × cell-specific: per-cell-tier-node aggregate.
+**Destination overhead for the zone tier** is a modelling choice. Three
+canonical aggregators are provided:
 
-Each category in detail:
+- `aggregate_dest_overhead_per_node`   — mean per-cell overhead per snap
+  node (cell tier).
+- `aggregate_dest_overhead_per_group_euclidean` — for road-network
+  analyses, where "cost to a typical place in the zone" is best modeled as
+  Euclidean centroid-distance ÷ speed.
+- `aggregate_dest_overhead_per_group_routed`    — for transit-style
+  analyses, where users have to reach a specific stop node so the last-mile
+  is a routed Dijkstra distance rather than Euclidean.
 
-- **(1) Origin overhead, cell → node** — per-cell first-mile (cell centroid →
-  assigned network node). Different cells at the same node have *different*
-  values. Cannot be added to a `TieredODPairs` because TieredODPairs is
-  keyed by node, not by cell. Applied at accessibility-computation time via
-  the `cell_overhead_column` kwarg on `gravity`, `cumulative_opportunities`, etc.
+**Workflow (canonical geo-keyed pattern)**::
 
-- **(2) Origin overhead at node** — per-node overhead independent of which
-  cell at that node is the actual origin (e.g., parking-find time on
-  departure). Added to a `TieredODPairs` of costs upfront via
-  `add_node_overheads(origin=...)`.
-
-- **(3) Destination overhead at node** — per-destination-node overhead,
-  independent of geo unit (e.g., parking-find time on arrival). Added via
-  `add_node_overheads(dest_cell=..., dest_zone=...)` per
-  tier.
-
-- **(4) Destination overhead, node → cell (aggregated)** — for cell-tier
-  destinations, the mean per-cell overhead across cells sharing the node;
-  for zone-tier destinations, the (weighted) average across
-  cells in the zone of the "intra-zone" access cost. Computed via
-  `aggregate_dest_overhead_per_node` (cell tier),
-  `aggregate_dest_overhead_per_group_euclidean` (zone tier — for
-  road networks, where users don't actually pass through a specific node),
-  or `aggregate_dest_overhead_per_group_routed` (zone tier — for
-  transit-style analyses where users do have to access a specific stop).
-  Apply via `add_node_overheads`.
-
-**Recommended pattern: pick ONE side.**
-
-Mixing the two granularities on the same side (e.g., per-cell first-mile +
-per-node origin overhead) is technically supported but makes the analysis
-structure harder to reason about. We recommend picking ONE granularity per
-side:
-
-- **Cell-granularity workflow:** (1) + (4). Per-cell first-mile via
-  `cell_overhead_column`; aggregated destination overhead per tier via
-  this module. Natural for analyses where intra-node heterogeneity matters
-  (e.g., walking accessibility with hectare cells).
-
-- **Node-granularity workflow:** (2) + (3). Per-node origin and destination
-  overheads via `add_node_overheads`. Natural for analyses where the unit-
-  of-interest IS the network node (e.g., transit-stop-to-stop accessibility).
-
-The two patterns can be mixed when there's a clear reason — but document
-the reason in your project.
-
-**Workflow (cell-granularity case)**::
-
-    # 1. Per-cell first-mile (origin side, #1) — typically done in data prep
+    # 1. Per-cell first-mile (origin side) — typically done in data prep
     cells['walk_overhead_s'] = dist_to_node / WALK_SPEED_MS
 
-    # 2. Compute aggregated destination overheads (#4)
+    # 2. Compute aggregated destination overheads
     node_overhead = overhead.aggregate_dest_overhead_per_node(
         cells, 'walk_overhead_s')
     zones['walk_dest_overhead_s'] = overhead.aggregate_dest_overhead_per_group_euclidean(
         cells, zones, speed=WALK_SPEED_MS,
         group_id_column='zone_id', cell_overhead_column='walk_overhead_s')
 
-    # 3. Apply destination overheads to costs
-    times_aug = overhead.add_node_overheads(
-        times, pairs,
-        dest_cell=node_overhead,
-        dest_zone=zones.set_index('node_id')['walk_dest_overhead_s'],
+    # 3. Bake overheads into the geo-keyed cost ODM
+    times_geo = overhead.add_geo_overheads(
+        times_geo, pairs_geo,
+        origin_cell=cells['walk_overhead_s'],
+        dest_cell=cells['walk_overhead_s'],
+        dest_zone=zones['walk_dest_overhead_s'],
+        cell_to_zone=cells['zone_id'],
     )
 
-    # 4. Accessibility — origin first-mile still applied here via cell_overhead_column
-    accessibility.gravity(
-        times_aug, weights, c2z, decays,
-        cells=cells, node_column='node_id', cell_overhead_column='walk_overhead_s',
-    )
+    # 4. Accessibility reads the pre-baked ODM directly.
+    accessibility.gravity(times_geo, weights, cell_to_zone, decays)
 """
 
 from typing import Callable
@@ -99,7 +60,7 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 
-from aperta.od_pairs import TieredODGeoPairs, TieredODPairs
+from aperta.od_pairs import TieredODGeoPairs
 
 
 def aggregate_dest_overhead_per_node(
@@ -111,8 +72,6 @@ def aggregate_dest_overhead_per_node(
 ) -> pd.Series:
     """Per-network-node destination overhead — (weighted) mean of per-cell
     overheads across cells sharing each node.
-
-    Use as `dest_cell=...` in `add_node_overheads` (overhead #4 at cell tier).
 
     For cell-tier destinations: a destination network node typically represents
     one or more cells (any cell whose `node_column` value is that node). The
@@ -131,9 +90,7 @@ def aggregate_dest_overhead_per_node(
 
     Returns:
         `pd.Series` indexed by network node ID, with one mean overhead per
-        node. Nodes with no associated cells are absent from the result —
-        callers using the result via `add_node_overheads` will receive `0`
-        overhead for those nodes (the `dict.get(..., 0)` fallback).
+        node. Nodes with no associated cells are absent from the result.
     """
     df = cells.dropna(subset=[node_column])
     if weight_column is None:
@@ -156,105 +113,129 @@ def aggregate_dest_overhead_per_node(
     return pd.Series(out).rename(f"dest_overhead_per_node({cell_overhead_column})")
 
 
-def aggregate_dest_overhead_per_group_euclidean(
-    cells: gpd.GeoDataFrame,
-    target_groups: gpd.GeoDataFrame,
-    speed: float,
+def aggregate_dest_overhead_per_group(
+    cells: pd.DataFrame | gpd.GeoDataFrame,
+    target_groups: pd.DataFrame | gpd.GeoDataFrame,
     *,
+    distance: str,
     group_id_column: str,
     cell_overhead_column: str | None = None,
     weight_column: str | None = None,
+    # Euclidean-mode kwargs:
+    speed: float | None = None,
+    # Routed-mode kwargs:
+    graph: nx.Graph | None = None,
+    weight: str | None = None,
+    node_column: str = "node_id",
+    cutoff: float | None = None,
 ) -> pd.Series:
-    """Per-group destination overhead — Euclidean-distance-based, for zone-tier destinations.
+    """Per-group destination overhead — for zone-tier destinations.
 
-    Use as `dest_zone=...` in `add_node_overheads`
-    (overhead #4 at zone tier). The same function shape handles any
-    via the `group_id_column` kwarg.
+    Pair with `add_geo_overheads(dest_zone=...)` (overhead #4 at zone tier).
+    The same function shape handles any grouping via the `group_id_column`
+    kwarg.
 
-    For each target group `g` (with polygon centroid `g_centroid`):
+    For each target group `g` (with representative point / network node):
 
         overhead(g) = (weighted) mean over cells c in g of:
             (cells[c, cell_overhead_column] if cell_overhead_column else 0)
-            + euclidean(c_centroid, g_centroid) / speed
+            + last_mile_distance(c, g)
 
-    The Euclidean variant is appropriate for road-network analyses where
-    users don't actually have to pass through the group's representative
-    node — the "geometric distance to a typical place in the group" is the
-    more honest approximation. For transit-style analyses where users do
-    have to access a specific stop, use
-    `aggregate_dest_overhead_per_group_routed` instead.
+    The `last_mile_distance` term depends on the `distance` mode:
 
-    The CRS of `cells` and `target_groups` must agree and be metric
-    (Euclidean distance computations require it). `speed` is in CRS-units
-    per time-unit (e.g. for walking with cells in metres: `speed=1.4`).
+    - `'euclidean'`: `euclidean(c_centroid, g_centroid) / speed`. Appropriate
+      for road-network analyses where users don't actually have to pass
+      through the group's representative node — the "geometric distance to
+      a typical place in the group" is the more honest approximation.
+      Requires `speed` (CRS-units per time-unit) and CRSes on `cells` +
+      `target_groups` that agree and are metric.
+    - `'routed'`: `route(g_node → c_node, weight)`. Appropriate for
+      transit-style analyses where users have to access a specific stop
+      node. Direction is `g_node → c_node` (single-source Dijkstra from
+      `g_node`) — by symmetry on undirected graphs this equals
+      `c_node → g_node`; for directed graphs (one-way streets etc.),
+      the `g_node → c_node` direction is the "egress at destination"
+      semantic. Requires `graph`, `weight`, and `node_column` on both
+      `cells` and `target_groups`.
 
     The `cell_overhead_column` typically encodes the mode-specific constant
     plus any feature-based overhead (e.g. β · population_density) the user
-    has precomputed per cell. The Euclidean penalty is added on top.
+    has precomputed per cell. The last-mile distance is added on top.
 
     Args:
-        cells: per-cell GeoDataFrame with polygon (or point) geometry.
-            Must have `group_id_column` linking to `target_groups.index`.
-        target_groups: per-group GeoDataFrame with polygon (or point)
-            geometry, indexed by group ID. Polygon centroid is used as the
-            "representative point".
-        speed: speed in CRS-units per time-unit. Used to convert distance
-            to time. Must be > 0.
+        cells: per-cell DataFrame (routed mode) or GeoDataFrame with polygon
+            / point geometry (Euclidean mode). Must have `group_id_column`
+            linking to `target_groups.index`. In routed mode must also have
+            `node_column` (network node ID).
+        target_groups: per-group DataFrame / GeoDataFrame, indexed by group
+            ID. In Euclidean mode the polygon centroid is the "representative
+            point"; in routed mode `node_column` gives the group's
+            representative network node.
+        distance: `'euclidean'` or `'routed'`. Picks which last-mile distance
+            model applies and which mode-specific kwargs are consulted.
         group_id_column: column on `cells` linking to `target_groups.index`
             (typically `'zone_id'` or `'region_id'`).
         cell_overhead_column: optional column on `cells` with per-cell base
             overhead (constant + feature-based), added on top of the
-            Euclidean penalty.
+            last-mile distance.
         weight_column: optional column on `cells` to weight the mean (e.g.
             `'population'`). `None` = uniform.
+        speed: `'euclidean'` mode only — speed in CRS-units per time-unit,
+            used to convert distance to time. Must be > 0.
+        graph: `'routed'` mode only — routable networkx (or osmnx) graph.
+        weight: `'routed'` mode only — edge attribute name used for routing
+            (e.g. `'walk_time_s'`).
+        node_column: `'routed'` mode only — column name carrying the network
+            node ID, on both `cells` and `target_groups`. Default `'node_id'`.
+        cutoff: `'routed'` mode only — optional `csg.dijkstra(limit=cutoff)`
+            in `weight` units. Cells beyond it from `g_node` are treated as
+            unreachable (contribute NaN, filtered from the mean). Set this
+            comfortably above the longest expected last-mile in `weight`
+            units (typical zone diameter ÷ slowest mode speed) to speed up
+            routing on large graphs.
 
     Returns:
         `pd.Series` indexed by `target_groups.index`, with one mean overhead
-        per group. Groups with no constituent cells get `NaN`.
+        per group. Groups with no constituent cells (or, in routed mode,
+        with all cells unreachable from `g_node`) get `NaN`.
     """
-    if speed <= 0:
-        raise ValueError(f"`speed` must be > 0; got {speed!r}.")
-
-    cells_valid = cells.dropna(subset=[group_id_column])
-    if not len(cells_valid):
-        return pd.Series(
-            dtype=float,
-            index=target_groups.index,
-            name=f"dest_overhead_per_group_euclidean({group_id_column})",
+    if distance == "euclidean":
+        if speed is None:
+            raise ValueError("`speed` is required for `distance='euclidean'`.")
+        distances_per_cell, cell_group_ids, cells_valid = _euclidean_last_mile(
+            cells,
+            target_groups,
+            speed=speed,
+            group_id_column=group_id_column,
         )
-
-    # Per-cell centroid coords (works for both polygons and points).
-    cells_centroids = cells_valid.geometry.centroid
-    cell_x = cells_centroids.x.to_numpy(dtype=float)
-    cell_y = cells_centroids.y.to_numpy(dtype=float)
-
-    # Per-group centroid coords, looked up by cell's group_id.
-    group_centroids = target_groups.geometry.centroid
-    group_x_lookup = group_centroids.x.to_dict()
-    group_y_lookup = group_centroids.y.to_dict()
-    cell_groups = cells_valid[group_id_column].to_numpy()
-    group_x_per_cell = np.array([group_x_lookup.get(g, np.nan) for g in cell_groups])
-    group_y_per_cell = np.array([group_y_lookup.get(g, np.nan) for g in cell_groups])
-
-    # Euclidean distance per cell, divided by speed.
-    distances = np.hypot(cell_x - group_x_per_cell, cell_y - group_y_per_cell)
-    times = distances / speed
+    elif distance == "routed":
+        if graph is None or weight is None:
+            raise ValueError("`graph` and `weight` are required for `distance='routed'`.")
+        distances_per_cell, cell_group_ids, cells_valid = _routed_last_mile(
+            cells,
+            target_groups,
+            graph=graph,
+            weight=weight,
+            group_id_column=group_id_column,
+            node_column=node_column,
+            cutoff=cutoff,
+        )
+    else:
+        raise ValueError(f"`distance` must be `'euclidean'` or `'routed'`; got {distance!r}.")
 
     if cell_overhead_column is not None:
-        times = times + cells_valid[cell_overhead_column].to_numpy(dtype=float)
+        distances_per_cell = distances_per_cell + (
+            cells_valid[cell_overhead_column].to_numpy(dtype=float)
+        )
+    if weight_column is not None:
+        weights = cells_valid[weight_column].to_numpy(dtype=float)
+    else:
+        weights = np.ones(len(cells_valid))
 
-    # (Weighted) mean per group — explicit per-group loop to avoid the
-    # type-stub friction of `groupby().apply()` with `include_groups`.
-    weights = (
-        cells_valid[weight_column].to_numpy(dtype=float)
-        if weight_column is not None
-        else np.ones(len(cells_valid))
-    )
     out: dict = {}
-    df_groups = pd.Series(cell_groups).groupby(cell_groups).groups
-    for group, idx in df_groups.items():
+    for group, idx in pd.Series(cell_group_ids).groupby(cell_group_ids).groups.items():
         i = np.asarray(idx)
-        v = times[i]
+        v = distances_per_cell[i]
         w = weights[i]
         m = np.isfinite(v) & np.isfinite(w) & (w > 0)
         out[group] = float((v[m] * w[m]).sum() / w[m].sum()) if m.any() else float("nan")
@@ -262,72 +243,57 @@ def aggregate_dest_overhead_per_group_euclidean(
     return (
         pd.Series(out)
         .reindex(target_groups.index)
-        .rename(f"dest_overhead_per_group_euclidean({group_id_column})")
+        .rename(f"dest_overhead_per_group({group_id_column})")
     )
 
 
-def aggregate_dest_overhead_per_group_routed(
+def _euclidean_last_mile(
+    cells: gpd.GeoDataFrame,
+    target_groups: gpd.GeoDataFrame,
+    *,
+    speed: float,
+    group_id_column: str,
+) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+    """Per-cell Euclidean centroid-to-group-centroid distance, divided by
+    `speed`. Returns `(distances, group_ids, cells_valid)` — `cells_valid`
+    is the filtered per-cell frame (rows with a resolvable group_id).
+    """
+    if speed <= 0:
+        raise ValueError(f"`speed` must be > 0; got {speed!r}.")
+
+    cells_valid = cells.dropna(subset=[group_id_column])
+    if not len(cells_valid):
+        return np.array([]), np.array([]), cells_valid
+
+    cells_centroids = cells_valid.geometry.centroid
+    cell_x = cells_centroids.x.to_numpy(dtype=float)
+    cell_y = cells_centroids.y.to_numpy(dtype=float)
+
+    group_centroids = target_groups.geometry.centroid
+    group_x_lookup = group_centroids.x.to_dict()
+    group_y_lookup = group_centroids.y.to_dict()
+    cell_groups = cells_valid[group_id_column].to_numpy()
+    group_x_per_cell = np.array([group_x_lookup.get(g, np.nan) for g in cell_groups])
+    group_y_per_cell = np.array([group_y_lookup.get(g, np.nan) for g in cell_groups])
+
+    distances = np.hypot(cell_x - group_x_per_cell, cell_y - group_y_per_cell) / speed
+    return distances, cell_groups, cells_valid
+
+
+def _routed_last_mile(
     cells: pd.DataFrame,
     target_groups: pd.DataFrame,
+    *,
     graph: nx.Graph,
     weight: str,
-    *,
     group_id_column: str,
-    node_column: str = "node_id",
-    cell_overhead_column: str | None = None,
-    weight_column: str | None = None,
-    cutoff: float | None = None,
-) -> pd.Series:
-    """Per-group destination overhead via routing — for zone-tier destinations.
-
-    Use as `dest_zone=...` in `add_node_overheads`
-    (overhead #4 at zone tier). The same function shape handles any
-    via the `group_id_column` kwarg.
-
-    For each target group `g` (with representative network node `g_node`):
-
-        overhead(g) = (weighted) mean over cells c in g of:
-            (cells[c, cell_overhead_column] if cell_overhead_column else 0)
-            + route(g_node → c_node, weight)
-
-    Routing direction is `g_node → c_node` (single-source Dijkstra from
-    `g_node`) — by symmetry on undirected graphs this equals
-    `c_node → g_node`. The "egress at destination" semantic is the
-    `g_node → c_node` direction; for directed graphs (one-way streets etc.),
-    that's the right direction.
-
-    Args:
-        cells: per-cell DataFrame. Must have `node_column` (network node ID)
-            and `group_id_column` (target-group ID linking to
-            `target_groups.index`).
-        target_groups: per-group DataFrame (e.g. `zones`),
-            indexed by group ID, with `node_column` giving the group's
-            representative network node.
-        graph: routable networkx (or osmnx) graph.
-        weight: edge attribute name used for routing (e.g. `'walk_time_s'`).
-        group_id_column: column on `cells` linking to `target_groups.index`
-            (typically `'zone_id'` or `'region_id'`).
-        node_column: column name carrying the network node ID, on both
-            `cells` and `target_groups`. Default `'node_id'`.
-        cell_overhead_column: optional column on `cells` with per-cell
-            first-mile overhead to add to the routed distance before
-            averaging. `None` = routed cost only (zone-internal first-mile
-            ignored).
-        weight_column: optional column on `cells` to weight the mean (e.g.
-            `'population'`). `None` = uniform.
-        cutoff: optional `csg.dijkstra(limit=cutoff)` in `weight` units.
-            Cells beyond it from `g_node` are treated as unreachable
-            (contribute NaN, filtered from the mean). Set this comfortably
-            above the longest expected last-mile in `weight` units (typical
-            zone diameter ÷ slowest mode speed) to speed up routing on
-            large graphs.
-
-    Returns:
-        `pd.Series` indexed by `target_groups.index`, with one mean overhead
-        per group. Groups with no constituent cells (or with all cells
-        unreachable from `g_node`) get `NaN`.
+    node_column: str,
+    cutoff: float | None,
+) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+    """Per-cell routed distance from each cell's group representative node
+    back to the cell's snap node, via one Dijkstra per group. Returns
+    `(distances, group_ids, cells_valid)`.
     """
-    # Local import to keep scipy.sparse out of the module load path.
     import scipy.sparse.csgraph as csg
 
     from aperta.routing import _graph_to_csr
@@ -335,40 +301,28 @@ def aggregate_dest_overhead_per_group_routed(
     csr, nx_to_seq, _ = _graph_to_csr(graph, weight)
     limit = cutoff if cutoff is not None else np.inf
 
-    def _distances_from(g_node, cell_nodes):
+    cells_valid = cells.dropna(subset=[node_column, group_id_column])
+    if not len(cells_valid):
+        return np.array([]), np.array([]), cells_valid
+
+    group_node_lookup = target_groups[node_column].to_dict()
+    distances = np.full(len(cells_valid), np.nan, dtype=float)
+    cell_nodes_arr = cells_valid[node_column].to_numpy()
+    cell_groups_arr = cells_valid[group_id_column].to_numpy()
+
+    for group_id, idx in pd.Series(cell_groups_arr).groupby(cell_groups_arr).groups.items():
+        g_node = group_node_lookup.get(group_id)
+        if g_node is None or pd.isna(g_node):
+            continue
+        i = np.asarray(idx)
         g_seq = nx_to_seq[g_node]
         dist_row = csg.dijkstra(csr, indices=[g_seq], limit=limit, return_predecessors=False)[0]
         cell_seqs = np.fromiter(
-            (nx_to_seq[n] for n in cell_nodes), dtype=np.int64, count=len(cell_nodes)
+            (nx_to_seq[n] for n in cell_nodes_arr[i]), dtype=np.int64, count=len(i)
         )
-        return dist_row[cell_seqs]
+        distances[i] = dist_row[cell_seqs]
 
-    cells_valid = cells.dropna(subset=[node_column, group_id_column])
-    cells_by_group = cells_valid.groupby(group_id_column)
-
-    out: dict = {}
-    for group_id, g_node in target_groups[node_column].items():
-        if pd.isna(g_node):
-            continue
-        if group_id not in cells_by_group.groups:
-            continue
-        group_cells = cells_by_group.get_group(group_id)
-        cell_nodes = group_cells[node_column].to_numpy()
-        distances = _distances_from(g_node, cell_nodes)
-        if cell_overhead_column is not None:
-            first_mile = group_cells[cell_overhead_column].to_numpy(dtype=float)
-            distances = distances + first_mile
-        if weight_column is not None:
-            wgts = group_cells[weight_column].to_numpy(dtype=float)
-        else:
-            wgts = np.ones_like(distances)
-        m = np.isfinite(distances) & np.isfinite(wgts) & (wgts > 0)
-        if not m.any():
-            out[group_id] = float("nan")
-            continue
-        out[group_id] = float((distances[m] * wgts[m]).sum() / wgts[m].sum())
-
-    return pd.Series(out, name=f"dest_overhead_per_group({group_id_column})")
+    return distances, cell_groups_arr, cells_valid
 
 
 def _zones_referenced_as_origins(costs: TieredODGeoPairs) -> set:
@@ -452,91 +406,6 @@ def _as_lookup(x: pd.Series | dict | None) -> dict | None:
     return dict(x)
 
 
-def add_node_overheads(
-    costs: TieredODPairs,
-    pairs: TieredODPairs,
-    *,
-    origin: pd.Series | dict | None = None,
-    dest_cell: pd.Series | dict | None = None,
-    dest_zone: pd.Series | dict | None = None,
-) -> TieredODPairs:
-    """Add per-node origin and destination overheads to a cost `TieredODPairs`.
-
-    Each kwarg is a per-node lookup (`pd.Series` indexed by node ID, or a
-    `dict[node_id -> overhead]`). Nodes absent from a lookup contribute `0`
-    overhead.
-
-    - `origin`: added to every OD cost whose origin matches a key. Looked up
-      by the origin node of each TieredODPairs entry. Applies to all tiers
-      (cells_to_cells and cells_to_zones use cell-tier origin nodes;
-      zones_to_zones uses zone-tier origin nodes).
-    - `dest_cell`: added to cells_to_cells OD costs, looked up by destination
-      cell-tier node. Use for overhead #3 (cell-tier dest, at-node) and / or
-      #4 (cell-tier dest, aggregated — from
-      `aggregate_dest_overhead_per_node`).
-    - `dest_zone`: added to BOTH `cells_to_zones` and `zones_to_zones` OD
-      costs, looked up by destination zone-tier node. Use for overhead #3 / #4
-      at zone tier (both middle and far tier have zone destinations).
-
-    Any kwarg can be `None` (no overhead applied at that side / tier). The
-    returned `TieredODPairs` is a new object — the input is not mutated.
-
-    Note on origin overhead: the same Series is looked up at all tiers, but
-    the *origin nodes themselves differ by tier* (cell-tier and middle-tier
-    origins are cell-nodes; far-tier origins are zone-nodes). To apply a
-    single per-cell-node origin overhead to all tiers, you would need to
-    combine it with `cell_overhead_column` at accessibility time instead —
-    see this module's docstring on the per-cell-vs-per-node granularity choice.
-
-    Args:
-        costs: `TieredODPairs` of routed costs.
-        pairs: `TieredODPairs` of destination IDs (typically from
-            `od_pairs.get_pairs`), position-aligned with `costs`.
-        origin, dest_cell, dest_zone: per-node overhead lookups.
-
-    Returns:
-        New `TieredODPairs` of cost arrays with the requested overheads added.
-        Tiers that are `None` in `costs` pass through as `None`.
-    """
-    origin_lu = _as_lookup(origin)
-    dest_cell_lu = _as_lookup(dest_cell)
-    dest_zone_lu = _as_lookup(dest_zone)
-
-    def _augment(
-        cost_tier: dict | None, pair_tier: dict | None, dest_lookup: dict | None
-    ) -> dict | None:
-        if cost_tier is None:
-            return None
-        out: dict = {}
-        for orig, cost_arr in cost_tier.items():
-            # Preserve input dtype (typically FP32 for cost ODMs) — silent
-            # FP64 upcast here would double memory for the whole result.
-            new_arr = np.asarray(cost_arr).copy()
-            dt = new_arr.dtype
-            if origin_lu is not None:
-                new_arr = new_arr + dt.type(origin_lu.get(orig, 0.0))
-            if dest_lookup is not None and pair_tier is not None:
-                dest_ids = pair_tier.get(orig)
-                if dest_ids is not None:
-                    dest_arr = np.fromiter(
-                        (dest_lookup.get(d, 0.0) for d in dest_ids), dtype=dt, count=len(dest_ids)
-                    )
-                    new_arr = new_arr + dest_arr
-            out[orig] = new_arr
-        return out
-
-    return type(costs)(
-        cells_to_cells=_augment(costs.cells_to_cells, pairs.cells_to_cells, dest_cell_lu),
-        cells_to_zones=_augment(costs.cells_to_zones, pairs.cells_to_zones, dest_zone_lu),
-        zones_to_zones=_augment(costs.zones_to_zones, pairs.zones_to_zones, dest_zone_lu),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Geo-keyed overhead application
-# ---------------------------------------------------------------------------
-
-
 def add_geo_overheads(
     costs: TieredODGeoPairs,
     pairs: TieredODGeoPairs,
@@ -550,10 +419,10 @@ def add_geo_overheads(
 ) -> TieredODGeoPairs:
     """Add per-geo-unit origin and destination overheads to a geo-keyed cost ODM.
 
-    Geo-keyed twin of `add_node_overheads`. Four independent overhead lookups,
-    one per (side × tier-granularity) combination. Each kwarg is a per-unit
-    lookup (`pd.Series` indexed by unit ID or `dict[unit_id -> value]`); units
-    absent from a lookup contribute 0 overhead.
+    Four independent overhead lookups, one per (side × tier-granularity)
+    combination. Each kwarg is a per-unit lookup (`pd.Series` indexed by
+    unit ID or `dict[unit_id -> value]`); units absent from a lookup
+    contribute 0 overhead.
 
     Origin (looked up by origin unit ID at each tier):
 
@@ -666,108 +535,3 @@ def add_geo_overheads(
         cells_to_zones=_augment(costs.cells_to_zones, pairs.cells_to_zones, o_cell_lu, d_zone_lu),
         zones_to_zones=_augment(costs.zones_to_zones, pairs.zones_to_zones, o_zone_lu, d_zone_lu),
     )
-
-
-def add_origin_cell_overhead(
-    costs: TieredODGeoPairs,
-    pairs: TieredODGeoPairs,
-    cells: pd.DataFrame,
-    overhead_column: str,
-    *,
-    zone_id_column: str = "zone_id",
-    zone_aggregator: str = "mean",
-) -> TieredODGeoPairs:
-    """Bake per-cell origin overhead into a geo-keyed cost ODM at all tiers.
-
-    Convenience wrapper around `add_geo_overheads`. The per-cell first-mile
-    overhead is added directly at the cell tier; at the zone tier
-    (where origins are zones, not cells), the per-zone aggregate of per-cell
-    overheads is added — cells in the same zone share their zone-tier OD pair,
-    so collapsing to a per-zone scalar is the natural granularity.
-
-    Why this matters for cross-modal accessibility: the per-cell first-mile is
-    mode-specific (`dist_to_node / WALK_SPEED_MS` vs
-    `dist_to_node / CAR_SPEED_MS`). Baking it into the per-mode cost ODM
-    before `aggregate_across_modes` lets the cross-modal logsum see the right
-    per-mode disutility, instead of conflating origin time across modes.
-
-    Args:
-        costs: geo-keyed cost ODM (typically from `reindex_by_geo_unit`).
-        pairs: matching geo-keyed pairs (for tier structure; not used for
-            dest lookups here since this function only touches origins).
-        cells: cell-level DataFrame indexed by `cell_id`. Must have
-            `overhead_column` and (when zone-tier is populated) `zone_id_column`.
-        overhead_column: per-cell overhead column on `cells`.
-        zone_id_column: column on `cells` mapping each cell to its zone.
-            Required iff `costs.zones_to_zones` is populated (only the
-            far tier uses zone-level origin overhead — the cells_to_cells
-            and cells_to_zones tiers both have cell-id origins and consume
-            `origin_cell` directly).
-        zone_aggregator: pandas-compatible string aggregator (default `'mean'`),
-            applied to per-cell overhead values within each zone.
-
-    Returns:
-        New `TieredODGeoPairs` with the overhead added. `costs` is not mutated.
-    """
-    if overhead_column not in cells.columns:
-        raise ValueError(f"`cells` is missing column {overhead_column!r}.")
-    origin_cell = cells[overhead_column]
-    origin_zone: pd.Series | None = None
-    needs_zone = costs.zones_to_zones is not None
-    if needs_zone:
-        if zone_id_column not in cells.columns:
-            raise ValueError(
-                f"`cells` is missing zone-link column {zone_id_column!r} "
-                f"(required because zones_to_zones costs are populated)."
-            )
-        origin_zone = cells.groupby(zone_id_column)[overhead_column].agg(zone_aggregator)
-    return add_geo_overheads(
-        costs,
-        pairs,
-        origin_cell=origin_cell,
-        origin_zone=origin_zone,
-    )
-
-
-def linear_per_cell_overhead(
-    cells: pd.DataFrame,
-    constant: float,
-    feature_coefficients: dict[str, float],
-) -> pd.Series:
-    """Canonical aperta linear per-cell trip overhead:
-
-        overhead(cell) = constant + Σ coef_i × cells[col_i]
-
-    One side (origin or destination) of the per-cell trip overhead. The
-    classic decomposition is a constant ("door-to-curb" time), a snap-
-    distance term (`coef_i = seconds-per-metre`, `col_i = 'snap_dist'`),
-    and a density term (`coef_i = seconds-per-density-unit`,
-    `col_i = 'density_norm'`), but any per-cell numeric column works —
-    the formula is mode- and feature-agnostic.
-
-    NaN handling: missing values in a feature column are treated as 0
-    (the assumption is that "data not available" doesn't add overhead).
-    If a different convention is needed, pre-process `cells` before
-    calling.
-
-    Returns a per-cell `pd.Series` indexed like `cells`, ready to pass
-    as `origin_cell=` or `dest_cell=` to `overhead.add_geo_overheads`.
-
-    Args:
-        cells: per-cell DataFrame; must contain every column named in
-            `feature_coefficients`.
-        constant: side constant (e.g. seconds of "door-to-curb" time).
-        feature_coefficients: `{column_name -> coefficient}`. Empty dict
-            is allowed (returns a constant Series).
-
-    Returns:
-        `pd.Series` of floats indexed by `cells.index`.
-
-    See also: [[add_geo_overheads]] for applying the result to a cost
-    ODM, and [[aggregate_dest_overhead_per_group_euclidean]] for
-    aggregating destination-side overheads to zones.
-    """
-    result = pd.Series(constant, index=cells.index, dtype=float)
-    for col, coef in feature_coefficients.items():
-        result = result + coef * cells[col].fillna(0.0)
-    return result

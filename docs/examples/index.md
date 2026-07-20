@@ -8,17 +8,15 @@ outputs.
 | Tier | Notebook | Run time | What it covers |
 |---|---|---|---|
 | Minimal | [`minimal`](minimal) | ~10 s | Every aperta primitive exercised exactly once, OSM data only (Cambridge MA). The "what does aperta do?" demo. |
-| Walkthrough | [`walkthrough`](walkthrough) | ~1 min | Guided tour of every primitive on real OSM data (Central Paris): tiered ODs, geo-keyed reindex, overheads, three accessibility metrics, path-first per-edge feature aggregation, cross-modal logsum. |
-| Extended | [`extended_accessibility`](extended_accessibility) | ~30 min | Production-scale Bern + 40 km cross-modal accessibility (walking, cycling, car at peak hours; three destination types). Generates the figures used in the toolkit paper. |
-| Extended | [`extended_calibration`](extended_calibration) | ~30 min | Iterative edge-weight calibration against Google-Maps-derived car travel times. |
-| Extended | [`extended_traffic_flows`](extended_traffic_flows) | ~30 min | Per-edge AADT estimation via cost-decay-weighted nested-betweenness sampling, with counter-fit diagnostics. |
+| Walkthrough | [`walkthrough`](walkthrough) | ~1 min | Guided tour of every primitive on real OSM data (Central Paris): tiered ODs, geo-keyed reindex, overheads, three accessibility metrics, path-first per-edge feature aggregation, cross-modal logsum. Covers the full accessibility surface end-to-end. |
+| Calibration | [`calibration`](calibration) | ~30 min | Consolidated calibration workflow on the Canton of Zurich (fetched inline from OSM): traffic-flow estimation via nested-betweenness sampling with survey-derived P(C), then flow-aware edge-weight calibration against Google-Maps peak-hour travel times. |
 
-The two **extended-example calibration notebooks**
-(`extended_calibration` and `extended_traffic_flows`) require
-ground-truth inputs (Google-Maps-derived car travel times and traffic-counter
-readings) whose source terms preclude redistribution. They render here from
-committed outputs, but re-running them locally requires the private inputs.
-A public-data version is planned.
+The **calibration notebook** fetches the OSM car network for the Canton
+of Zurich inline via `osmnx`; the only external inputs are ground-truth
+files whose source terms preclude redistribution — Google-Maps-derived
+car travel times and Swiss ASTRA counter readings. It renders here
+from committed outputs; re-running locally requires the private
+ground-truth inputs. A public-data version is planned.
 
 ```{toctree}
 :hidden:
@@ -26,7 +24,5 @@ A public-data version is planned.
 
 minimal
 walkthrough
-extended_accessibility
-extended_calibration
-extended_traffic_flows
+calibration
 ```

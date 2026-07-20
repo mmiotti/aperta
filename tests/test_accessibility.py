@@ -23,7 +23,7 @@ from aperta.accessibility import (
     power_decay,
 )
 from aperta.od_pairs import TieredODGeoPairs, TieredODNodePairs
-from aperta.overhead import add_origin_cell_overhead
+from aperta.overhead import add_geo_overheads
 
 
 def _toy_inputs() -> tuple[TieredODNodePairs, TieredODNodePairs, TieredODNodePairs, dict]:
@@ -149,7 +149,7 @@ class CountInBinsTestCase(unittest.TestCase):
 
 class CountInBinsGeoKeyedTestCase(unittest.TestCase):
     """`cumulative_opportunities` with `TieredODGeoPairs` input: cell-indexed output;
-    per-cell origin overhead via `add_origin_cell_overhead` upstream."""
+    per-cell origin overhead via `add_geo_overheads` upstream."""
 
     def setUp(self):
         # Geo-keyed fixture: 3 cells (c1, c2 in zone Z; c3 in zone Z too).
@@ -200,8 +200,13 @@ class CountInBinsGeoKeyedTestCase(unittest.TestCase):
         self.assertEqual(df.loc["c1", ("long", "pop")], 300.0)  # 100 + 200
 
     def test_baked_overhead_shifts_bins(self):
-        """`add_origin_cell_overhead` shifts every cost by the per-cell value."""
-        baked = add_origin_cell_overhead(self.costs, self.pairs, self.cells_df, "walk_overhead_s")
+        """`add_geo_overheads` shifts every cost by the per-cell value."""
+        baked = add_geo_overheads(
+            self.costs,
+            self.pairs,
+            origin_cell=self.cells_df["walk_overhead_s"],
+            cell_to_zone=self.cells_df["zone_id"],
+        )
         df = cumulative_opportunities(baked, {"pop": self.w_pop}, self.c2z, self.bins)
         # c1 has overhead 0 → unchanged from raw.
         self.assertEqual(df.loc["c1", ("short", "pop")], 30.0)
@@ -330,7 +335,7 @@ class GravityTestCase(unittest.TestCase):
             gravity(self.costs, {"pop": self.w_pop}, self.c2z, [])
 
     def test_geo_keyed_overhead_shifts_decay(self):
-        """Geo-keyed: per-cell overhead baked via `add_origin_cell_overhead`
+        """Geo-keyed: per-cell overhead baked via `add_geo_overheads`
         shifts every cost; for exp decay that's a uniform multiplicative
         factor exp(-beta · overhead)."""
         # Build a geo-keyed mirror of the node-keyed fixture.
@@ -361,7 +366,12 @@ class GravityTestCase(unittest.TestCase):
         )
         c2z = cells_df["zone_id"].to_dict()
         beta = 0.001
-        baked = add_origin_cell_overhead(costs_geo, pairs_geo, cells_df, "walk_overhead_s")
+        baked = add_geo_overheads(
+            costs_geo,
+            pairs_geo,
+            origin_cell=cells_df["walk_overhead_s"],
+            cell_to_zone=cells_df["zone_id"],
+        )
         df = gravity(baked, {"pop": w_pop_geo}, c2z, exp_decay("d", beta))
         # Zone-tier overhead = per-zone-mean of per-cell overheads. Z has cells
         # c1 (0) and c2 (100), mean = 50 → ALL cells in Z see +50 at zone tier.
@@ -567,7 +577,12 @@ class NearestKTestCase(unittest.TestCase):
             index=pd.Index(["c1", "c2"], name="cell_id"),
         )
         c2z = cells_df["zone_id"].to_dict()
-        baked = add_origin_cell_overhead(costs_geo, pairs_geo, cells_df, "walk_overhead_s")
+        baked = add_geo_overheads(
+            costs_geo,
+            pairs_geo,
+            origin_cell=cells_df["walk_overhead_s"],
+            cell_to_zone=cells_df["zone_id"],
+        )
         df = nearest_k(baked, {"pop": w_pop_geo}, c2z, ks=[1, 2, 3])
         # c1: overhead 0 → unshifted. c2: +100 uniformly across cell + zone tiers
         # (because each zone has only one cell, so per-zone-mean = per-cell value).

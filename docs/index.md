@@ -43,9 +43,9 @@ Requires Python ≥ 3.11.
   [`examples/walkthrough/accessibility.ipynb`](https://github.com/mmiotti/aperta/blob/main/examples/walkthrough/accessibility.ipynb)
   (Central Paris, walk + bike, cross-modal logsum, path-first per-edge
   feature aggregation, ~40 s).
-- **Production-scale demo** —
-  [`examples/extended/`](https://github.com/mmiotti/aperta/tree/main/examples/extended)
-  (Bern + 40 km, calibration, traffic flows, ~30 min).
+- **Production-scale calibration demos** —
+  [`examples/calibration/`](https://github.com/mmiotti/aperta/tree/main/examples/calibration)
+  (Bern + 40 km, edge-weight calibration + traffic-flow tuning, ~30 min each).
 
 ## API reference
 
@@ -53,7 +53,7 @@ The [API reference](api/index) covers every public function and class
 across aperta's algorithm modules: routing, accessibility metrics, OD
 pair structures, trip overheads, utility-based costs, traffic flow
 estimation, edge-weight calibration, and the supporting geo / network /
-OSM / topography helpers.
+OSM helpers.
 
 ```{toctree}
 :hidden:

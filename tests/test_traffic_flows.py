@@ -3,24 +3,18 @@
 Run with:
     python -m unittest tests.test_traffic_flows
 
-Two public entry points:
-    - `estimate_edge_flows` — naive edge-betweenness-based traffic flow with optional cutoff
-      OR a `nested_node_sample` dict for nested betweenness.
-    - `nested_node_sample` — sample destinations for sampled origins, weighted
-      by cost-derived scores, integrating all three OD tiers (cells_to_cells,
-      cells_to_zones, zones_to_zones).
+Covers `nested_node_sample` — sample destinations for sampled origins,
+weighted by cost-derived scores, integrating all three OD tiers
+(cells_to_cells, cells_to_zones, zones_to_zones).
 """
 
 import unittest
 
-import networkx as nx
 import numpy as np
-import pandas as pd
 
 from aperta.od_pairs import TieredODNodePairs
 from aperta.traffic_flows import (
     bin_adjusted_dest_weights,
-    estimate_edge_flows,
     nested_node_sample,
     percentile_bin_edges,
 )
@@ -28,15 +22,6 @@ from aperta.traffic_flows import (
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
-
-
-def _toy_graph() -> nx.MultiDiGraph:
-    """Tiny multigraph: A → B → C → D plus a shortcut A → C, all edges
-    `length = cost = 1`."""
-    g = nx.MultiDiGraph()
-    for u, v in [("A", "B"), ("B", "C"), ("C", "D"), ("A", "C")]:
-        g.add_edge(u, v, length=1.0, cost=1.0)
-    return g
 
 
 def _toy_tiered_inputs():
@@ -91,41 +76,6 @@ def _inverse_distance(x: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# `estimate_edge_flows` — naive betweenness-based traffic flow estimation
-# ---------------------------------------------------------------------------
-
-
-class GetTrafficFlowsTestCase(unittest.TestCase):
-    def test_returns_series_keyed_by_multidigraph_edge(self):
-        g = _toy_graph()
-        sample = {"A": ["D"]}
-        flows = estimate_edge_flows(
-            g, weight="cost", expected_km_driven=10.0, nested_node_sample=sample
-        )
-        self.assertIsInstance(flows, pd.Series)
-        # Each edge is keyed by (u, v, k) (MultiDiGraph).
-        for key in flows.index:
-            self.assertEqual(len(key), 3)
-
-    def test_nested_node_sample_path(self):
-        """Only edges on the sampled paths get positive flow; the
-        `expected_km_driven` normaliser is exact."""
-        g = _toy_graph()
-        sample = {"A": ["D"]}
-        flows = estimate_edge_flows(
-            g, weight="cost", expected_km_driven=10.0, nested_node_sample=sample
-        )
-        lengths = nx.get_edge_attributes(g, "length")
-        total_vkt = sum(v * lengths[k] for k, v in flows.items())
-        self.assertAlmostEqual(total_vkt, 10.0)
-        # The shortcut A-C and the segment C-D carry the trip; A-B and B-C are unused.
-        self.assertGreater(flows.get(("A", "C", 0), 0), 0)
-        self.assertGreater(flows.get(("C", "D", 0), 0), 0)
-        self.assertEqual(flows.get(("A", "B", 0), 0), 0)
-        self.assertEqual(flows.get(("B", "C", 0), 0), 0)
-
-
-# ---------------------------------------------------------------------------
 # `nested_node_sample` — weighted-sampled origin / destination pairs
 # ---------------------------------------------------------------------------
 
@@ -140,9 +90,9 @@ class NestedNodeSampleTestCase(unittest.TestCase):
             self.pairs,
             self.weights,
             self.costs,
-            self.c2z,
-            self.orig_weights,
-            _inverse_distance,
+            cell_to_zone_node=self.c2z,
+            orig_weights=self.orig_weights,
+            cost_to_weight=_inverse_distance,
             n_orig=4,
             n_dest=10,
             random_state=rs,
@@ -152,38 +102,52 @@ class NestedNodeSampleTestCase(unittest.TestCase):
             self.assertIn(k, ("c1", "c2", "c3", "c4"))
 
     def test_n_dest_per_origin(self):
+        """With-replacement origin sampling: each origin gets a multiple
+        of `n_dest` destinations (== `n_picks × n_dest`), and the total
+        across all origins equals the nominal sample budget
+        `n_orig × n_dest`."""
         rs = np.random.RandomState(42)
+        n_orig, n_dest = 4, 15
         out = nested_node_sample(
             self.pairs,
             self.weights,
             self.costs,
-            self.c2z,
-            self.orig_weights,
-            _inverse_distance,
-            n_orig=4,
-            n_dest=15,
+            cell_to_zone_node=self.c2z,
+            orig_weights=self.orig_weights,
+            cost_to_weight=_inverse_distance,
+            n_orig=n_orig,
+            n_dest=n_dest,
             random_state=rs,
         )
+        # Every origin's array length is `n_picks × n_dest`.
         for dests in out.values():
-            self.assertEqual(len(dests), 15)
+            self.assertEqual(len(dests) % n_dest, 0)
+            self.assertGreaterEqual(len(dests), n_dest)
+        # Total OD pairs sampled is exactly `n_orig × n_dest` regardless
+        # of how the picks distribute across unique origins — this is what
+        # makes AADT scaling clean (no dedup correction needed).
+        self.assertEqual(sum(len(d) for d in out.values()), n_orig * n_dest)
 
     def test_origin_weight_concentration(self):
-        """All origin-weight on c2 → c2 is the only sampled origin (and
-        appears regardless of n_orig because dupes are de-duped)."""
+        """All origin-weight on c2 → c2 is the only sampled origin. Under
+        with-replacement sampling, c2 is picked `n_orig` times and so
+        gets `n_orig × n_dest` destinations."""
         rs = np.random.RandomState(42)
+        n_orig, n_dest = 4, 10
         weights_c2_only = np.array([0.0, 1.0, 0.0, 0.0])
         out = nested_node_sample(
             self.pairs,
             self.weights,
             self.costs,
-            self.c2z,
-            weights_c2_only,
-            _inverse_distance,
-            n_orig=4,
-            n_dest=10,
+            cell_to_zone_node=self.c2z,
+            orig_weights=weights_c2_only,
+            cost_to_weight=_inverse_distance,
+            n_orig=n_orig,
+            n_dest=n_dest,
             random_state=rs,
         )
         self.assertEqual(list(out.keys()), ["c2"])
+        self.assertEqual(len(out["c2"]), n_orig * n_dest)
 
     def test_dest_score_concentration_on_self_pair(self):
         """With inverse-distance scoring, the cost-0 self-pair dominates
@@ -199,9 +163,9 @@ class NestedNodeSampleTestCase(unittest.TestCase):
             self.pairs,
             self.weights,
             self.costs,
-            self.c2z,
-            c1_only,
-            _inverse_distance,
+            cell_to_zone_node=self.c2z,
+            orig_weights=c1_only,
+            cost_to_weight=_inverse_distance,
             n_orig=1,
             n_dest=1000,
             random_state=rs,
@@ -222,9 +186,9 @@ class NestedNodeSampleTestCase(unittest.TestCase):
             self.pairs,
             big_zone_weights,
             self.costs,
-            self.c2z,
-            c1_only,
-            _inverse_distance,
+            cell_to_zone_node=self.c2z,
+            orig_weights=c1_only,
+            cost_to_weight=_inverse_distance,
             n_orig=1,
             n_dest=1000,
             random_state=rs,
@@ -238,9 +202,9 @@ class NestedNodeSampleTestCase(unittest.TestCase):
             self.pairs,
             self.weights,
             self.costs,
-            self.c2z,
-            self.orig_weights,
-            _inverse_distance,
+            cell_to_zone_node=self.c2z,
+            orig_weights=self.orig_weights,
+            cost_to_weight=_inverse_distance,
             n_orig=4,
             n_dest=10,
             random_state=rs1,
@@ -249,9 +213,9 @@ class NestedNodeSampleTestCase(unittest.TestCase):
             self.pairs,
             self.weights,
             self.costs,
-            self.c2z,
-            self.orig_weights,
-            _inverse_distance,
+            cell_to_zone_node=self.c2z,
+            orig_weights=self.orig_weights,
+            cost_to_weight=_inverse_distance,
             n_orig=4,
             n_dest=10,
             random_state=rs2,
@@ -279,9 +243,9 @@ class NestedNodeSampleTestCase(unittest.TestCase):
             self.pairs,
             self.weights,
             self.costs,
-            self.c2z,
-            c1_only,
-            _inverse_distance,
+            cell_to_zone_node=self.c2z,
+            orig_weights=c1_only,
+            cost_to_weight=_inverse_distance,
             n_orig=1,
             n_dest=200,
             random_state=rs,
@@ -309,9 +273,9 @@ class NestedNodeSampleTestCase(unittest.TestCase):
             self.pairs,
             big_zone_weights,
             self.costs,
-            self.c2z,
-            c1_and_c3,
-            _inverse_distance,
+            cell_to_zone_node=self.c2z,
+            orig_weights=c1_and_c3,
+            cost_to_weight=_inverse_distance,
             n_orig=20,
             n_dest=200,
             random_state=rs,
@@ -368,9 +332,9 @@ class NestedNodeSampleMiddleTierTestCase(unittest.TestCase):
             self.pairs,
             self.weights,
             self.costs,
-            self.c2z,
-            c1_only,
-            _inverse_distance,
+            cell_to_zone_node=self.c2z,
+            orig_weights=c1_only,
+            cost_to_weight=_inverse_distance,
             n_orig=1,
             n_dest=1000,
             random_state=rs,
@@ -399,9 +363,9 @@ class NestedNodeSampleMiddleTierTestCase(unittest.TestCase):
             self.pairs,
             self.weights,
             self.costs,
-            self.c2z,
-            c1_only,
-            _inverse_distance,
+            cell_to_zone_node=self.c2z,
+            orig_weights=c1_only,
+            cost_to_weight=_inverse_distance,
             n_orig=1,
             n_dest=500,
             random_state=rs,
@@ -418,9 +382,9 @@ class NestedNodeSampleMiddleTierTestCase(unittest.TestCase):
             self.pairs,
             self.weights,
             self.costs,
-            self.c2z,
-            c3_only,
-            _inverse_distance,
+            cell_to_zone_node=self.c2z,
+            orig_weights=c3_only,
+            cost_to_weight=_inverse_distance,
             n_orig=1,
             n_dest=100,
             random_state=rs,

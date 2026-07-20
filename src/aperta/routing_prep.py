@@ -51,6 +51,25 @@ Directedness = Literal["undirected", "directed_scc"]
 # Projects working with non-OSM road networks should override these settings
 # explicitly when calling `prepare_network` (or skip it and write the
 # `is_snap_eligible_*` / `cost_excluded_*` decorations directly).
+#
+# ⚠ WARNING: ASYMMETRIC PER-EDGE COSTS require `directed_scc` for ALL modes.
+# Undirected routing collapses an edge's two orientations into one in the
+# cost function — any per-direction asymmetry (uphill/downhill elevation
+# penalties, time-of-day flow asymmetry, signed traffic regulations) gets
+# averaged or arbitrarily picked, producing nonsense results. This is the
+# classic OSRM trap: it defaults to undirected for active modes and silently
+# breaks elevation-aware cycling/walking routing.
+#
+# If your project needs per-direction costs for walk or bike (e.g.
+# elevation-aware active-mode routing), override the default:
+#
+#     prepare_network(graph, mode='walk', directedness='directed_scc')
+#     prepare_network(graph, mode='bike', directedness='directed_scc')
+#
+# AND ensure the input graph carries genuinely directed edges per mode.
+# OSMnx's `oneway` is car-oriented; for proper per-mode direction handling
+# at extract time, see `aperta_atlas.osm.emit_directions` (which respects
+# `oneway:bicycle`, `oneway:foot`, `cycleway*=opposite*` tags).
 MODE_DEFAULTS: dict[BaseMode, dict] = {
     "walk": {
         "network_type": "all",
@@ -329,7 +348,7 @@ def compute_snap_eligibility(
         view: nx.Graph = graph.to_undirected(as_view=True)
     else:
         view = graph
-    snap_nodes = _compute_snap_eligible_nodes(view, cfg.directedness, cfg.cost_excluded_flag)
+    snap_nodes = compute_snap_eligible_nodes(view, cfg.directedness, cfg.cost_excluded_flag)
 
     return snap_nodes, cfg.cost_excluded_flag
 
@@ -460,7 +479,7 @@ def prepare_network(
         overwrite="if_missing",
     )
 
-    snap_nodes = _compute_snap_eligible_nodes(
+    snap_nodes = compute_snap_eligible_nodes(
         prepared_graph, cfg.directedness, cfg.cost_excluded_flag
     )
 
@@ -481,12 +500,19 @@ def prepare_network(
     )
 
 
-def _compute_snap_eligible_nodes(
+def compute_snap_eligible_nodes(
     graph: nx.Graph,
     directedness: Directedness,
     cost_excluded_flag: str,
 ) -> frozenset:
     """Largest CC (undirected) or SCC (directed) of the *cost-masked* subgraph.
+
+    Pure compute — does NOT mutate `graph`. Companion to
+    `compute_snap_eligibility` (which writes the per-edge cost-mask AND
+    computes the SCC in one call); use this directly when you've already
+    written the cost-mask elsewhere (e.g., a post-insertion recompute after
+    `insert_projected_nodes` that needs the updated SCC without rewriting
+    the cost-mask).
 
     The cost-masked subgraph contains only edges where the per-edge attribute
     `cost_excluded_flag` is absent or `False`. Computing eligibility on this
@@ -547,31 +573,17 @@ def _check_combination(
     setting".
     """
     if base_mode == "walk":
-        if directedness == "directed_scc":
-            warnings.warn(
-                "walk + directedness='directed_scc' is unnecessarily restrictive; "
-                "walking does not need to respect one-ways. Consider 'undirected'.",
-                UserWarning,
-                stacklevel=3,
-            )
-        if network_type == "walk":
-            warnings.warn(
-                "walk + network_type='walk' may strip pedestrian paths topologically "
-                "connected to the rest of the network through highway nodes "
-                "(the Cambridge MA pitfall). Consider network_type='all' with "
-                "cost_excluded_tags={'motorway', 'motorway_link', 'trunk', "
-                "'trunk_link'}.",
-                UserWarning,
-                stacklevel=3,
-            )
-        if network_type == "all" and not cost_excluded_tags:
-            warnings.warn(
-                "walk + network_type='all' with empty cost_excluded_tags: walking "
-                "will be routed across motorways. Consider excluding {'motorway', "
-                "'motorway_link', 'trunk', 'trunk_link'}.",
-                UserWarning,
-                stacklevel=3,
-            )
+        # Historical walk-specific warnings (`directed_scc` "unnecessarily
+        # restrictive", `network_type='walk'` "Cambridge pitfall",
+        # `network_type='all'` + empty cost_excluded_tags "walking will be
+        # routed across motorways") were dropped: they each assumed a
+        # specific OSMnx-fetched data shape. For custom PBF pipelines the
+        # walk network is pre-filtered at extraction time and asymmetric
+        # per-edge costs (elevation gradients) make `directed_scc` the
+        # correct choice — exactly the case the asymmetric-cost note at
+        # the top of this module flags. Reintroduce only with an opt-out
+        # for callers who manage their own filtering.
+        pass
     elif base_mode == "car":
         if directedness == "undirected":
             warnings.warn(

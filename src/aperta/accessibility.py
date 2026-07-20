@@ -24,14 +24,14 @@ Two valid input shapes, distinguished by the costs/weights subclass:
   cannot be applied here — the function returns per-NODE accessibilities. Build
   the `cell_to_zone` map from `od_pairs.build_cell_to_zone_node_map(cells,
   zones, node_column)` (cell-tier node → zone-tier node). Weights from
-  `od_pairs.dest_values` (per-node sums).
+  `od_pairs.lookup_dest_column_node` (per-node sums).
 
 - **`TieredODGeoPairs`** (geo-keyed): origins and dests are geo-unit IDs
   (cells_to_cells → cell_id; zones_to_zones → zone_id; etc.). Each origin row
   in the output is a cell. Per-cell origin overhead should be baked into the
-  ODM *before* calling this function via `overhead.add_origin_cell_overhead`.
+  ODM *before* calling this function via `add_geo_overheads`.
   Build the `cell_to_zone` map directly: `cells['zone_id'].to_dict()`. Weights
-  from `od_pairs.dest_values_geo` (per-cell direct lookup, no implicit summing).
+  from `od_pairs.lookup_dest_column_node_geo` (per-cell direct lookup, no implicit summing).
 
 The same three functions (`cumulative_opportunities`, `gravity`, `nearest_k`) accept
 either shape; output index name (`'node'` vs `'cell'`) reflects the input.
@@ -111,7 +111,7 @@ def exp_decay(name: str, beta: float) -> Decay:
 
 def power_decay(name: str, beta: float) -> Decay:
     """Power-law decay: `f(c) = c ** (-beta)`. `beta` > 0; c = 0 yields `inf`,
-    so callers should apply `routing.add_intrazonal_cost` first to replace
+    so callers should apply `routing.floor_intrazonal_costs` first to replace
     self-pair cost-0 entries with a finite intrazonal cost.
     """
     return Decay(name, lambda c: np.power(c, -beta))
@@ -218,7 +218,7 @@ def cumulative_opportunities(
         weights: `{property_name -> TieredODPairs}`, position-aligned with
             `costs` per tier. Must share the costs' key space (node-keyed
             weights for node-keyed costs; geo-keyed for geo-keyed). Build via
-            `od_pairs.dest_values` (node-keyed) or `od_pairs.dest_values_geo`
+            `od_pairs.lookup_dest_column_node` (node-keyed) or `od_pairs.lookup_dest_column_node_geo`
             (geo-keyed). Missing origins / tiers contribute zeros, not errors.
         cell_to_zone: `{cell_tier_key -> zone_tier_key}` map for tier
             stitching. Build from `od_pairs.build_cell_to_zone_node_map`
@@ -234,7 +234,7 @@ def cumulative_opportunities(
         opted in upstream).
 
     Per-cell overhead: for `TieredODGeoPairs` inputs, bake per-cell origin
-    overhead into the cost ODM upfront via `overhead.add_origin_cell_overhead`.
+    overhead into the cost ODM upfront via `add_geo_overheads`.
     """
     prop_names = list(weights.keys())
     origins = list(_require_cell_tier(costs).keys())
@@ -467,15 +467,3 @@ def nearest_k(
         index=pd.Index(origins, name=_origin_index_name(costs)),
         columns=columns,
     )
-
-
-def flatten_index(df: pd.DataFrame) -> pd.DataFrame:
-    """Collapse a 2-level column MultiIndex into single strings joined by `__`.
-
-    Convenience for the accessibility outputs (which carry `(bin, property)`
-    or `(decay, property)` MultiIndex columns) when downstream code prefers
-    flat single-string column names (e.g. for CSV export). Mutates in place
-    and also returns `df`.
-    """
-    df.columns = ["__".join(col).strip() for col in df.columns.values]
-    return df

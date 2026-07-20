@@ -3,10 +3,10 @@ aperta — cross-modal accessibility analysis on transport networks.
 
 The library is organized around a six-phase workflow:
 
-  1. Load and prepare data  — networks (per mode), land use, topography.
+  1. Load and prepare data  — networks (per mode), land use, elevation.
   2. Map data to units      — `cells → zones` aggregation hierarchy
                               (`geo_mapping`, `network_snap.snap_to_network_nodes`,
-                              `network_snap.snap_to_network_tiered`,
+                              `network_snap.insert_projected_nodes`,
                               `network_snap.transport_centroid`).
   3. Build sparse OD pairs  — `od_pairs.get_pairs` returns a `TieredODNodePairs`
                               (three distance tiers: cells_to_cells,
@@ -22,28 +22,31 @@ The library is organized around a six-phase workflow:
                               per-edge / per-node features along realised
                               routes via `PathAggregation` / `NodeAggregation`)
                               + the `overhead` module
-                              (`add_node_overheads` for node-keyed,
-                              `add_geo_overheads` / `add_origin_cell_overhead`
-                              for geo-keyed). `utility.route_utility` +
-                              `add_endpoint_utility` for utility-based costs.
-                              `routing.aggregate_along_paths` is the path-walker
-                              primitive when you have a pre-computed list of
-                              paths rather than a `TieredODPairs`.
-  6. Calculate accessibility — `accessibility.cumulative_opportunities` (cumulative),
+                              (`overhead.add_geo_overheads` for geo-keyed
+                              overhead application; `aggregate_dest_overhead_per_node`
+                              and `aggregate_dest_overhead_per_group` helpers for
+                              zone-tier last-mile aggregation).
+                              `utility.route_utility` +
+                              `utility.add_endpoint_utility` for utility-based
+                              costs. `routing.aggregate_along_paths` is the
+                              path-walker primitive when you have a pre-computed
+                              list of paths rather than a `TieredODPairs`.
+  6. Calculate accessibility — `accessibility.cumulative_opportunities`,
                                `accessibility.gravity`, `accessibility.nearest_k`.
                                Cross-modal: combine per-mode `TieredODGeoPairs`
                                with `od_pairs.aggregate_across_modes` first.
 
 All algorithm modules (`od_pairs`, `routing`, `overhead`, `accessibility`,
 `utility`, `traffic_flows`, `geo_processing`, `geo_mapping`,
-`network_processing`, `visualization`, `osm_helpers`, `calibration`,
-`topography`, `errors`) operate on plain numpy / pandas / networkx inputs — no
-filesystem assumptions, no opinionated project structure.
-See `tests/test_workflow.py` for the ~150-line end-to-end toy-world
-example, `examples/minimal/accessibility.ipynb` for a ~50-line OSM
-quickstart, `examples/walkthrough/accessibility.ipynb` for the full
-guided tour, and `examples/extended/` for a multi-notebook showcase
-with published-paper calibration (Bern + 40 km).
+`network_processing`, `network_snap`, `routing_prep`, `data_processing`,
+`visualization`, `osm_helpers`, `calibration`, `errors`) operate on plain
+numpy / pandas / networkx inputs — no filesystem assumptions, no
+opinionated project structure. See `tests/test_workflow.py` for the
+~150-line end-to-end toy-world example,
+`examples/minimal/accessibility.ipynb` for a ~50-line OSM quickstart,
+`examples/walkthrough/accessibility.ipynb` for the full guided tour, and
+`examples/calibration/` for production-scale calibration demos (edge
+weights + traffic flows, Bern + 40 km).
 
 Key types:
   - `od_pairs.TieredODNodePairs` — three-tier OD dict-of-arrays keyed by network

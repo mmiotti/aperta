@@ -380,7 +380,7 @@ def split_two_way_edge_at_point(
 
 
 def _snap_to_subset(
-    points: gpd.GeoDataFrame,
+    points: gpd.GeoDataFrame | gpd.GeoSeries,
     graph: nx.Graph,
     node_ids: list,
     *,
@@ -405,15 +405,15 @@ def _snap_to_subset(
 
 
 def snap_to_network_nodes(
-    points: gpd.GeoDataFrame,
+    points: gpd.GeoDataFrame | gpd.GeoSeries,
     graph: nx.Graph,
     *,
-    max_radius: float | None = None,
+    max_distance: float | None = None,
     eligible_node_ids: set | list | pd.Index | None = None,
     eligible_node_flag: str | None = None,
     priority_node_ids: set | list | pd.Index | None = None,
     priority_node_flag: str | None = None,
-    priority_node_radius: float | None = None,
+    priority_node_max_distance: float | None = None,
 ) -> tuple[pd.Series, pd.Series]:
     """Snap each row in `points` to its nearest node in `graph`.
 
@@ -421,16 +421,16 @@ def snap_to_network_nodes(
 
     1. **Tier 1 — priority node snap**: if a priority set is provided
        (via `priority_node_ids` or `priority_node_flag`), snap to the
-       nearest priority node within `priority_node_radius`. The priority
+       nearest priority node within `priority_node_max_distance`. The priority
        set is typically the nodes incident to one or more high-class
        edges (e.g., main roads); the helper `nodes_incident_to_edges`
        derives such a set from an edge predicate.
     2. **Tier 2 — eligible node snap (fallback)**: for unmatched points,
-       snap to the nearest eligible node within `max_radius`. Points
-       beyond `max_radius` from every eligible node return NaN.
+       snap to the nearest eligible node within `max_distance`. Points
+       beyond `max_distance` from every eligible node return NaN.
 
     When no priority set is given (default), the function collapses to a
-    single-pass eligible-node snap within `max_radius` — bit-identical to
+    single-pass eligible-node snap within `max_distance` — bit-identical to
     the historical single-tier behavior.
 
     This function does NOT mutate `graph` and does NOT insert nodes.
@@ -443,10 +443,10 @@ def snap_to_network_nodes(
     Point CRS and the graph coordinates must already agree — no reprojection.
 
     Args:
-        points: GeoDataFrame of points to snap. Output is indexed by
-            `points.index`.
+        points: GeoDataFrame or GeoSeries of points to snap. Output is
+            indexed by `points.index`.
         graph: NetworkX (or compatible) graph with `x` / `y` node attributes.
-        max_radius: optional cap on tier-2 (fallback) snap distance. `None`
+        max_distance: optional cap on tier-2 (fallback) snap distance. `None`
             means no cap. Points farther than this from every eligible node
             return NaN.
         eligible_node_ids: optional restriction on the tier-2 (fallback)
@@ -456,12 +456,12 @@ def snap_to_network_nodes(
             to `eligible_node_ids` (e.g., `snap_eligible_<mode>` from
             `prepare_network`).
         priority_node_ids: optional priority set for tier-1 snap. If given,
-            points within `priority_node_radius` of a priority node snap
+            points within `priority_node_max_distance` of a priority node snap
             to that node; unmatched points fall through to tier 2. Mutually
             exclusive with `priority_node_flag`.
         priority_node_flag: per-node bool attribute name as an alternative
             to `priority_node_ids`.
-        priority_node_radius: tier-1 search radius. Required when a priority
+        priority_node_max_distance: tier-1 search radius. Required when a priority
             set is given; ignored otherwise. Typically equal to or larger
             than the spacing used by `insert_projected_nodes` so that virtual
             nodes inserted on priority edges are found.
@@ -500,31 +500,33 @@ def snap_to_network_nodes(
             n for n, data in graph.nodes(data=True) if data.get(priority_node_flag)
         ]
     priority_active = priority_node_ids is not None
-    if priority_active and priority_node_radius is None:
-        raise ValueError("`priority_node_radius` is required when a priority set is given.")
+    if priority_active and priority_node_max_distance is None:
+        raise ValueError("`priority_node_max_distance` is required when a priority set is given.")
     if priority_active:
-        priority_node_list = [
-            n
-            for n in eligible_node_list
-            if n in set(priority_node_ids)  # type: ignore[arg-type]
-        ]
+        # Hoist set construction OUT of the comprehension — leaving it inline
+        # rebuilds the set per iteration, making this O(|eligible| × |priority|).
+        # At country scale that's ~3M × ~50k = ~150 B ops; hours.
+        priority_set = set(priority_node_ids)  # type: ignore[arg-type]
+        priority_node_list = [n for n in eligible_node_list if n in priority_set]
     else:
         priority_node_list = []
 
     # Single-pass case — no priority set, just tier-2.
     if not priority_active:
-        return _snap_to_subset(points, graph, eligible_node_list, max_distance=max_radius)
+        return _snap_to_subset(points, graph, eligible_node_list, max_distance=max_distance)
 
     # Two-pass case — tier 1 priority then tier 2 eligible for the unmatched.
     p_ids, p_dists = _snap_to_subset(
-        points, graph, priority_node_list, max_distance=priority_node_radius
+        points, graph, priority_node_list, max_distance=priority_node_max_distance
     )
     matched_mask = p_ids.notna()
     if matched_mask.all():
         return p_ids, p_dists
 
     unmatched = points.loc[~matched_mask]
-    e_ids, e_dists = _snap_to_subset(unmatched, graph, eligible_node_list, max_distance=max_radius)
+    e_ids, e_dists = _snap_to_subset(
+        unmatched, graph, eligible_node_list, max_distance=max_distance
+    )
 
     # Combine: priority hits win; eligible fills the rest.
     out_ids = p_ids.copy()
@@ -707,18 +709,18 @@ def _find_nearest_edge(
     edge_keys: list,
     edge_geoms: list,
     point: Point,
-    max_radius: float | None,
+    max_distance: float | None,
 ):
     """Query `strtree` for the nearest edge to `point`. Returns
-    `(edge_key, geom, dist)` if the nearest edge is within `max_radius`
-    (or `max_radius is None`), else `None`.
+    `(edge_key, geom, dist)` if the nearest edge is within `max_distance`
+    (or `max_distance is None`), else `None`.
     """
     if strtree is None or not edge_geoms:
         return None
     # shapely 2.x: query_nearest returns array of indices; with max_distance,
     # returns empty if nothing within.
-    if max_radius is not None:
-        idxs = strtree.query_nearest(point, max_distance=max_radius)
+    if max_distance is not None:
+        idxs = strtree.query_nearest(point, max_distance=max_distance)
     else:
         idxs = strtree.query_nearest(point)
     if len(idxs) == 0:
@@ -762,7 +764,7 @@ def insert_projected_nodes(
     points: gpd.GeoDataFrame,
     graph: nx.Graph,
     *,
-    max_radius: float | None,
+    max_distance: float | None,
     node_spacing: float = 50.0,
     eligible_node_ids: set | list | pd.Index | None = None,
     eligible_node_flag: str | None = None,
@@ -775,7 +777,7 @@ def insert_projected_nodes(
     `snap_to_network_nodes` call.
 
     For each point in `points`, finds the nearest filter-eligible edge
-    within `max_radius`. Project the point onto that edge:
+    within `max_distance`. Project the point onto that edge:
 
     - If the projection lands within `node_spacing` of either endpoint
       of the edge, do NOTHING — the endpoint will serve as the snap
@@ -786,7 +788,7 @@ def insert_projected_nodes(
       `primary` road shows up as priority for downstream tools that
       derive priority-node sets from edge tags).
 
-    Points beyond `max_radius` from any filter-eligible edge contribute
+    Points beyond `max_distance` from any filter-eligible edge contribute
     no insertion.
 
     This function MUTATES `graph` in place and returns nothing. The
@@ -801,12 +803,12 @@ def insert_projected_nodes(
         # Cells: densify any non-highway edge near each cell.
         insert_projected_nodes(
             cells_gdf, graph,
-            max_radius=200, node_spacing=75,
+            max_distance=200, node_spacing=75,
         )
         # Zones on main roads only.
         insert_projected_nodes(
             zones_gdf, graph,
-            max_radius=1000, node_spacing=250,
+            max_distance=1000, node_spacing=250,
             edge_filter={'primary', 'secondary', 'tertiary'},
         )
 
@@ -834,7 +836,7 @@ def insert_projected_nodes(
         graph: NetworkX graph with `x`/`y` node attributes; edges must
             carry `geometry` LineStrings (consolidated OSMnx graphs
             satisfy this).
-        max_radius: max distance from a point to its nearest candidate
+        max_distance: max distance from a point to its nearest candidate
             edge. Points farther than this contribute no insertion.
             `None` = unbounded.
         node_spacing: minimum spacing between an insertion and an
@@ -932,6 +934,15 @@ def insert_projected_nodes(
             f"before this. Probable infinite loop in child_lineage."
         )
 
+    # Pre-compute next node id once. The split_* primitives would otherwise
+    # re-scan `graph.nodes` per call to derive `max(int_ids) + 1`, making the
+    # full loop O(M × N) — hours on country-scale graphs. We hoist the scan,
+    # then pass `new_node_id` explicitly each iteration and increment locally.
+    int_node_ids = [n for n in graph.nodes if isinstance(n, (int, np.integer))]
+    if not int_node_ids:
+        raise ValueError("Cannot auto-derive new node ids: graph has no int-typed node ids.")
+    next_node_id = int(max(int_node_ids)) + 1
+
     # Single-pass insertion. By construction (every freshly_split entry has a
     # paired child_lineage entry from the same insertion block), the lineage
     # walk always lands on a non-stale descendant; no point gets deferred.
@@ -945,7 +956,7 @@ def insert_projected_nodes(
         point = Point(pt_geom.x, pt_geom.y)
 
         # Find nearest filter-eligible edge.
-        hit = _find_nearest_edge(elig_strtree, elig_keys, elig_geoms, point, max_radius)
+        hit = _find_nearest_edge(elig_strtree, elig_keys, elig_geoms, point, max_distance)
         if hit is None:
             n_no_match += 1
             continue
@@ -984,6 +995,8 @@ def insert_projected_nodes(
             continue
 
         # Insert a virtual node — two-way if applicable, else single-direction.
+        # `new_node_id=next_node_id` skips the split primitive's internal
+        # max-int scan; we bump our local counter after each successful insert.
         if len(edge_key) == 3:
             u, v, k_fwd = edge_key
             if k_rev is not None and rev_geom is not None:
@@ -994,6 +1007,7 @@ def insert_projected_nodes(
                     point,
                     k_forward=k_fwd,
                     k_reverse=k_rev,
+                    new_node_id=next_node_id,
                     extra_node_attrs={"is_virtual": 1},
                 )
                 new_node = result.new_node_id
@@ -1016,6 +1030,7 @@ def insert_projected_nodes(
                     v,
                     point,
                     k=k_fwd,
+                    new_node_id=next_node_id,
                     extra_node_attrs={"is_virtual": 1},
                 )
                 new_node = result_single.new_node_id
@@ -1031,6 +1046,7 @@ def insert_projected_nodes(
                 u,
                 v,
                 point,
+                new_node_id=next_node_id,
                 extra_node_attrs={"is_virtual": 1},
             )
             new_node = result_single.new_node_id
@@ -1040,6 +1056,7 @@ def insert_projected_nodes(
                 (c2, _edge_geom(c2)),
             ]
 
+        next_node_id += 1
         freshly_split.add(edge_key)
         # Add the synthetic node to the eligible set so subsequent within-
         # call queries treat it as a valid endpoint (matters if a future

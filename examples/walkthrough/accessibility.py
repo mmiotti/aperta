@@ -25,8 +25,9 @@
 # external downloads beyond `pip install` are needed.
 #
 # For a shorter introduction (~40 lines, ~10 s), see
-# [`minimal/accessibility.ipynb`](../minimal/accessibility.ipynb). For a
-# production-scale, multi-mode showcase, see [`extended/`](../extended/).
+# [`minimal/accessibility.ipynb`](../minimal/accessibility.ipynb). For
+# calibration + traffic-flow tuning on a large real network, see
+# [`calibration/`](../calibration/) (requires ground-truth data).
 #
 # The notebook follows aperta's six-phase workflow:
 #
@@ -62,12 +63,12 @@
 # %%
 import warnings
 
+import geopandas as gpd
 import h3
 import matplotlib.pyplot as plt
 import numpy as np
 import osmnx as ox
 import pandas as pd
-import geopandas as gpd
 from shapely.geometry import Polygon
 
 import aperta.accessibility as accessibility
@@ -446,8 +447,7 @@ walk_weight = routing.mask_excluded_edges(
 )
 routing.apply_edge_weights(graph, walk_weight, 'walk_time_s')
 
-times = routing.tiered_path_costs(
-    pairs, graph, weight='walk_time_s',
+times = routing.tiered_path_costs(graph, pairs, weight='walk_time_s',
     cutoff=45 * 60,  # 45 min upper bound; r_zones * (1/walk_speed) gives ≈30 min
 )
 print(times)
@@ -464,10 +464,13 @@ print(times)
 # Three steps:
 #
 # 1. `reindex_by_geo_unit` — fan out node-keyed entries to cell/zone entries.
-# 2. `add_origin_cell_overhead` — bake per-cell first-mile into the cost ODM
-#    (per-cell at `cells_to_cells` + `cells_to_zones`, per-zone-mean at
-#    `zones_to_zones` since the far tier is keyed by zone, not cell).
-# 3. `dest_values_geo` — build per-cell destination weight ODMs directly.
+# 2. `add_geo_overheads` — bake per-cell first-mile into the cost ODM.
+#    Passing `origin_cell=` alone is enough: the helper auto-derives the
+#    zone-tier overhead as the group-mean of the per-cell values, using the
+#    `cell_to_zone` map. Cells and zones share the same first-mile intent —
+#    per-cell at `cells_to_cells` / `cells_to_zones` and per-zone-mean at
+#    `zones_to_zones` (the far tier is keyed by zone, not cell).
+# 3. `lookup_dest_column_geo` — build per-cell destination weight ODMs directly.
 
 # %%
 pairs_geo, times_geo = od_pairs.reindex_by_geo_unit(
@@ -476,10 +479,12 @@ pairs_geo, times_geo = od_pairs.reindex_by_geo_unit(
     zones=zones, zone_node_column='node_id',
     r_cells=R_CELLS, r_medium=R_MEDIUM, r_zones=R_ZONES,
 )
-times_geo = overhead.add_origin_cell_overhead(
-    times_geo, pairs_geo, cells, 'walk_overhead_s',
+times_geo = overhead.add_geo_overheads(
+    times_geo, pairs_geo,
+    origin_cell=cells['walk_overhead_s'],
+    cell_to_zone=cells['zone_id'],
 )
-sm_weights = od_pairs.dest_values_geo(
+sm_weights = od_pairs.lookup_dest_column_geo(
     'supermarkets', pairs_geo, cells, zones=zones,
 )
 # Cell → zone lookup for tier stitching in the accessibility metrics.
@@ -681,7 +686,7 @@ zones['bike_node_id'], _ = network_snap.snap_to_network_nodes(
 #
 # This is a deliberately tiny example of "edge weights richer than
 # pure length / speed". For systematic calibration against observed
-# travel times see the separate `calibrate_edge_weights.ipynb` notebook.
+# travel times see the separate `calibration.ipynb` notebook.
 
 # %%
 BIKE_SPEED_MS = 20 / 3.6           # 20 km/h, typical urban cycling speed
@@ -729,15 +734,17 @@ bike_pairs = od_pairs.get_pairs(
 # `r_medium`, the bike call would auto-infer `r_medium = min(r_cells * 10,
 # r_zones) = r_zones`, collapsing the far tier and crashing the cross-modal
 # call.
-bike_times = routing.tiered_path_costs(bike_pairs, bike_graph, weight='bike_time_s')
+bike_times = routing.tiered_path_costs(bike_graph, bike_pairs, weight='bike_time_s')
 bike_pairs_geo, bike_times_geo = od_pairs.reindex_by_geo_unit(
     bike_pairs, bike_times, cells,
     cell_node_column='bike_node_id',
     zones=zones, zone_node_column='bike_node_id',
     r_cells=R_CELLS, r_medium=R_MEDIUM, r_zones=R_ZONES,
 )
-bike_times_geo = overhead.add_origin_cell_overhead(
-    bike_times_geo, bike_pairs_geo, cells, 'bike_overhead_s',
+bike_times_geo = overhead.add_geo_overheads(
+    bike_times_geo, bike_pairs_geo,
+    origin_cell=cells['bike_overhead_s'],
+    cell_to_zone=cells['zone_id'],
 )
 print(bike_times_geo)
 
@@ -805,8 +812,7 @@ def edge_bike_score(u, v, data) -> float:
 # elsewhere in aperta: a named spec consisting of an attribute extractor
 # and an aggregator. `tiered_path_aggregate` returns both the per-pair
 # costs and the per-pair aggregated features — same single routing pass.
-_costs, path_aggs = routing.tiered_path_aggregate(
-    bike_pairs, bike_graph, weight='bike_time_s',
+_costs, path_aggs = routing.tiered_path_aggregate(bike_graph, bike_pairs, weight='bike_time_s',
     edge_aggregations=[
         routing.PathAggregation('bike_score_avg', edge_bike_score, 'mean'),
     ],
@@ -878,7 +884,7 @@ fastest_pairs, fastest_times = od_pairs.aggregate_across_modes(
      'bike': (bike_pairs_geo, bike_times_geo)},
     aggregator=fastest_mode_cost,
 )
-sm_weights_fastest = od_pairs.dest_values_geo(
+sm_weights_fastest = od_pairs.lookup_dest_column_geo(
     'supermarkets', fastest_pairs, cells, zones=zones,
 )
 acc_nk_fastest = accessibility.nearest_k(
@@ -964,8 +970,7 @@ bike_utility = utility.Utility(
 # internally so the routing pass is shared across the cost and all features.
 
 # %%
-bike_route_u = utility.route_utility(
-    bike_pairs, bike_graph, weight='bike_time_s', utility=bike_utility,
+bike_route_u = utility.route_utility(bike_graph, bike_pairs, weight='bike_time_s', utility=bike_utility,
 )
 
 # %% [markdown]
@@ -981,9 +986,9 @@ bike_full_u = utility.add_endpoint_utility(
 
 # %% [markdown]
 # **Step 3**: lift to geo-keyed form, then bake the per-cell bike origin
-# overhead into the utility ODM via `add_origin_cell_overhead`. Units
-# already match (utils + utils) because we pre-multiply `bike_overhead_s`
-# by `β_cost`, so no per-call overhead-conversion is needed.
+# overhead into the utility ODM via `add_geo_overheads`. Units already match
+# (utils + utils) because we pre-multiply `bike_overhead_s` by `β_cost`, so
+# no per-call overhead-conversion is needed.
 
 # %%
 _, bike_full_u_geo = od_pairs.reindex_by_geo_unit(
@@ -993,8 +998,10 @@ _, bike_full_u_geo = od_pairs.reindex_by_geo_unit(
     r_cells=R_CELLS, r_medium=R_MEDIUM, r_zones=R_ZONES,
 )
 cells['bike_util_overhead'] = bike_utility.cost_coefficient * cells['bike_overhead_s']
-bike_full_u_geo = overhead.add_origin_cell_overhead(
-    bike_full_u_geo, bike_pairs_geo, cells, 'bike_util_overhead',
+bike_full_u_geo = overhead.add_geo_overheads(
+    bike_full_u_geo, bike_pairs_geo,
+    origin_cell=cells['bike_util_overhead'],
+    cell_to_zone=cells['zone_id'],
 )
 
 # %% [markdown]
@@ -1012,8 +1019,7 @@ walking_utility = utility.Utility(
     constant=-3.0,
     cost_coefficient=-1.0 / 60.0,
 )
-route_u = utility.route_utility(
-    pairs, graph, weight='walk_time_s', utility=walking_utility,
+route_u = utility.route_utility(graph, pairs, weight='walk_time_s', utility=walking_utility,
 )
 full_u = utility.add_endpoint_utility(route_u, pairs, walking_utility, cells=cells)
 _, full_u_geo = od_pairs.reindex_by_geo_unit(
@@ -1023,8 +1029,10 @@ _, full_u_geo = od_pairs.reindex_by_geo_unit(
     r_cells=R_CELLS, r_medium=R_MEDIUM, r_zones=R_ZONES,
 )
 cells['util_overhead'] = walking_utility.cost_coefficient * cells['walk_overhead_s']
-full_u_geo = overhead.add_origin_cell_overhead(
-    full_u_geo, pairs_geo, cells, 'util_overhead',
+full_u_geo = overhead.add_geo_overheads(
+    full_u_geo, pairs_geo,
+    origin_cell=cells['util_overhead'],
+    cell_to_zone=cells['zone_id'],
 )
 
 # %% [markdown]
@@ -1054,7 +1062,7 @@ walk_logsum = np.log(gravity_u_walk[('exp_u', 'supermarkets')]).rename('walk_log
 
 # Bike-only logsum. Destination weights aligned to bike_pairs_geo: same cells
 # as the walk weights, but the per-origin reachable sets differ.
-sm_weights_bike = od_pairs.dest_values_geo(
+sm_weights_bike = od_pairs.lookup_dest_column_geo(
     'supermarkets', bike_pairs_geo, cells, zones=zones,
 )
 gravity_u_bike = accessibility.gravity(
@@ -1107,7 +1115,7 @@ combined_u_pairs, combined_u = od_pairs.aggregate_across_modes(
 )
 
 # Destination weights aligned to the UNION dest set across modes.
-sm_weights_combined = od_pairs.dest_values_geo(
+sm_weights_combined = od_pairs.lookup_dest_column_geo(
     'supermarkets', combined_u_pairs, cells, zones=zones,
 )
 gravity_combined = accessibility.gravity(

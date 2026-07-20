@@ -15,10 +15,8 @@ from shapely.geometry import LineString, Point, box
 
 from aperta.network_processing import (
     aggregate_edges_to_nodes,
-    consolidate_intersections,
-    flag_node_intersection_topology,
-    flag_node_osm_classification,
-    lanes_per_direction,
+    smooth_node_attribute,
+    snap_features_to_nodes,
 )
 from aperta.network_snap import (
     insert_projected_nodes,
@@ -29,12 +27,6 @@ from aperta.network_snap import (
     transport_centroid,
 )
 from aperta.routing_prep import compute_snap_eligibility, prepare_network
-
-
-def _flag_all(g):
-    """Test helper: topology + OSM classification in one call."""
-    flag_node_intersection_topology(g)
-    flag_node_osm_classification(g)
 
 
 class SnapToNetworkNodesTestCase(unittest.TestCase):
@@ -102,7 +94,7 @@ class SnapToNetworkNodesTestCase(unittest.TestCase):
         self.assertEqual(list(distances.index), ["first", "second"])
 
     def test_max_radius_caps_assignment(self):
-        """Points farther than `max_radius` from every node get NaN."""
+        """Points farther than `max_distance` from every node get NaN."""
         graph = self._graph()
         points = self._points(
             [
@@ -111,7 +103,7 @@ class SnapToNetworkNodesTestCase(unittest.TestCase):
             ],  # far from every node
             ["near", "far"],
         )
-        ids, distances = snap_to_network_nodes(points, graph, max_radius=5.0)
+        ids, distances = snap_to_network_nodes(points, graph, max_distance=5.0)
         self.assertEqual(ids.loc["near"], "a")
         self.assertTrue(pd.isna(ids.loc["far"]))
         self.assertAlmostEqual(distances.loc["near"], 1.0)
@@ -126,6 +118,23 @@ class SnapToNetworkNodesTestCase(unittest.TestCase):
         )
         ids, _ = snap_to_network_nodes(points, graph)
         self.assertEqual(list(ids), ["a", "a", "a"])
+
+    def test_accepts_geoseries_with_noncontiguous_index(self):
+        """`snap_to_network_nodes` accepts a GeoSeries (not just a GeoDataFrame),
+        including one whose index is non-contiguous (e.g., after a `.loc` filter).
+        Guards against a latent `df[["geometry"]]` label-lookup bug on GeoSeries.
+        """
+        graph = self._graph()
+        # Non-contiguous index — the shape that surfaced the bug in real use.
+        points = gpd.GeoSeries(
+            [Point(1.0, 0.0), Point(0.0, 8.0)],
+            index=pd.Index([3, 17], name="point_id"),
+        )
+        ids, distances = snap_to_network_nodes(points, graph)
+        self.assertEqual(ids.loc[3], "a")
+        self.assertEqual(ids.loc[17], "c")
+        self.assertAlmostEqual(distances.loc[3], 1.0)
+        self.assertAlmostEqual(distances.loc[17], 2.0)
 
     def test_works_with_osmnx_style_multidigraph(self):
         """Accepts MultiDiGraph (the shape OSMnx returns) — only needs node x/y."""
@@ -395,296 +404,6 @@ class TransportCentroidTestCase(unittest.TestCase):
         )
         # Z's centroid is at (25, 25) → nearest eligible node z3 at (25, 25).
         self.assertEqual(ids.loc["Z"], "z3")
-
-
-class FlagNodeIntersectionsTestCase(unittest.TestCase):
-    """`flag_node_intersection_topology` + `flag_node_osm_classification`
-    write per-node attributes describing intersection type (`n_streets`,
-    `is_t_junction`, `is_4way`), their rank-conditional variants (`_major`,
-    `_anchor`), and per-node max / min OSM highway-rank. Obstacle flags
-    (traffic signals etc.) live in `consolidate_intersections`, not here.
-    """
-
-    def _graph(self) -> nx.MultiDiGraph:
-        """Mixed-degree fixture:
-            1: 4-way intersection (n_streets=4) — primary + residential
-            2: passthrough (n_streets=2) — primary (1↔2) + residential (2↔6)
-            3, 4, 5: leaves (n_streets=1) on residential
-            6: leaf (n_streets=1) on residential
-        Highway tags chosen so node 1 sees both primary (rank 5) and
-        residential (rank 2) — tests max/min rank.
-        """
-        g = nx.MultiDiGraph()
-        for n, x, y in [(1, 0, 0), (2, 1, 0), (3, -1, 0), (4, 0, 1), (5, 0, -1), (6, 2, 0)]:
-            g.add_node(n, x=float(x), y=float(y))
-        for u, v, hw in [
-            (1, 2, "primary"),
-            (1, 3, "residential"),
-            (1, 4, "residential"),
-            (1, 5, "residential"),
-            (2, 6, "residential"),
-        ]:
-            g.add_edge(u, v, highway=hw)
-            g.add_edge(v, u, highway=hw)
-        return g
-
-    def test_basic_intersection_flags_mutually_exclusive(self):
-        """is_t_junction = exactly 3 distinct neighbours; is_4way = ≥ 4;
-        never both set on the same node. Leaves and passthroughs get neither."""
-        g = self._graph()
-        _flag_all(g)
-        # Node 1: 4 distinct neighbours → only is_4way.
-        self.assertEqual(g.nodes[1]["n_streets"], 4.0)
-        self.assertEqual(g.nodes[1]["is_t_junction"], 0.0)
-        self.assertEqual(g.nodes[1]["is_4way"], 1.0)
-        # Node 2: passthrough → neither.
-        self.assertEqual(g.nodes[2]["n_streets"], 2.0)
-        self.assertEqual(g.nodes[2]["is_t_junction"], 0.0)
-        self.assertEqual(g.nodes[2]["is_4way"], 0.0)
-        # Leaf node 6: 1 neighbour → neither.
-        self.assertEqual(g.nodes[6]["n_streets"], 1.0)
-        self.assertEqual(g.nodes[6]["is_t_junction"], 0.0)
-        self.assertEqual(g.nodes[6]["is_4way"], 0.0)
-
-    def test_t_junction_fires_at_exactly_three(self):
-        """3-way intersection (T-junction) lights up is_t_junction."""
-        g = nx.MultiDiGraph()
-        for n, (x, y) in enumerate([(0, 0), (1, 0), (-1, 0), (0, 1)]):
-            g.add_node(n, x=float(x), y=float(y))
-        for u, v in [(0, 1), (0, 2), (0, 3)]:
-            g.add_edge(u, v)
-            g.add_edge(v, u)
-        _flag_all(g)
-        self.assertEqual(g.nodes[0]["n_streets"], 3.0)
-        self.assertEqual(g.nodes[0]["is_t_junction"], 1.0)
-        self.assertEqual(g.nodes[0]["is_4way"], 0.0)
-
-    def test_max_min_highway_rank(self):
-        """max/min from OSM_HIGHWAY_RANKS over incident edges."""
-        g = self._graph()
-        _flag_all(g)
-        from aperta.network_processing import OSM_HIGHWAY_RANKS
-
-        # Node 1: edges of types {primary, residential} → max=5, min=2.
-        self.assertEqual(g.nodes[1]["max_highway_rank"], float(OSM_HIGHWAY_RANKS["primary"]))
-        self.assertEqual(g.nodes[1]["min_highway_rank"], float(OSM_HIGHWAY_RANKS["residential"]))
-        # Node 6: only residential edges → max=min=2.
-        self.assertEqual(g.nodes[6]["max_highway_rank"], float(OSM_HIGHWAY_RANKS["residential"]))
-        self.assertEqual(g.nodes[6]["min_highway_rank"], float(OSM_HIGHWAY_RANKS["residential"]))
-
-    def test_undirected_graph_works(self):
-        """Undirected graphs use `graph.neighbors`, not predecessors/successors."""
-        g = nx.MultiGraph()
-        g.add_node(0, x=0.0, y=0.0)
-        for i, (x, y) in enumerate([(1, 0), (-1, 0), (0, 1)], start=1):
-            g.add_node(i, x=float(x), y=float(y))
-            g.add_edge(0, i)
-        _flag_all(g)
-        # 3 distinct neighbours of node 0 → is_t_junction set, is_4way clear.
-        self.assertEqual(g.nodes[0]["n_streets"], 3.0)
-        self.assertEqual(g.nodes[0]["is_t_junction"], 1.0)
-        self.assertEqual(g.nodes[0]["is_4way"], 0.0)
-
-    def test_major_requires_min_rank_ge_3(self):
-        """`_major` variants need every incident edge to be tertiary or better."""
-        # Node A: 3-way T-junction with three primary edges → major qualifies.
-        g_pure_t = nx.MultiDiGraph()
-        for n in ("A", "B", "C", "D"):
-            g_pure_t.add_node(n, x=0.0, y=0.0)
-        for u, v in [("A", "B"), ("A", "C"), ("A", "D")]:
-            g_pure_t.add_edge(u, v, highway="primary")
-            g_pure_t.add_edge(v, u, highway="primary")
-        _flag_all(g_pure_t)
-        self.assertEqual(g_pure_t.nodes["A"]["is_t_junction"], 1.0)
-        self.assertEqual(g_pure_t.nodes["A"]["is_t_junction_major"], 1.0)
-
-        # Node from `_graph` fixture: 4-way with one primary + three
-        # residential → min_rank = 2 (residential) → major fails.
-        g_mixed = self._graph()
-        _flag_all(g_mixed)
-        self.assertEqual(g_mixed.nodes[1]["is_4way"], 1.0)
-        self.assertEqual(g_mixed.nodes[1]["is_4way_major"], 0.0)  # has a residential branch
-
-    def test_anchor_requires_max_rank_ge_3_and_min_rank_le_5(self):
-        """`_anchor` variants need ≥1 tertiary+ edge AND not pure trunk/motorway."""
-        # Mixed residential + primary 4-way: max=5 (primary), min=2 (residential).
-        # 5 >= 3 ✓ and 2 <= 5 ✓ → anchor qualifies.
-        g_mixed = self._graph()
-        _flag_all(g_mixed)
-        self.assertEqual(g_mixed.nodes[1]["is_4way"], 1.0)
-        self.assertEqual(g_mixed.nodes[1]["is_4way_anchor"], 1.0)
-
-        # Pure-residential T-junction: max=2 → fails `max >= 3` → anchor=0.
-        g_pure_res = nx.MultiDiGraph()
-        for n in ("A", "B", "C", "D"):
-            g_pure_res.add_node(n, x=0.0, y=0.0)
-        for u, v in [("A", "B"), ("A", "C"), ("A", "D")]:
-            g_pure_res.add_edge(u, v, highway="residential")
-            g_pure_res.add_edge(v, u, highway="residential")
-        _flag_all(g_pure_res)
-        self.assertEqual(g_pure_res.nodes["A"]["is_t_junction"], 1.0)
-        self.assertEqual(g_pure_res.nodes["A"]["is_t_junction_anchor"], 0.0)
-
-        # Pure-motorway T-junction: max=min=7 → fails `min <= 5` → anchor=0.
-        g_pure_mw = nx.MultiDiGraph()
-        for n in ("A", "B", "C", "D"):
-            g_pure_mw.add_node(n, x=0.0, y=0.0)
-        for u, v in [("A", "B"), ("A", "C"), ("A", "D")]:
-            g_pure_mw.add_edge(u, v, highway="motorway")
-            g_pure_mw.add_edge(v, u, highway="motorway")
-        _flag_all(g_pure_mw)
-        self.assertEqual(g_pure_mw.nodes["A"]["is_t_junction"], 1.0)
-        self.assertEqual(g_pure_mw.nodes["A"]["is_t_junction_anchor"], 0.0)
-
-    def test_major_is_a_subset_of_anchor_when_max_rank_le_5(self):
-        """If every edge is tertiary–primary (rank 3–5), the node is BOTH
-        major (min >= 3) AND anchor (max >= 3, min <= 5)."""
-        g = nx.MultiDiGraph()
-        for n in ("A", "B", "C", "D", "E"):
-            g.add_node(n, x=0.0, y=0.0)
-        for u, v in [("A", "B"), ("A", "C"), ("A", "D"), ("A", "E")]:
-            g.add_edge(u, v, highway="tertiary")
-            g.add_edge(v, u, highway="tertiary")
-        _flag_all(g)
-        self.assertEqual(g.nodes["A"]["is_4way"], 1.0)
-        self.assertEqual(g.nodes["A"]["is_4way_major"], 1.0)
-        self.assertEqual(g.nodes["A"]["is_4way_anchor"], 1.0)
-
-    def test_passthrough_node_gets_no_intersection_flags(self):
-        """Passthrough (n_streets=2) is neither T-junction nor 4-way, regardless of rank."""
-        g = nx.MultiDiGraph()
-        for n in ("A", "B", "C"):
-            g.add_node(n, x=0.0, y=0.0)
-        for u, v in [("A", "B"), ("B", "C")]:
-            g.add_edge(u, v, highway="primary")
-            g.add_edge(v, u, highway="primary")
-        _flag_all(g)
-        self.assertEqual(g.nodes["B"]["n_streets"], 2.0)
-        # All intersection flags off:
-        for flag in (
-            "is_t_junction",
-            "is_4way",
-            "is_t_junction_major",
-            "is_4way_major",
-            "is_t_junction_anchor",
-            "is_4way_anchor",
-        ):
-            self.assertEqual(g.nodes["B"][flag], 0.0, f"{flag} should be 0 for passthrough")
-
-
-class ConsolidateIntersectionsTestCase(unittest.TestCase):
-    """`consolidate_intersections` wraps `osmnx.consolidate_intersections`,
-    plus reattaches obstacle flags (traffic signals, stops, roundabouts)
-    that OSMnx alone would drop when their host nodes are merged away.
-    """
-
-    def _graph_with_signal_and_roundabout(self) -> nx.MultiDiGraph:
-        """4-arm intersection at (1000, 1000) with a traffic_signal node 5 m
-        offset (typical OSM pattern — signals tagged on the approach, not
-        the centre). Separately, a small roundabout (two nodes 11 m apart,
-        connected by a `junction=roundabout` edge) at (2000, 2000).
-        """
-        g = nx.MultiDiGraph(crs="EPSG:2056")
-        g.add_node(1, x=1000.0, y=1000.0)
-        for n, (x, y) in zip([2, 3, 4, 5], [(1100, 1000), (900, 1000), (1000, 1100), (1000, 900)]):
-            g.add_node(n, x=float(x), y=float(y))
-        # Signal sits 5√2 ≈ 7 m east-northeast of the intersection centre.
-        g.add_node(6, x=1005.0, y=1005.0, highway="traffic_signals")
-        for u, v in [(1, 2), (1, 3), (1, 4), (1, 5)]:
-            g.add_edge(u, v)
-            g.add_edge(v, u)
-        # East arm goes through the signal node.
-        g.add_edge(2, 6)
-        g.add_edge(6, 1)
-        g.add_edge(1, 6)
-        g.add_edge(6, 2)
-        # Roundabout: two nodes ~11 m apart with junction=roundabout edges.
-        g.add_node(10, x=2000.0, y=2000.0)
-        g.add_node(11, x=2010.0, y=2005.0)
-        g.add_edge(10, 11, junction="roundabout")
-        g.add_edge(11, 10, junction="roundabout")
-        return g
-
-    def test_signal_reallocated_to_consolidated_node(self):
-        """The off-centre traffic_signal node is dropped during consolidation
-        but its flag re-attaches to the consolidated 4-way intersection."""
-        g = self._graph_with_signal_and_roundabout()
-        consolidated = consolidate_intersections(g, tolerance=20.0, obstacle_buffer=30.0)
-        # Find the consolidated central intersection (degree ≥ 4 near 1000,1000).
-        central = None
-        for nid, d in consolidated.nodes(data=True):
-            if abs(d["x"] - 1000) < 30 and abs(d["y"] - 1000) < 30 and d.get("is_4way") == 1.0:
-                central = nid
-                break
-        self.assertIsNotNone(central, "no consolidated 4-way intersection found")
-        self.assertEqual(consolidated.nodes[central]["is_traffic_signal"], 1.0)
-
-    def test_roundabout_detected_from_edge_tag(self):
-        """A node consolidated from a `junction=roundabout` edge is flagged."""
-        g = self._graph_with_signal_and_roundabout()
-        consolidated = consolidate_intersections(g, tolerance=20.0, obstacle_buffer=30.0)
-        rb_nodes = [
-            nid for nid, d in consolidated.nodes(data=True) if d.get("is_roundabout") == 1.0
-        ]
-        self.assertEqual(len(rb_nodes), 1)
-        self.assertAlmostEqual(consolidated.nodes[rb_nodes[0]]["x"], 2005, delta=10)
-        self.assertAlmostEqual(consolidated.nodes[rb_nodes[0]]["y"], 2002.5, delta=10)
-
-    def test_non_intersection_nodes_have_zero_flags(self):
-        """Arm-tip nodes (degree 1 in the original) carry no obstacle flags."""
-        g = self._graph_with_signal_and_roundabout()
-        consolidated = consolidate_intersections(g, tolerance=20.0, obstacle_buffer=30.0)
-        # Whichever nodes ended up near the arm tips (not within tolerance of
-        # the centre) should have all flags 0.
-        for nid, d in consolidated.nodes(data=True):
-            if abs(d["x"] - 1000) > 50 and abs(d["x"] - 2005) > 30:
-                self.assertEqual(d.get("is_traffic_signal", 0.0), 0.0)
-                self.assertEqual(d.get("is_roundabout", 0.0), 0.0)
-
-    def test_obstacle_buffer_excludes_far_signals(self):
-        """A signal further than `obstacle_buffer` is NOT attached."""
-        g = self._graph_with_signal_and_roundabout()
-        # With buffer=2 m the signal at (1005,1005) is too far from the
-        # consolidated central node at ~(1001,1001).
-        consolidated = consolidate_intersections(g, tolerance=20.0, obstacle_buffer=2.0)
-        any_signal = any(
-            d.get("is_traffic_signal") == 1.0 for _, d in consolidated.nodes(data=True)
-        )
-        self.assertFalse(any_signal)
-
-
-class LanesPerDirectionTestCase(unittest.TestCase):
-    """`lanes_per_direction` corrects OSM's bidirectional `lanes` tag for
-    use in per-direction quantities (directional AADT, per-lane capacity).
-    """
-
-    def test_oneway_returns_lanes_unchanged(self):
-        # Motorway: 3 lanes, oneway → all 3 lanes in this direction.
-        self.assertEqual(lanes_per_direction({"lanes": 3, "oneway": True}), 3.0)
-
-    def test_twoway_halves_lanes(self):
-        # Two-way primary: 4 total lanes → 2 per direction.
-        self.assertEqual(lanes_per_direction({"lanes": 4, "oneway": False}), 2.0)
-
-    def test_twoway_with_one_lane_returns_one(self):
-        # Narrow shared road: 1 lane both ways → can't split.
-        self.assertEqual(lanes_per_direction({"lanes": 1, "oneway": False}), 1.0)
-
-    def test_missing_lanes_defaults_to_one(self):
-        # No lanes tag → OSM implicit default = 1 per direction.
-        self.assertEqual(lanes_per_direction({"oneway": False}), 1.0)
-        self.assertEqual(lanes_per_direction({"oneway": True}), 1.0)
-
-    def test_string_lanes_parsed(self):
-        # OSM often stores lanes as strings.
-        self.assertEqual(lanes_per_direction({"lanes": "4", "oneway": False}), 2.0)
-
-    def test_list_lanes_takes_first(self):
-        # Post-OSMnx merges occasionally leave list-valued tags.
-        self.assertEqual(lanes_per_direction({"lanes": ["4", "4"], "oneway": False}), 2.0)
-
-    def test_unparseable_lanes_defaults_to_one(self):
-        self.assertEqual(lanes_per_direction({"lanes": "unknown"}), 1.0)
 
 
 class PrepareNetworkTestCase(unittest.TestCase):
@@ -958,17 +677,29 @@ class PrepareNetworkTestCase(unittest.TestCase):
 
     # --- warning emission ---
 
-    def test_walk_directed_scc_warns(self):
-        with self.assertWarnsRegex(UserWarning, "unnecessarily restrictive"):
-            prepare_network(self._trap_graph(), "walk", directedness="directed_scc")
-
-    def test_walk_network_type_walk_warns(self):
-        with self.assertWarnsRegex(UserWarning, "Cambridge MA pitfall"):
-            prepare_network(self._trap_graph(), "walk", network_type="walk")
-
-    def test_walk_all_with_empty_excluded_tags_warns(self):
-        with self.assertWarnsRegex(UserWarning, "routed across motorways"):
-            prepare_network(self._trap_graph(), "walk", cost_excluded_tags=set())
+    def test_walk_combinations_emit_no_warning(self):
+        # The walk-specific warnings (directed_scc "unnecessarily
+        # restrictive", network_type='walk' "Cambridge pitfall",
+        # network_type='all' + empty cost_excluded_tags "routed across
+        # motorways") were dropped — each baked in an OSMnx-fetched data
+        # shape that doesn't hold for custom PBF pipelines, and the
+        # directed_scc one directly contradicted the module-level
+        # asymmetric-cost note.
+        for kwargs in [
+            {"directedness": "directed_scc"},
+            {"network_type": "walk"},
+            {"cost_excluded_tags": set()},
+        ]:
+            with warnings.catch_warnings(record=True) as captured:
+                warnings.simplefilter("always")
+                prepare_network(self._trap_graph(), "walk", **kwargs)
+            walk_warns = [w for w in captured if "walk" in str(w.message).lower()]
+            self.assertEqual(
+                walk_warns,
+                [],
+                msg=f"unexpected walk warning for kwargs={kwargs}: "
+                f"{[str(w.message) for w in walk_warns]}",
+            )
 
     def test_car_undirected_warns(self):
         with self.assertWarnsRegex(UserWarning, "treats one-way streets as"):
@@ -1669,7 +1400,7 @@ class InsertProjectedNodesTestCase(unittest.TestCase):
         insert_projected_nodes(
             points,
             g,
-            max_radius=200.0,
+            max_distance=200.0,
             node_spacing=10.0,
         )
         # One new node inserted (and `is_virtual=1`).
@@ -1690,7 +1421,7 @@ class InsertProjectedNodesTestCase(unittest.TestCase):
         insert_projected_nodes(
             points,
             g,
-            max_radius=200.0,
+            max_distance=200.0,
             node_spacing=10.0,
         )
         # No insertion.
@@ -1700,7 +1431,7 @@ class InsertProjectedNodesTestCase(unittest.TestCase):
         self.assertTrue(g.has_edge(2, 1, 0))
 
     def test_no_insertion_beyond_max_radius(self):
-        """Points farther than `max_radius` from every edge contribute no
+        """Points farther than `max_distance` from every edge contribute no
         insertion."""
         g = self._toy_graph()
         n_before = g.number_of_nodes()
@@ -1708,7 +1439,7 @@ class InsertProjectedNodesTestCase(unittest.TestCase):
         insert_projected_nodes(
             points,
             g,
-            max_radius=50.0,
+            max_distance=50.0,
             node_spacing=10.0,
         )
         self.assertEqual(g.number_of_nodes(), n_before)
@@ -1721,7 +1452,7 @@ class InsertProjectedNodesTestCase(unittest.TestCase):
         insert_projected_nodes(
             points,
             g,
-            max_radius=500.0,
+            max_distance=500.0,
             node_spacing=10.0,
             eligible_node_ids={3, 4},
         )
@@ -1739,7 +1470,7 @@ class InsertProjectedNodesTestCase(unittest.TestCase):
         insert_projected_nodes(
             points,
             g,
-            max_radius=200.0,
+            max_distance=200.0,
             node_spacing=10.0,
             cost_excluded_flag="cost_excluded_x",
         )
@@ -1773,7 +1504,7 @@ class InsertProjectedNodesTestCase(unittest.TestCase):
         insert_projected_nodes(
             points,
             g,
-            max_radius=200.0,
+            max_distance=200.0,
             node_spacing=10.0,
         )
         # No insertion — motorway excluded by default.
@@ -1787,7 +1518,7 @@ class InsertProjectedNodesTestCase(unittest.TestCase):
         insert_projected_nodes(
             points,
             g,
-            max_radius=500.0,
+            max_distance=500.0,
             node_spacing=10.0,
             edge_filter={"tertiary"},
         )
@@ -1807,7 +1538,7 @@ class InsertProjectedNodesTestCase(unittest.TestCase):
         insert_projected_nodes(
             points,
             g,
-            max_radius=200.0,
+            max_distance=200.0,
             node_spacing=10.0,
             edge_filter=lambda d: d.get("highway") == "residential",
         )
@@ -1822,7 +1553,7 @@ class InsertProjectedNodesTestCase(unittest.TestCase):
         insert_projected_nodes(
             points,
             g,
-            max_radius=200.0,
+            max_distance=200.0,
             node_spacing=10.0,
         )
         # Both directional parents gone.
@@ -1853,7 +1584,7 @@ class InsertProjectedNodesTestCase(unittest.TestCase):
         insert_projected_nodes(
             points,
             g,
-            max_radius=200.0,
+            max_distance=200.0,
             node_spacing=10.0,
         )
         new = [n for n, d in g.nodes(data=True) if d.get("is_virtual") == 1][0]
@@ -1892,7 +1623,7 @@ class InsertProjectedNodesTestCase(unittest.TestCase):
         insert_projected_nodes(
             points,
             g,
-            max_radius=10.0,
+            max_distance=10.0,
             node_spacing=0.5,
         )
         # Insertion happened — graph mutated.
@@ -1930,7 +1661,7 @@ class InsertProjectedNodesTestCase(unittest.TestCase):
         insert_projected_nodes(
             points,
             g,
-            max_radius=20.0,
+            max_distance=20.0,
             node_spacing=2.0,
         )
         # No insertion (projection within node_spacing of endpoint on both sides).
@@ -1972,7 +1703,7 @@ class InsertProjectedNodesTestCase(unittest.TestCase):
             insert_projected_nodes(
                 points,
                 g,
-                max_radius=200.0,
+                max_distance=200.0,
                 node_spacing=50.0,
                 verbose=True,
             )
@@ -1994,7 +1725,7 @@ class InsertProjectedNodesTestCase(unittest.TestCase):
             insert_projected_nodes(
                 points,
                 g,
-                max_radius=200.0,
+                max_distance=200.0,
                 node_spacing=5.0,
                 verbose=True,
             )
@@ -2012,10 +1743,66 @@ class InsertProjectedNodesTestCase(unittest.TestCase):
         result = insert_projected_nodes(
             points,
             g,
-            max_radius=200.0,
+            max_distance=200.0,
             node_spacing=10.0,
         )
         self.assertIsNone(result)
+
+    def test_inserted_virtual_node_ids_are_consecutive(self):
+        """`insert_projected_nodes` pre-computes the next node id once and
+        increments locally per insertion — the underlying `split_*` primitives
+        are NOT allowed to re-derive `max(int_ids) + 1` per call, since that
+        would make the loop O(M × N) on country-scale graphs.
+
+        Verifying consecutive ids is a structural proxy: with the old
+        per-call scan the ids would still be consecutive, but with the
+        hoisted counter we can be sure no per-iteration O(N) work is sneaking
+        in via the split primitives' auto-derive branch.
+        """
+        # Build a graph with several parallel two-way edges so many points
+        # can each insert into a distinct edge.
+        g = nx.MultiDiGraph()
+        n_edges = 8
+        max_existing_id = 0
+        for i in range(n_edges):
+            u, v = 2 * i + 1, 2 * i + 2
+            y = float(i * 50)
+            g.add_node(u, x=0.0, y=y)
+            g.add_node(v, x=100.0, y=y)
+            g.add_edge(
+                u,
+                v,
+                key=0,
+                highway="residential",
+                length=100.0,
+                geometry=LineString([(0, y), (100, y)]),
+            )
+            g.add_edge(
+                v,
+                u,
+                key=0,
+                highway="residential",
+                length=100.0,
+                geometry=LineString([(100, y), (0, y)]),
+            )
+            max_existing_id = max(max_existing_id, u, v)
+        points = self._points(
+            [(50.0, float(i * 50)) for i in range(n_edges)],
+            [f"p{i}" for i in range(n_edges)],
+        )
+        insert_projected_nodes(
+            points,
+            g,
+            max_distance=10.0,
+            node_spacing=5.0,
+        )
+        virtual_ids = sorted(n for n, d in g.nodes(data=True) if d.get("is_virtual") == 1)
+        self.assertEqual(len(virtual_ids), n_edges)
+        # Must be consecutive starting at max_existing_id + 1.
+        self.assertEqual(
+            virtual_ids,
+            list(range(max_existing_id + 1, max_existing_id + 1 + n_edges)),
+        )
 
 
 class SnapToNetworkNodesPriorityTestCase(unittest.TestCase):
@@ -2053,7 +1840,7 @@ class SnapToNetworkNodesPriorityTestCase(unittest.TestCase):
         )
 
     def test_priority_node_within_radius_wins_over_closer_nonpriority(self):
-        """A priority node within `priority_node_radius` is chosen even if a
+        """A priority node within `priority_node_max_distance` is chosen even if a
         non-priority node is closer."""
         g = self._graph()
         priority = {"p", "q"}
@@ -2063,16 +1850,16 @@ class SnapToNetworkNodesPriorityTestCase(unittest.TestCase):
         ids, dists = snap_to_network_nodes(
             points,
             g,
-            max_radius=100.0,
+            max_distance=100.0,
             priority_node_ids=priority,
-            priority_node_radius=50.0,
+            priority_node_max_distance=50.0,
         )
         self.assertEqual(ids.loc["p1"], "p")
         self.assertAlmostEqual(float(dists.loc["p1"]), 10.0)
 
     def test_falls_back_to_eligible_when_no_priority_in_range(self):
-        """A point beyond `priority_node_radius` from any priority node
-        falls back to the nearest eligible node within `max_radius`."""
+        """A point beyond `priority_node_max_distance` from any priority node
+        falls back to the nearest eligible node within `max_distance`."""
         g = self._graph()
         priority = {"p", "q"}
         # Point at (500, 0): no priority within 50m, closest eligible
@@ -2081,13 +1868,13 @@ class SnapToNetworkNodesPriorityTestCase(unittest.TestCase):
         ids, dists = snap_to_network_nodes(
             points,
             g,
-            max_radius=500.0,
+            max_distance=500.0,
             priority_node_ids=priority,
-            priority_node_radius=50.0,
+            priority_node_max_distance=50.0,
         )
         self.assertEqual(ids.loc["p1"], "q")  # priority node `q` at (110, 0)
         # Wait — priority q is at (110,0), distance from (500,0) is 390.
-        # If max_radius=500, q is within max_radius too. But priority
+        # If max_distance=500, q is within max_distance too. But priority
         # radius is 50, so q (390m away) is outside priority. So tier 1
         # misses; tier 2 picks nearest eligible (which includes q AND s).
         # s is at (102, 0), distance 398. q is at (110, 0), distance 390.
@@ -2104,7 +1891,7 @@ class SnapToNetworkNodesPriorityTestCase(unittest.TestCase):
         ids, dists = snap_to_network_nodes(
             points,
             g,
-            max_radius=100.0,
+            max_distance=100.0,
         )
         # Nearest is `r` at (2, 0).
         self.assertEqual(ids.loc["p1"], "r")
@@ -2119,21 +1906,21 @@ class SnapToNetworkNodesPriorityTestCase(unittest.TestCase):
         ids, _ = snap_to_network_nodes(
             points,
             g,
-            max_radius=100.0,
+            max_distance=100.0,
             priority_node_flag="is_priority",
-            priority_node_radius=50.0,
+            priority_node_max_distance=50.0,
         )
         self.assertEqual(ids.loc["p1"], "p")
 
     def test_priority_radius_required_when_priority_set_given(self):
-        """Passing a priority set without `priority_node_radius` raises."""
+        """Passing a priority set without `priority_node_max_distance` raises."""
         g = self._graph()
         points = self._points([(0.0, 0.0)], ["p1"])
         with self.assertRaises(ValueError):
             snap_to_network_nodes(
                 points,
                 g,
-                max_radius=100.0,
+                max_distance=100.0,
                 priority_node_ids={"p"},
             )
 
@@ -2144,10 +1931,10 @@ class SnapToNetworkNodesPriorityTestCase(unittest.TestCase):
             snap_to_network_nodes(
                 points,
                 g,
-                max_radius=100.0,
+                max_distance=100.0,
                 priority_node_ids={"p"},
                 priority_node_flag="is_priority",
-                priority_node_radius=50.0,
+                priority_node_max_distance=50.0,
             )
 
     def test_nodes_incident_to_edges_derives_priority_set(self):
@@ -2220,7 +2007,7 @@ class SnapToNetworkNodesPriorityTestCase(unittest.TestCase):
         insert_projected_nodes(
             points,
             g,
-            max_radius=200.0,
+            max_distance=200.0,
             node_spacing=25.0,
         )
         # Step 2: build priority node set (primary edge incidence + virtuals).
@@ -2228,15 +2015,15 @@ class SnapToNetworkNodesPriorityTestCase(unittest.TestCase):
         ids, dists = snap_to_network_nodes(
             points,
             g,
-            max_radius=200.0,
+            max_distance=200.0,
             priority_node_ids=priority,
-            priority_node_radius=100.0,
+            priority_node_max_distance=100.0,
         )
         # near_primary matches a primary-side virtual.
         primary_target = ids.loc["near_primary"]
         self.assertIn(primary_target, priority)
         # near_resi: closest priority node is ~45m below (a virtual on the
-        # primary edge). Since priority_node_radius=100 covers that, the
+        # primary edge). Since priority_node_max_distance=100 covers that, the
         # priority node wins.
         self.assertIn(ids.loc["near_resi"], priority)
 
@@ -2396,54 +2183,208 @@ class PrepareNetworkIdempotencyTestCase(unittest.TestCase):
         self.assertIsInstance(prepared.snap_eligible_nodes, frozenset)
 
 
-class GraphmlBoolRoundtripTestCase(unittest.TestCase):
-    """Bool-typed per-mode flags (`is_snap_eligible_<mode>`,
-    `cost_excluded_<mode>`, `is_virtual`) round-trip through .graphml as
-    integers (0 / 1), not the literal strings 'True' / 'False' — thanks to
-    the prefix-scan dtype helper in `load_consolidated_graphml`."""
+class SnapFeaturesToNodesTestCase(unittest.TestCase):
+    """`snap_features_to_nodes` snaps point locations to nearest-within-
+    radius graph nodes, writing `is_<flag>` per node."""
 
-    def _g(self) -> nx.MultiDiGraph:
-        g = nx.MultiDiGraph(crs="EPSG:4326")
-        for n, (x, y) in {0: (0, 0), 1: (1, 0), 2: (2, 0)}.items():
-            g.add_node(n, x=float(x), y=float(y), osmid=n)
-        g.add_edge(0, 1, key=0, highway="residential", length=1.0)
-        g.add_edge(1, 2, key=0, highway="motorway", length=1.0)
+    def _make_grid(self):
+        """3 nodes at (0,0), (100,0), (200,0)."""
+        g = nx.MultiDiGraph()
+        for i, x in enumerate([0.0, 100.0, 200.0]):
+            g.add_node(i, x=x, y=0.0)
         return g
 
-    def test_bool_flags_roundtrip_as_int(self):
-        import tempfile
+    def test_snaps_to_nearest_node(self):
+        g = self._make_grid()
+        # Location at (110, 0) → nearest is node 1 (distance 10).
+        snap_features_to_nodes(g, [(110.0, 0.0)], flag_name="signal", max_distance=50.0)
+        self.assertEqual(g.nodes[0]["is_signal"], 0)
+        self.assertEqual(g.nodes[1]["is_signal"], 1)
+        self.assertEqual(g.nodes[2]["is_signal"], 0)
 
-        import osmnx as ox
+    def test_drops_locations_outside_radius(self):
+        g = self._make_grid()
+        # (110, 0) — within 50m of node 1, kept.
+        # (1000, 0) — far from all, dropped.
+        snap_features_to_nodes(
+            g, [(110.0, 0.0), (1000.0, 0.0)], flag_name="signal", max_distance=50.0
+        )
+        self.assertEqual(g.nodes[1]["is_signal"], 1)
+        # All other nodes should be 0 (not just absent).
+        for n in (0, 2):
+            self.assertEqual(g.nodes[n]["is_signal"], 0)
 
-        from aperta.network_processing import load_consolidated_graphml
+    def test_multiple_locations_snap_to_different_nodes(self):
+        g = self._make_grid()
+        snap_features_to_nodes(
+            g, [(5.0, 0.0), (105.0, 0.0), (205.0, 0.0)], flag_name="stop", max_distance=50.0
+        )
+        for n in (0, 1, 2):
+            self.assertEqual(g.nodes[n]["is_stop"], 1)
 
-        with tempfile.NamedTemporaryFile(suffix=".graphml", delete=False) as tmp:
-            tmp_path = tmp.name
+    def test_empty_locations_zeros_all_nodes(self):
+        g = self._make_grid()
+        snap_features_to_nodes(g, [], flag_name="signal", max_distance=50.0)
+        for n in g.nodes:
+            self.assertEqual(g.nodes[n]["is_signal"], 0)
 
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                prepared = prepare_network(self._g(), "walk")
-            # Tag one node as virtual to exercise the is_virtual prefix.
-            prepared.graph.nodes[1]["is_virtual"] = 1
-            ox.save_graphml(prepared.graph, tmp_path)
+    def test_idempotent_re_run_clears_prior_flags(self):
+        g = self._make_grid()
+        # First call: flag node 1.
+        snap_features_to_nodes(g, [(110.0, 0.0)], flag_name="signal", max_distance=50.0)
+        self.assertEqual(g.nodes[1]["is_signal"], 1)
+        # Second call with no locations: flag should be cleared.
+        snap_features_to_nodes(g, [], flag_name="signal", max_distance=50.0)
+        self.assertEqual(g.nodes[1]["is_signal"], 0)
 
-            loaded = load_consolidated_graphml(tmp_path)
-            # Per-node is_snap_eligible_walk: every node should have a real int.
-            for n in loaded.nodes:
-                val = loaded.nodes[n].get("is_snap_eligible_walk")
-                self.assertIsInstance(val, int, f"node {n} has wrong dtype")
-            # Per-edge cost_excluded_walk: every edge.
-            if loaded.is_multigraph():
-                for _u, _v, _k, d in loaded.edges(keys=True, data=True):
-                    val = d.get("cost_excluded_walk")
-                    self.assertIsInstance(val, int)
-            # is_virtual=1 round-trips as int 1 on node 1.
-            self.assertEqual(loaded.nodes[1].get("is_virtual"), 1)
-        finally:
-            import os
+    def test_empty_graph_is_noop(self):
+        g = nx.MultiDiGraph()
+        snap_features_to_nodes(g, [(0.0, 0.0)], flag_name="signal", max_distance=50.0)
+        # No nodes to flag; should not raise.
+        self.assertEqual(g.number_of_nodes(), 0)
 
-            os.unlink(tmp_path)
+    def test_flag_name_prefix(self):
+        # `flag_name='traffic_signal'` produces `is_traffic_signal`.
+        g = self._make_grid()
+        snap_features_to_nodes(g, [(0.0, 0.0)], flag_name="traffic_signal", max_distance=10.0)
+        self.assertEqual(g.nodes[0]["is_traffic_signal"], 1)
+
+
+class SmoothNodeAttributeTestCase(unittest.TestCase):
+    """`smooth_node_attribute` — topology-weighted Gaussian smoothing."""
+
+    @staticmethod
+    def _path_graph(elevations: dict, length: float = 100.0) -> nx.Graph:
+        """Build a path graph `0 - 1 - 2 - ...` with given elevations
+        and a uniform edge length."""
+        g = nx.path_graph(len(elevations))
+        for u, v in g.edges():
+            g[u][v]["length"] = length
+        nx.set_node_attributes(g, elevations, "elevation")
+        return g
+
+    def test_uniform_field_unchanged(self):
+        """All nodes at the same value → smoothing changes nothing."""
+        g = self._path_graph({0: 50.0, 1: 50.0, 2: 50.0, 3: 50.0, 4: 50.0})
+        smooth_node_attribute(g, "elevation", length_scale=100.0)
+        for n in g.nodes():
+            self.assertAlmostEqual(g.nodes[n]["elevation"], 50.0, places=10)
+
+    def test_self_included_with_weight_one(self):
+        """Centre node has weight 1 (distance 0 → Gaussian = 1)."""
+        # Path 0 - 1 - 2, elevations 100/200/300, edge length = length_scale.
+        # Neighbour weight = exp(-0.5) ≈ 0.6065
+        # Node 0: only neighbour is 1 → (100 + w·200) / (1 + w)
+        # Node 1: neighbours are 0 and 2 → (200 + w·100 + w·300) / (1 + 2w) = 200
+        # Node 2: only neighbour is 1 → (300 + w·200) / (1 + w)
+        g = self._path_graph({0: 100.0, 1: 200.0, 2: 300.0})
+        smooth_node_attribute(g, "elevation", length_scale=100.0)
+        import math
+
+        w = math.exp(-0.5)
+        self.assertAlmostEqual(g.nodes[0]["elevation"], (100 + w * 200) / (1 + w), places=6)
+        self.assertAlmostEqual(g.nodes[1]["elevation"], 200.0, places=6)
+        self.assertAlmostEqual(g.nodes[2]["elevation"], (300 + w * 200) / (1 + w), places=6)
+
+    def test_gaussian_decay(self):
+        """Edge far above length_scale → near-zero neighbour weight."""
+        # Edge length = 5 × length_scale → weight exp(-12.5) ≈ 3.7e-6
+        g = self._path_graph({0: 100.0, 1: 200.0}, length=500.0)
+        smooth_node_attribute(g, "elevation", length_scale=100.0)
+        # Drift < 0.001 → the neighbour contribution is negligible.
+        self.assertAlmostEqual(g.nodes[0]["elevation"], 100.0, places=2)
+        self.assertAlmostEqual(g.nodes[1]["elevation"], 200.0, places=2)
+
+    def test_nan_centre_passes_through(self):
+        """A NaN at the centre node stays NaN — no smoothing applied."""
+        g = self._path_graph({0: 100.0, 1: float("nan"), 2: 300.0})
+        smooth_node_attribute(g, "elevation", length_scale=100.0)
+        self.assertTrue(np.isnan(g.nodes[1]["elevation"]))
+
+    def test_nan_neighbour_skipped(self):
+        """A NaN neighbour drops out of the sum; other neighbours still count."""
+        # Path 0 - 1 - 2 - 3, elevations 100/NaN/300/200.
+        # Node 2's neighbours: 1 (NaN — skipped) + 3 (200).
+        # → smoothed[2] = (300 + w·200) / (1 + w)
+        g = self._path_graph({0: 100.0, 1: float("nan"), 2: 300.0, 3: 200.0})
+        smooth_node_attribute(g, "elevation", length_scale=100.0)
+        import math
+
+        w = math.exp(-0.5)
+        self.assertAlmostEqual(
+            g.nodes[2]["elevation"],
+            (300 + w * 200) / (1 + w),
+            places=6,
+        )
+
+    def test_out_attr_leaves_input_alone(self):
+        """`out_attr=` writes to a different attribute; original untouched."""
+        g = self._path_graph({0: 100.0, 1: 200.0, 2: 300.0})
+        smooth_node_attribute(g, "elevation", length_scale=100.0, out_attr="elevation_smooth")
+        # Original preserved
+        self.assertEqual(g.nodes[0]["elevation"], 100.0)
+        self.assertEqual(g.nodes[1]["elevation"], 200.0)
+        # New attribute present
+        self.assertIn("elevation_smooth", g.nodes[0])
+        self.assertNotEqual(g.nodes[0]["elevation_smooth"], 100.0)
+
+    def test_directed_graph_uses_both_directions(self):
+        """For a DiGraph, smoothing uses both successors AND predecessors
+        (terrain is undirected even if the road graph isn't)."""
+        # DiGraph 0 → 1 → 2. Smoothing of node 1 should pull from BOTH 0 and 2.
+        g = nx.DiGraph()
+        g.add_edge(0, 1, length=100.0)
+        g.add_edge(1, 2, length=100.0)
+        nx.set_node_attributes(g, {0: 100.0, 1: 200.0, 2: 300.0}, "elevation")
+        smooth_node_attribute(g, "elevation", length_scale=100.0)
+        # If only successors were used: node 1 → (200 + w·300) / (1 + w) ≠ 200
+        # With both: (200 + w·100 + w·300) / (1 + 2w) = 200
+        self.assertAlmostEqual(g.nodes[1]["elevation"], 200.0, places=6)
+
+    def test_multigraph_uses_shortest_parallel_edge(self):
+        """For a MultiGraph with parallel edges, the shortest one sets the
+        weight (the Gaussian distance)."""
+        g = nx.MultiGraph()
+        g.add_edge(0, 1, length=500.0)  # far parallel edge
+        g.add_edge(0, 1, length=100.0)  # near parallel edge
+        nx.set_node_attributes(g, {0: 100.0, 1: 200.0}, "elevation")
+        smooth_node_attribute(g, "elevation", length_scale=100.0)
+        # Should use length=100 → weight exp(-0.5) ≈ 0.6065
+        import math
+
+        w = math.exp(-0.5)
+        expected = (100 + w * 200) / (1 + w)
+        self.assertAlmostEqual(g.nodes[0]["elevation"], expected, places=6)
+
+    def test_iterations_compound(self):
+        """`n_iterations=k+1` smooths more than `n_iterations=k`. Use a
+        single peak on a flat background so the max actually moves with
+        smoothing (a step function has sticky boundaries — boundary
+        extrema have no off-peak neighbour to pull them down)."""
+        # 11 nodes at 100 with a single 200-peak at node 5.
+        elevs = {i: 100.0 for i in range(11)}
+        elevs[5] = 200.0
+
+        g1 = self._path_graph(elevs)
+        smooth_node_attribute(g1, "elevation", length_scale=100.0, n_iterations=1)
+        peak_1 = max(g1.nodes[n]["elevation"] for n in g1.nodes())
+
+        g3 = self._path_graph(elevs)
+        smooth_node_attribute(g3, "elevation", length_scale=100.0, n_iterations=3)
+        peak_3 = max(g3.nodes[n]["elevation"] for n in g3.nodes())
+
+        # More iterations → peak gets pulled further toward the
+        # background by repeated convolution with the Gaussian kernel.
+        self.assertLess(peak_3, peak_1)
+        # And the peak hasn't fully decayed yet (the bg-level is 100).
+        self.assertGreater(peak_3, 100.0)
+
+    def test_node_without_attribute_left_untouched(self):
+        """Nodes that don't have the input attribute aren't given one."""
+        g = self._path_graph({0: 100.0, 1: 200.0, 2: 300.0})
+        g.add_node(99)  # no elevation
+        smooth_node_attribute(g, "elevation", length_scale=100.0)
+        self.assertNotIn("elevation", g.nodes[99])
 
 
 if __name__ == "__main__":

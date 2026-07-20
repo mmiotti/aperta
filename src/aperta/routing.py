@@ -1,46 +1,36 @@
 """
-Routing primitives backed by `scipy.sparse.csgraph.dijkstra`. Input graphs
-are `networkx.Graph` (or its multi/directed variants); aperta converts to a
-scipy CSR matrix internally per call. No backend choice — scipy throughout.
+Routing primitives over `networkx.Graph` (and its multi/directed variants).
+Two engines, picked by query shape:
 
-The library exposes two concerns separately:
+  - **one-to-many / many-to-many**: scipy CSR Dijkstra (with optional cutoff).
+    `tiered_path_costs`, `tiered_path_aggregate`. Scipy's per-origin SSSP
+    amortizes across all targets sharing that origin and supports a
+    Dijkstra `limit=` to bound the frontier expansion.
 
-1. **Edge weighting** — `apply_edge_weights` runs a user-supplied callable on each
-   edge of a graph and writes the result to a named edge attribute. Mode-specific
-   behavior (car vs. bike vs. walking, peak vs. off-peak, density-adjusted speeds,
-   intersection penalties, etc.) lives in these callables, not in this module.
-   `combine_edge_weights` sums multiple per-edge components into a single routing
-   weight (e.g. edge travel time + intersection penalty -> total cost).
-   `mask_excluded_edges` wraps a weight callable to return cost = ∞ for edges
-   flagged by `prepare_network` as non-traversable for a given mode (e.g.
-   motorways for walking).
+  - **one-to-one**: networkx bidirectional Dijkstra. Empirically faster
+    than scipy CSR for unique-source per-trip queries (bidirectional
+    pruning halves the explored node count; no per-call C-boundary
+    overhead). `shortest_path_metrics_one_to_one` (with edge-feature
+    aggregation), `shortest_path_costs_one_to_one` (cost-only, lean).
 
-2. **Routing primitives** — covering the common query shapes:
+The module also exposes the edge-weighting layer used by both engines:
+`apply_edge_weights` runs a user-supplied callable on each edge and writes
+the result to a named edge attribute. `mask_excluded_edges` wraps a weight
+callable to return cost = ∞ for edges flagged by
+`routing_prep.prepare_network` as non-traversable for a given mode.
 
-   - `shortest_distances_from`: single source → all reachable nodes (with optional
-     cutoff). Used for accessibility / isochrone calculations.
-   - `shortest_distances_pairwise`: full distance matrix between two node lists.
-   - `shortest_path_metrics_one_to_one`: paired (origin, destination) routing
-     that also aggregates edge features along each path. Used for travel-time
-     model calibration and similar trip-by-trip work.
-   - `tiered_path_costs` / `tiered_path_aggregate`: bulk many-to-many routing
-     across the three-tier OD structure.
+Why no contraction-hierarchy backend (Pandana / OSRM): aperta's routing
+workflow is one-shot Dijkstra on a *live* graph whose edge weights are
+routinely mutated (calibration loop, scenario comparison, time-of-day
+variants). Preprocess-once-reuse-many fights this pattern.
 
-Why scipy-only: aperta's routing workflow is one-shot Dijkstra-from-many-origins
-on a *live* graph whose edge weights are routinely mutated (calibration loop,
-scenario comparison, time-of-day variants). Contraction hierarchies (Pandana,
-OSRM) preprocess once and reuse, which fights this workflow. The historical
-networkx / igraph backends were dropped in favour of scipy CSR + scipy
-`csgraph.dijkstra`, which is competitive in raw speed, zero-preprocessing,
-and has a single code path.
-
-A future `RoutingProfile` class will bundle the duration callable + parameters +
-graph into one object; for now, callers compose the pieces themselves.
+A future `RoutingProfile` class will bundle the duration callable +
+parameters + graph into one object; for now, callers compose the pieces.
 """
 
 import logging
 from collections.abc import Sequence
-from typing import Callable, NamedTuple
+from typing import Callable, NamedTuple, TypeVar
 
 import networkx as nx
 import numpy as np
@@ -54,7 +44,7 @@ from aperta.od_pairs import TieredODNodePairs, TieredODPairs
 # ---------------------------------------------------------------------------
 
 
-def apply_edge_weights(graph: nx.Graph, weight_fn: Callable, weight_name: str, **fn_kwargs) -> None:
+def apply_edge_weights(graph: nx.Graph, weight_fn: Callable, weight: str, **fn_kwargs) -> None:
     """Apply `weight_fn` to each edge of `graph` (mutates `graph` in place).
 
     `weight_fn` receives the edge data dict plus any extra `fn_kwargs`. The
@@ -63,10 +53,10 @@ def apply_edge_weights(graph: nx.Graph, weight_fn: Callable, weight_name: str, *
     """
     if isinstance(graph, (nx.MultiGraph, nx.MultiDiGraph)):
         for _u, _v, _k, data in graph.edges(keys=True, data=True):
-            data[weight_name] = weight_fn(data, **fn_kwargs)
+            data[weight] = weight_fn(data, **fn_kwargs)
     else:
         for _u, _v, data in graph.edges(data=True):
-            data[weight_name] = weight_fn(data, **fn_kwargs)
+            data[weight] = weight_fn(data, **fn_kwargs)
 
 
 def mask_excluded_edges(weight_fn: Callable, cost_excluded_flag: str) -> Callable:
@@ -93,21 +83,6 @@ def mask_excluded_edges(weight_fn: Callable, cost_excluded_flag: str) -> Callabl
         return weight_fn(edge_data, **kwargs)
 
     return masked
-
-
-def combine_edge_weights(graph: nx.Graph, source_names: list[str], target_name: str) -> None:
-    """Sum multiple per-edge attributes into one combined weight (in place).
-
-    Use case (lumos pattern): travel time and intersection penalty are computed
-    separately, stored as `duration_edge_t3` and `duration_node_t3`, then summed
-    into the routing weight `duration_t3`.
-    """
-    if isinstance(graph, (nx.MultiGraph, nx.MultiDiGraph)):
-        for _u, _v, _k, data in graph.edges(keys=True, data=True):
-            data[target_name] = sum(float(data[name]) for name in source_names)
-    else:
-        for _u, _v, data in graph.edges(data=True):
-            data[target_name] = sum(float(data[name]) for name in source_names)
 
 
 # ---------------------------------------------------------------------------
@@ -231,51 +206,6 @@ def _walk_predecessors_to_path(
 # ---------------------------------------------------------------------------
 
 
-def shortest_distances_from(
-    graph: nx.Graph,
-    origin,
-    weight: str,
-    cutoff: float | None = None,
-) -> dict:
-    """Single-source shortest distances from `origin` to all reachable nodes.
-
-    Returns a dict mapping node -> total weight. With `cutoff`, only nodes
-    within that weight threshold are returned. Unreachable nodes are omitted.
-    """
-    import scipy.sparse.csgraph as csg
-
-    csr, nx_to_seq, seq_to_nx = _graph_to_csr(graph, weight)
-    limit = cutoff if cutoff is not None else np.inf
-    dist_row = csg.dijkstra(
-        csr, indices=[nx_to_seq[origin]], limit=limit, return_predecessors=False
-    )[0]
-    return {seq_to_nx[i]: float(d) for i, d in enumerate(dist_row) if np.isfinite(d)}
-
-
-def shortest_distances_pairwise(
-    graph: nx.Graph,
-    origins: list,
-    destinations: list,
-    weight: str,
-    cutoff: float | None = None,
-) -> np.ndarray:
-    """Distance matrix for `origins` x `destinations`.
-
-    Returns ndarray of shape (len(origins), len(destinations)). Unreachable
-    destinations are `np.inf`.
-    """
-    import scipy.sparse.csgraph as csg
-
-    csr, nx_to_seq, _ = _graph_to_csr(graph, weight)
-    limit = cutoff if cutoff is not None else np.inf
-    origin_seqs = [nx_to_seq[o] for o in origins]
-    dest_seqs = np.fromiter(
-        (nx_to_seq[d] for d in destinations), dtype=np.int64, count=len(destinations)
-    )
-    dist = csg.dijkstra(csr, indices=origin_seqs, limit=limit, return_predecessors=False)
-    return dist[:, dest_seqs]
-
-
 def shortest_path_metrics_one_to_one(
     graph: nx.Graph,
     trip_ids: list | pd.Series | np.ndarray,
@@ -284,31 +214,36 @@ def shortest_path_metrics_one_to_one(
     weight: str,
     length_attr: str = "length",
     edge_features: dict[str, str] | None = None,
-    *,
-    cutoff: float | None = None,
 ) -> pd.DataFrame:
-    """Paired (origin, destination) shortest-path routing with edge-feature aggregation.
+    """Paired (origin, destination) routing via `nx.bidirectional_dijkstra`,
+    with edge-feature aggregation along each realised path.
 
     `edge_features` maps an edge attribute name to an aggregation:
-      - 'sum'             : element-wise sum along the path (e.g. count of intersections)
-      - 'length_weighted' : average weighted by edge length (e.g. average gradient)
+      - 'sum'              : element-wise sum along the path
+      - 'length_weighted'  : average weighted by edge length
+      - 'duration_weighted': average weighted by per-edge `weight` (i.e.
+        the routing cost — typically duration)
 
     Returns a DataFrame indexed by trip_id with columns:
       - `distance` (sum of `length_attr` along the path)
       - `cost`     (sum of `weight`     along the path)
       - one column per requested edge feature
 
-    Trips with no path are omitted from the output (so output length <= input length).
+    Trips with no path (`NetworkXNoPath`) or missing endpoints
+    (`NodeNotFound`) are silently dropped from the output (so output
+    length ≤ input length). Self-pairs yield zero for every column.
 
-    `cutoff` (optional): per-origin Dijkstra `limit=` in `weight` units. Set
-    this to a value comfortably above the longest expected trip cost — trips
-    that would route beyond it are silently dropped (treated as unreachable),
-    same as actually-unreachable trips. Big speed-up on large graphs when
-    trip costs are small relative to graph diameter (e.g. urban trips on a
-    country-scale road graph). Default `None` = no cutoff.
+    Why bidirectional Dijkstra: aperta's one-to-one workloads (calibration
+    against ground-truth trips, validation against measured times) tend to
+    have unique origins per trip, so origin-batching can't be exploited.
+    Bidirectional pruning halves the explored node count per query and
+    runs entirely in Python without per-call C-boundary overhead — beats
+    scipy CSR and igraph empirically on country-scale graphs.
 
-    Raises DataError if 'distance' or 'cost' appear in `edge_features` (would
-    collide with the built-in path-total columns).
+    For cost-only callers, use `shortest_path_costs_one_to_one` — same
+    routing engine, no path-walk or feature-aggregation overhead.
+
+    Raises `DataError` if 'distance' or 'cost' appear in `edge_features`.
     """
     if not (len(trip_ids) == len(origins) == len(destinations)):
         raise DataError("trip_ids, origins, and destinations must have equal lengths.")
@@ -317,42 +252,74 @@ def shortest_path_metrics_one_to_one(
     if reserved:
         raise DataError(f"edge_features may not include reserved column names: {sorted(reserved)}")
 
-    import scipy.sparse.csgraph as csg
-
-    csr, nx_to_seq, seq_to_nx = _graph_to_csr(graph, weight)
     is_multi = isinstance(graph, (nx.MultiGraph, nx.MultiDiGraph))
-    limit = cutoff if cutoff is not None else np.inf
-
-    # Group trips by origin so we only call dijkstra once per unique origin
-    # — far cheaper than per-trip when many trips share an origin (typical
-    # of calibration data: per-person trip diaries).
-    by_origin: dict = {}
-    for trip_id, o, d in zip(trip_ids, origins, destinations):
-        by_origin.setdefault(o, []).append((trip_id, d))
-
     rows = {}
-    for origin, trips in by_origin.items():
-        origin_seq = nx_to_seq[origin]
-        dist, pred = csg.dijkstra(csr, indices=[origin_seq], limit=limit, return_predecessors=True)
-        for trip_id, dest in trips:
-            target_seq = nx_to_seq[dest]
-            if not np.isfinite(dist[0, target_seq]):
-                continue
-            npath = _walk_predecessors_to_path(pred[0], origin_seq, target_seq, seq_to_nx)
-            if not npath:
-                continue
-            edge_data = [
-                _pick_min_weight_edge(graph, u, v, weight, is_multi)
-                for u, v in zip(npath[:-1], npath[1:])
-            ]
-            lengths = np.array([ed.get(length_attr, 0.0) for ed in edge_data])
-            costs = np.array([ed[weight] for ed in edge_data])
-            row = {"distance": float(lengths.sum()), "cost": float(costs.sum())}
-            for feature, agg in edge_features.items():
-                values = np.array([ed.get(feature, 0.0) for ed in edge_data])
-                row[feature] = _aggregate(values, lengths, agg, feature)
-            rows[trip_id] = row
+    for trip_id, origin, dest in zip(trip_ids, origins, destinations):
+        try:
+            _, path = nx.bidirectional_dijkstra(graph, origin, dest, weight=weight)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            continue
+        if len(path) < 2:
+            # Self-pair (origin == dest): no edges along the path.
+            rows[trip_id] = {"distance": 0.0, "cost": 0.0, **{f: 0.0 for f in edge_features}}
+            continue
+        edge_data = [
+            _pick_min_weight_edge(graph, u, v, weight, is_multi)
+            for u, v in zip(path[:-1], path[1:])
+        ]
+        lengths = np.array([ed.get(length_attr, 0.0) for ed in edge_data])
+        durations = np.array([ed.get(weight, 0.0) for ed in edge_data])
+        costs = np.array([ed[weight] for ed in edge_data])
+        row = {"distance": float(lengths.sum()), "cost": float(costs.sum())}
+        for feature, agg in edge_features.items():
+            values = np.array([ed.get(feature, 0.0) for ed in edge_data])
+            row[feature] = _aggregate(values, lengths, durations, agg, feature)
+        rows[trip_id] = row
     return pd.DataFrame.from_dict(rows, orient="index")
+
+
+def shortest_path_costs_one_to_one(
+    graph: nx.Graph,
+    trip_ids: list | pd.Series | np.ndarray,
+    origins: list | pd.Series | np.ndarray,
+    destinations: list | pd.Series | np.ndarray,
+    weight: str,
+) -> pd.Series:
+    """Cost-only one-to-one routing — lean variant of `shortest_path_metrics_one_to_one`.
+
+    Skips path reconstruction and per-edge feature aggregation entirely:
+    uses the path-cost value `nx.bidirectional_dijkstra` already returns.
+    ~2-3× faster end-to-end than the full-metrics function for callers
+    that only want the routed cost (e.g. calibration / validation against
+    measured durations).
+
+    Same per-trip drop semantics as the full-metrics function: trips with
+    no path (`NetworkXNoPath`) or endpoints not in the graph
+    (`NodeNotFound`) are silently absent from the output Series.
+    Self-pairs (origin == dest) yield 0.0.
+
+    Args:
+        graph: networkx graph; edges carry `weight`.
+        trip_ids: per-trip identifier, becomes the output Series index.
+        origins, destinations: per-trip node-id arrays. Must be the same
+            length as `trip_ids`.
+        weight: edge attribute name to use as routing cost.
+
+    Returns:
+        `pd.Series[float]` indexed by `trip_id`, named `'cost'`. Output
+        length ≤ input length (unreachable / unknown-endpoint trips
+        dropped).
+    """
+    if not (len(trip_ids) == len(origins) == len(destinations)):
+        raise DataError("trip_ids, origins, and destinations must have equal lengths.")
+    costs: dict = {}
+    for trip_id, origin, dest in zip(trip_ids, origins, destinations):
+        try:
+            cost, _ = nx.bidirectional_dijkstra(graph, origin, dest, weight=weight)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            continue
+        costs[trip_id] = float(cost)
+    return pd.Series(costs, name="cost", dtype=float)
 
 
 def _pick_min_weight_edge(graph: nx.Graph, u, v, weight: str, is_multi: bool) -> dict:
@@ -365,7 +332,13 @@ def _pick_min_weight_edge(graph: nx.Graph, u, v, weight: str, is_multi: bool) ->
     return data
 
 
-def _aggregate(values: np.ndarray, weights: np.ndarray, agg: str, feature: str) -> float:
+def _aggregate(
+    values: np.ndarray,
+    length_weights: np.ndarray,
+    duration_weights: np.ndarray,
+    agg: str,
+    feature: str,
+) -> float:
     """Aggregate per-edge `values` along one realised path.
 
     Supported aggregations: `'sum'` (plain sum) and `'length_weighted'`
@@ -376,9 +349,13 @@ def _aggregate(values: np.ndarray, weights: np.ndarray, agg: str, feature: str) 
     if agg == "sum":
         return float(values.sum())
     if agg == "length_weighted":
-        if weights.sum() == 0:
+        if length_weights.sum() == 0:
             return float("nan")
-        return float(np.average(values, weights=weights))
+        return float(np.average(values, weights=length_weights))
+    if agg == "duration_weighted":
+        if duration_weights.sum() == 0:
+            return float("nan")
+        return float(np.average(values, weights=duration_weights))
     raise DataError(f"Unknown aggregation `{agg}` for feature `{feature}`.")
 
 
@@ -388,8 +365,8 @@ def _aggregate(values: np.ndarray, weights: np.ndarray, agg: str, feature: str) 
 
 
 def tiered_path_costs(
-    pairs: TieredODPairs,
     graph: nx.Graph,
+    pairs: TieredODPairs,
     weight: str,
     *,
     mask: TieredODPairs | None = None,
@@ -399,11 +376,10 @@ def tiered_path_costs(
     """Shortest-path cost (sum of edge `weight` along the path) for every OD pair
     in `pairs`, across all tiers.
 
-    Single-process. For the experimental multi-process variant see
-    `tiered_path_costs_mp`. This is the hot path for almost every aperta
-    application — the closure-based inner loop is on purpose, not a refactor
-    candidate (a module-level worker pattern adds per-origin dict lookups
-    that measurably slow down single-process routing).
+    Single-process. This is the hot path for almost every aperta application —
+    the closure-based inner loop is on purpose, not a refactor candidate (a
+    module-level worker pattern adds per-origin dict lookups that measurably
+    slow down single-process routing).
 
     Every tier is routed across the same `graph`. All node IDs referenced
     anywhere in `pairs` — cell nodes (cells_to_cells keys + values), zone
@@ -411,9 +387,9 @@ def tiered_path_costs(
     therefore be present in `graph`.
 
     Args:
-        pairs: TieredODPairs of destination IDs (typically from `od_pairs.get_pairs`).
         graph: networkx routable graph containing every node referenced in
             `pairs`. Converted internally to a scipy CSR matrix.
+        pairs: TieredODPairs of destination IDs (typically from `od_pairs.get_pairs`).
         weight: edge attribute name used as the per-edge routing cost (e.g.
             `'duration_naive'`, `'duration_traffic_iterative'`).
         mask: optional boolean `TieredODPairs` (build via `od_pairs.make_mask`).
@@ -602,8 +578,8 @@ def _resolve_aggregator(agg: str | Callable) -> Callable:
 
 
 def aggregate_along_paths(
-    paths: list[list],
     graph: nx.Graph,
+    paths: list[list],
     weight: str,
     *,
     edge_aggregations: Sequence[PathAggregation] = (),
@@ -631,11 +607,11 @@ def aggregate_along_paths(
       - `[u, v, ...]`  → multi-node path; cost + aggs walked normally
 
     Args:
-        paths: list of node-id sequences (lists). Node IDs must match
-            `graph` keys.
         graph: networkx graph used for edge / node attribute lookup. For
             MultiGraph / MultiDiGraph the min-`weight` parallel edge is
             used (matches the router's choice).
+        paths: list of node-id sequences (lists). Node IDs must match
+            `graph` keys.
         weight: edge attribute name used as the per-edge cost.
         edge_aggregations: list of `PathAggregation` specs (per-edge).
         node_aggregations: list of `NodeAggregation` specs (per-node).
@@ -839,8 +815,8 @@ def _walk_paths_with_arrays(
 
 
 def tiered_path_aggregate(
-    pairs: TieredODPairs,
     graph: nx.Graph,
+    pairs: TieredODPairs,
     weight: str,
     *,
     edge_aggregations: Sequence[PathAggregation] = (),
@@ -1009,146 +985,13 @@ def tiered_path_aggregate(
     return costs, aggregations_by_name
 
 
-def add_trip_overhead(
-    costs: TieredODPairs,
-    pairs: TieredODPairs,
-    cell_info: pd.DataFrame,
-    *,
-    zone_info: pd.DataFrame | None = None,
-    origin_overhead: Callable | None = None,
-    dest_overhead: Callable | None = None,
-    verify_finite: bool = True,
-) -> TieredODPairs:
-    """Add per-trip origin and/or destination overhead to each OD pair's cost.
-
-    For each (origin_node, dest_node) pair in `costs` (paired position-wise with
-    `pairs`), the returned cost is::
-
-        new_cost = old_cost + origin_overhead(info_o.loc[orig])
-                            + dest_overhead (info_d.loc[dest])
-
-    where the info dataframe depends on the tier and the endpoint side::
-
-        cells_to_cells:    info_o = cell_info,   info_d = cell_info
-        cells_to_zones:    info_o = cell_info,   info_d = zone_info
-        zones_to_zones:    info_o = zone_info,   info_d = zone_info
-
-    Each info DataFrame is one row per network node at that tier, indexed by
-    node ID. It can mix native node-level attributes (e.g. local density,
-    intersection count) with aggregated unit-level attributes (e.g. distance
-    from cell centroid to nearest network node) — the function doesn't care
-    which is which, just looks up by node ID and hands the row(s) to the
-    callback.
-
-    When multiple units share a node (typical for cells), aggregate upstream::
-
-        cell_info = (cells.groupby('node_id_nw').agg({
-                        'dist_to_node': 'mean',
-                        'population': 'sum',
-                    }).join(nodes))   # node-level attrs joined in
-
-    Each callback receives a single `info` argument:
-      - For the **origin** side: a 1-D `pd.Series` (the row for that single
-        origin). The callback returns a scalar.
-      - For the **destination** side: a `pd.DataFrame` (one row per dest,
-        ordered the same as the dest array). The callback returns a 1-D
-        Series / ndarray of the same length. Pandas column access
-        (`info['col']`) yields a scalar in the Series case and a Series in the
-        DataFrame case, so the same callable typically works for both modes
-        without branching.
-
-    `origin_overhead` and `dest_overhead` are independently optional — pass
-    `None` to skip that side.
-
-    Args:
-        pairs: TieredODPairs of destination IDs (typically from `od_pairs.get_pairs`).
-        costs: TieredODPairs of cost arrays to augment; same shape as `pairs`.
-        cell_info: per-cell-node info DataFrame, indexed by the cell-tier node ID.
-        zone_info: per-zone-node info DataFrame, indexed by the zone-tier node ID.
-            Required iff `cells_to_zones` or `zones_to_zones` is present in `costs`.
-        origin_overhead: callable, see above. None to skip the origin contribution.
-        dest_overhead: callable, see above. None to skip the dest contribution.
-        verify_finite: if True, a ValueError is raised when output is not finite (NaN or Inf).
-
-    Returns:
-        New `TieredODPairs` of cost arrays (same shape as `costs`) with the
-        overhead added. `costs` is not mutated. Unreachable / masked-out entries
-        (np.inf in the input) stay infinite (inf + anything = inf).
-
-    Raises:
-        ValueError if overhead result is not finite and verify_finite is True.
-    """
-    if origin_overhead is None and dest_overhead is None:
-        return costs  # nothing to do
-
-    # (tier_attr) -> (origin_info_df, dest_info_df) lookup.
-    tier_infos: dict[str, tuple[pd.DataFrame | None, pd.DataFrame | None]] = {
-        "cells_to_cells": (cell_info, cell_info),
-        "cells_to_zones": (cell_info, zone_info),
-        "zones_to_zones": (zone_info, zone_info),
-    }
-
-    def _process(tier_attr: str) -> dict | None:
-        cost_tier = getattr(costs, tier_attr)
-        if cost_tier is None:
-            return None
-        pair_tier = getattr(pairs, tier_attr)
-        if pair_tier is None:
-            raise DataError(
-                f"`pairs.{tier_attr}` is None but `costs.{tier_attr}` is set — "
-                f"can't look up destination IDs to apply overhead."
-            )
-        info_o, info_d = tier_infos[tier_attr]
-        if origin_overhead is not None and info_o is None:
-            raise ValueError(
-                f"tier `{tier_attr}` has origin overhead requested but the "
-                f"matching info DataFrame is None."
-            )
-        if dest_overhead is not None and info_d is None:
-            raise ValueError(
-                f"tier `{tier_attr}` has dest overhead requested but the "
-                f"matching info DataFrame is None."
-            )
-
-        out: dict = {}
-        for orig, cost_arr in cost_tier.items():
-            new_c = np.asarray(cost_arr).copy()
-            if origin_overhead is not None:
-                # Validated non-None above when origin_overhead is set.
-                assert info_o is not None
-                # Single origin -> Series. Callback returns scalar.
-                oh_o = float(origin_overhead(info_o.loc[orig]))
-                if verify_finite and not np.isfinite(oh_o):
-                    raise ValueError(f"Origin overhead {orig} is not finite.")
-                new_c = new_c + oh_o
-            if dest_overhead is not None:
-                assert info_d is not None
-                dests = pair_tier[orig]
-                if len(dests) > 0:
-                    # Many dests -> DataFrame. Callback returns Series/array.
-                    oh_d = np.asarray(dest_overhead(info_d.loc[dests]), dtype=np.float64)
-                    if verify_finite:
-                        not_finite = (~np.isfinite(oh_d)).sum()
-                        if not_finite > 0:
-                            raise ValueError(
-                                f"Destination overhead for origin {orig} contains "
-                                f"{not_finite:,} non-finite numbers."
-                            )
-                    new_c = new_c + oh_d
-            out[orig] = new_c
-        return out
-
-    return type(costs)(
-        cells_to_cells=_process("cells_to_cells"),
-        cells_to_zones=_process("cells_to_zones"),
-        zones_to_zones=_process("zones_to_zones"),
-    )
+_TOD = TypeVar("_TOD", bound=TieredODPairs)
 
 
 def floor_intrazonal_costs(
-    costs: TieredODPairs,
+    costs: _TOD,
     min_cost: float | dict | pd.Series,
-) -> TieredODPairs:
+) -> _TOD:
     """Floor cell-tier costs at `min_cost` — applied uniformly to every entry.
 
     Routing on a graph returns 0 for the trivial origin-to-origin path. That's
@@ -1173,9 +1016,13 @@ def floor_intrazonal_costs(
     and flooring `nan` would silently invent data; both behaviours would be
     incorrect.
 
-    Only `cells_to_cells` is modified — `cells_to_zones` and `zones_to_zones`
-    are routed between distinct cell-zone / zone-zone pairs and don't have the
-    same zero-self-cost degeneracy. Tiers that are `None` pass through.
+    All three tiers are floored uniformly. Earlier revisions floored only
+    `cells_to_cells` on the argument that the higher tiers can't contain
+    self-pairs — but that's only true when all three tiers are populated.
+    When a scenario uses only `zones_to_zones` (or has a zone→same-zone
+    entry there), the same zero-self-cost degeneracy applies. Flooring
+    uniformly is safer and matches the "physical floor on any trip"
+    interpretation. Tiers that are `None` pass through unchanged.
 
     Args:
         costs: TieredODPairs of cost arrays.
@@ -1186,8 +1033,8 @@ def floor_intrazonal_costs(
             (same semantics as the dict form).
 
     Returns:
-        New `TieredODPairs` with `cell_tier_cost = max(cell_tier_cost,
-        min_cost)` applied per origin to finite entries; non-finite entries
+        New `TieredODPairs` with `cost = max(cost, min_cost)` applied per
+        origin to finite entries in every tier; non-finite entries
         (`inf`, `nan`) pass through unchanged.
     """
     if isinstance(min_cost, pd.Series):
@@ -1200,25 +1047,29 @@ def floor_intrazonal_costs(
         cost_lookup = {}
         scalar_floor = float(min_cost)
 
-    new_cells_to_cells: dict = {}
+    def _floor_tier(tier: dict | None) -> dict | None:
+        if tier is None:
+            return None
+        out: dict = {}
+        for origin, cost_arr in tier.items():
+            # Preserve input dtype (typically FP32).
+            new_arr = np.asarray(cost_arr).copy()
+            floor = scalar_floor if scalar_floor is not None else cost_lookup.get(origin)
+            if floor is None:
+                out[origin] = new_arr
+                continue
+            # Apply max() only to finite entries; inf/nan are left as-is.
+            finite_mask = np.isfinite(new_arr)
+            new_arr[finite_mask] = np.maximum(new_arr[finite_mask], float(floor))
+            out[origin] = new_arr
+        return out
+
     if costs.cells_to_cells is None:
         raise ValueError(
             "`costs.cells_to_cells` is None; cell-tier is required for this transform."
         )
-    for origin, cost_arr in costs.cells_to_cells.items():
-        # Preserve input dtype (typically FP32).
-        new_arr = np.asarray(cost_arr).copy()
-        floor = scalar_floor if scalar_floor is not None else cost_lookup.get(origin)
-        if floor is None:
-            new_cells_to_cells[origin] = new_arr
-            continue
-        # Apply max() only to finite entries; inf/nan are left as-is.
-        finite_mask = np.isfinite(new_arr)
-        new_arr[finite_mask] = np.maximum(new_arr[finite_mask], float(floor))
-        new_cells_to_cells[origin] = new_arr
-
     return type(costs)(
-        cells_to_cells=new_cells_to_cells,
-        cells_to_zones=costs.cells_to_zones,
-        zones_to_zones=costs.zones_to_zones,
+        cells_to_cells=_floor_tier(costs.cells_to_cells),
+        cells_to_zones=_floor_tier(costs.cells_to_zones),
+        zones_to_zones=_floor_tier(costs.zones_to_zones),
     )

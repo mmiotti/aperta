@@ -1,4 +1,4 @@
-"""Plot helpers shared across `examples/extended/` notebooks.
+"""Plot helpers shared across `examples/calibration/` notebooks.
 
 Pure presentation code — graph + data → matplotlib figure. Lives here
 rather than inline in each notebook so the notebook flow stays focused
@@ -23,11 +23,28 @@ import numpy as np
 import pandas as pd
 
 from aperta import visualization as viz
-from aperta.network_processing import OSM_HIGHWAY_RANKS
+
+
+# Inlined to keep the examples self-contained (aperta is OSM-agnostic;
+# OSM rank conventions are owned by aperta-atlas, which we deliberately
+# don't import from in aperta's example notebooks). Mirrored from
+# `aperta_atlas.osm.OSM_HIGHWAY_RANKS` as of v0.3.0a0.
+OSM_HIGHWAY_RANKS: dict[str, int] = {
+    "motorway": 7, "motorway_link": 7,
+    "trunk": 6, "trunk_link": 6,
+    "primary": 5, "primary_link": 5,
+    "secondary": 4, "secondary_link": 4,
+    "tertiary": 3, "tertiary_link": 3,
+    "residential": 2, "road": 2,
+    "living_street": 1, "pedestrian": 1,
+    "unclassified": -1, "service": -1, "busway": -1,
+    "cycleway": -1, "footway": -1, "path": -1, "track": -1,
+    "steps": -1, "crossing": -1, "disused": -1,
+}
 
 
 # Harmonised font sizes for paper-figure output. Imported by every
-# /extended notebook (via `import _figures as figures`) so the rcParams
+# /calibration notebook (via `import _figures as figures`) so the rcParams
 # stick globally for matplotlib.
 TITLE_SIZE  = 12   # axes titles
 LABEL_SIZE  = 12   # axes labels + colour-bar labels (match title size)
@@ -41,9 +58,9 @@ plt.rcParams['xtick.labelsize'] = TICK_SIZE
 plt.rcParams['ytick.labelsize'] = TICK_SIZE
 
 
-# Paper-figure export — all figures from /extended notebooks save here.
-# Caller-relative path: notebooks run from `extended/`, so this resolves
-# to `extended/results/figures_highres/`.
+# Paper-figure export — all figures from /calibration notebooks save here.
+# Caller-relative path: notebooks run from `calibration/`, so this resolves
+# to `calibration/results/figures_highres/`.
 import os as _os
 from pathlib import Path as _Path
 PAPER_FIGURES_DIR = _Path('results/figures_highres')

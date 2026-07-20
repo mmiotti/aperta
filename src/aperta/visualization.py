@@ -443,8 +443,8 @@ def plot_edge_values(
     on large graphs and lets the caller control draw order by sorting
     edges before adding them to the collection. `sort_key=` is the
     z-order knob: for a "high-tier roads on top" effect on an OSM-derived
-    graph, sort ascending by `OSM_HIGHWAY_RANKS` and the motorways land
-    last (= drawn on top of) the residential mesh.
+    graph, sort ascending by `aperta_atlas.osm.OSM_HIGHWAY_RANKS` and the
+    motorways land last (= drawn on top of) the residential mesh.
 
     Uses `d['geometry']` from each edge if present (always true post-
     `network_processing.consolidate_intersections`); falls back to a

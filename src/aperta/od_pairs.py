@@ -172,10 +172,10 @@ class TieredODNodePairs(TieredODPairs):
     masks, distances) aligned to those dest IDs.
 
     Produced by `get_pairs`, `routing.tiered_path_costs`,
-    `routing.tiered_path_aggregate`, `dest_values`, `get_euclidean_dists`,
-    `make_mask`, `overhead.add_node_overheads`, `utility.route_utility`,
-    `utility.add_endpoint_utility`. The default working representation for
-    single-mode pipelines — lightweight, no fan-out.
+    `routing.tiered_path_aggregate`, `lookup_dest_column_node`, `get_euclidean_dists`,
+    `make_mask`, `utility.route_utility`, `utility.add_endpoint_utility`.
+    The default working representation for single-mode pipelines —
+    lightweight, no fan-out.
 
     Accessibility metrics consuming a `TieredODNodePairs` return *node-indexed*
     DataFrames. For per-cell accessibility output, per-cell origin overhead,
@@ -198,7 +198,7 @@ class TieredODGeoPairs(TieredODPairs):
 
       - `od_pairs.aggregate_across_modes` for cross-modal accessibility,
       - accessibility metrics that should return cell/zone-indexed output,
-      - `add_geo_overheads` / `add_origin_cell_overhead` for geo-unit-keyed
+      - `add_geo_overheads` for geo-unit-keyed
         overhead baking.
 
     Heavier than `TieredODNodePairs` (multiple cells sharing a node fan out into
@@ -286,7 +286,7 @@ def _node_to_value_lookup(df: pd.DataFrame, node_column: str, value_column: str)
 def build_cell_to_zone_node_map(
     cells: pd.DataFrame,
     zones: pd.DataFrame,
-    node_column: str,
+    node_column: str = "node_id",
 ) -> dict:
     """Build the `{cell_node -> zone_node}` lookup that tiered helpers use to find
     each origin cell's parent zone (which keys `zones_to_zones`).
@@ -398,6 +398,10 @@ def _get_pairs_cells_only(
     for i in range(len(per_node)):
         if orig_node_set is not None and node_ids[i] not in orig_node_set:
             continue
+        # Every valid origin appears as a key, even if it has no in-radius
+        # destinations (isolated nodes). Empty-array entries are correct:
+        # "I'm an origin; I just have no neighbours within r_cells."
+        cells_to_cells[node_ids[i]]
         positions = _points_within_buffer(xy[i, 0], xy[i, 1], xy, r_cells)
         dests = node_ids[positions]
         if dest_node_set is not None:
@@ -439,7 +443,7 @@ def _mask_to_node_set(
 def get_pairs(
     cells: gpd.GeoDataFrame,
     r_cells: float,
-    node_column: str,
+    node_column: str = "node_id",
     *,
     zones: gpd.GeoDataFrame | None = None,
     r_zones: float | None = None,
@@ -615,6 +619,13 @@ def get_pairs(
         zone_is_dest = None
 
     # --- Emit cells_to_cells (close: d(Z, Z') < r_cells) ---
+    # Every valid origin appears as a key (with possibly empty array). An
+    # isolated cell — one whose parent zone has no other zones within
+    # r_cells — is still an origin; it just has no cell-tier destinations
+    # and contributes via the middle / far tiers instead. Empty-array
+    # entries make downstream consumers (`tiered_path_costs`,
+    # `nested_node_sample`, …) treat the tier uniformly without special-
+    # casing missing keys.
     cells_to_cells: defaultdict = defaultdict(set)
     for i in range(n_zones):
         if i and i % log_every == 0:
@@ -628,6 +639,10 @@ def get_pairs(
             )
         if len(origin_nodes) == 0:
             continue
+        # Touch the defaultdict for every valid origin so isolated cells
+        # (those with no in-`r_cells` destinations) still appear as keys.
+        for orig in origin_nodes:
+            cells_to_cells[orig]
         for j in cell_tier_dests[i]:
             dest_nodes = cells_in_zone.get(zone_ids[j], np.array([]))
             if len(dest_nodes) == 0:
@@ -658,6 +673,11 @@ def get_pairs(
             )
         if len(origin_nodes) == 0:
             continue
+        # Touch the defaultdict for every valid origin (same rationale as
+        # `cells_to_cells`): origins with no middle-tier destinations
+        # still appear as keys with empty arrays.
+        for orig in origin_nodes:
+            cells_to_zones[orig]
         dest_zone_idx = c2z_tier_dests[i]
         if zone_is_dest is not None and len(dest_zone_idx):
             dest_zone_idx = dest_zone_idx[zone_is_dest[dest_zone_idx]]
@@ -684,6 +704,10 @@ def get_pairs(
         origin_zone_node = zone_nodes[i]
         if pd.isna(origin_zone_node):
             continue
+        # Touch the defaultdict for every valid origin-zone (same rationale
+        # as the cell tiers): origin zones with no far-tier destinations
+        # still appear as keys with empty arrays.
+        zones_to_zones[origin_zone_node]
         dest_zone_idx = z2z_tier_dests[i]
         if zone_is_dest is not None and len(dest_zone_idx):
             dest_zone_idx = dest_zone_idx[zone_is_dest[dest_zone_idx]]
@@ -696,13 +720,51 @@ def get_pairs(
         if z2z_dests:
             zones_to_zones[origin_zone_node].update(z2z_dests)
 
+    # --- Rogue-cell post-fix ---
+    # A cell whose `zone_id` is NaN or whose zone is absent from `zones.index`
+    # never appears in `cells_in_zone` (pandas `groupby` drops NaN keys by
+    # default), so it's invisible to the zone-iterating tier loops above —
+    # but it's still a legitimate origin by its node ID. Touch `cells_to_cells`
+    # here to ensure every node in `orig_node_set` (or every cell node, if no
+    # mask) appears as a key with at least an empty array. Without this,
+    # downstream code that pre-samples origins by node ID and looks them up
+    # in `cells_to_cells` would `KeyError` on the rogue cells.
+    if orig_node_set is not None:
+        rogue_set = orig_node_set - set(cells_to_cells.keys())
+    else:
+        all_cell_nodes = set(cells_with_node[node_column].dropna().unique().tolist())
+        rogue_set = all_cell_nodes - set(cells_to_cells.keys())
+    for node in rogue_set:
+        cells_to_cells[node]
+    if rogue_set:
+        logging.warning(
+            f"`get_pairs`: {len(rogue_set):,} origin cells have no parent "
+            f"zone in `zones.index` (NaN `zone_id` or zone not in `zones`); "
+            f"populated with empty `cells_to_cells` entries — they will "
+            f"contribute no flow downstream. Filter such cells upstream if "
+            f"this is unintended."
+        )
+
+    # "Tier is in use" = at least one origin has a non-empty destination
+    # set. Returning None for empty c2z / z2z tiers keeps the existing
+    # contract for cases where `r_medium == r_cells` or `r_zones == r_medium`
+    # (no zone-pairs land in that band, so the tier is structurally
+    # absent — distinct from "in use, but this origin happens to have no
+    # destinations here").
+    def _any_dest(d: defaultdict) -> bool:
+        return any(v for v in d.values())
+
     return TieredODNodePairs(
         cells_to_cells={k: np.asarray(list(v)) for k, v in cells_to_cells.items()},
         cells_to_zones=(
-            {k: np.asarray(list(v)) for k, v in cells_to_zones.items()} if cells_to_zones else None
+            {k: np.asarray(list(v)) for k, v in cells_to_zones.items()}
+            if _any_dest(cells_to_zones)
+            else None
         ),
         zones_to_zones=(
-            {k: np.asarray(list(v)) for k, v in zones_to_zones.items()} if zones_to_zones else None
+            {k: np.asarray(list(v)) for k, v in zones_to_zones.items()}
+            if _any_dest(zones_to_zones)
+            else None
         ),
     )
 
@@ -715,8 +777,8 @@ def get_pairs(
 def node_values(
     column: str,
     df: pd.DataFrame,
-    node_column: str,
     node_list: pd.Series | list | np.ndarray,
+    node_column: str = "node_id",
 ) -> np.ndarray:
     """Single-tier lookup of `column` for every node in `node_list`.
 
@@ -733,11 +795,11 @@ def node_values(
     return np.array([df_lookup[node_id] for node_id in node_list])
 
 
-def dest_values(
+def lookup_dest_column_node(
     column: str,
     pairs: TieredODPairs,
     cells: pd.DataFrame,
-    node_column: str,
+    node_column: str = "node_id",
     zones: pd.DataFrame | None = None,
     *,
     dtype: np.dtype | type = np.float32,
@@ -758,8 +820,14 @@ def dest_values(
         dtype: dtype of returned value arrays (default `np.float32` —
             matches the default for `routing.tiered_path_costs` so that
             downstream accessibility arithmetic stays in FP32 end-to-end).
-            Missing destinations get `np.nan`, so `dtype` must be a float
-            dtype.
+
+    Raises:
+        KeyError: if a destination in `pairs` is absent from the
+            aggregated node lookup. Missing destinations are a
+            structural mismatch between `pairs` and `cells`/`zones` —
+            most often the sign that a cost ODM was passed as `pairs`
+            by mistake (its per-origin arrays hold values, not ids).
+            Filter unreachable destinations upstream before calling.
     """
     if column not in cells.columns:
         raise ValueError(f"`cells` is missing column {column!r}.")
@@ -777,9 +845,7 @@ def dest_values(
         if d is None or lookup is None:
             return None
         return {
-            origin: np.fromiter(
-                (lookup.get(dest, np.nan) for dest in dests), dtype=dtype, count=len(dests)
-            )
+            origin: np.fromiter((lookup[dest] for dest in dests), dtype=dtype, count=len(dests))
             for origin, dests in d.items()
         }
 
@@ -1141,7 +1207,7 @@ def reindex_by_geo_unit(
     return new_pairs, new_odm
 
 
-def dest_values_geo(
+def lookup_dest_column_geo(
     column: str,
     pairs: TieredODGeoPairs,
     cells: pd.DataFrame,
@@ -1151,7 +1217,7 @@ def dest_values_geo(
 ) -> TieredODGeoPairs:
     """Look up `column` for every destination in a geo-keyed `pairs`, per tier.
 
-    The geo-keyed twin of `dest_values`. Because destinations in
+    The geo-keyed twin of `lookup_dest_column_node`. Because destinations in
     `TieredODGeoPairs` are already individual geo-units (no node-level
     aggregation), each tier just looks up the value column on the matching
     DataFrame — no per-node summing. Structurally simpler and more honest
@@ -1169,12 +1235,20 @@ def dest_values_geo(
         dtype: dtype of returned value arrays (default `np.float32` —
             matches the default for `routing.tiered_path_costs` so
             downstream accessibility arithmetic stays in FP32 end-to-end).
-            Missing destinations get `np.nan`, so `dtype` must be a float
-            dtype.
 
     Returns:
         `TieredODGeoPairs` of value arrays, paired position-wise with the
         input destination arrays.
+
+    Raises:
+        KeyError: if a destination in `pairs` is absent from
+            `cells`/`zones`. Destinations in a geo-keyed pair index
+            were built from the same frames, so a miss always signals
+            a structural mismatch — most often the sign that a cost
+            ODM was passed as `pairs` by mistake (its per-origin
+            arrays hold values, not ids). Present-but-NaN values in
+            the column propagate to NaN in the output; only missing
+            keys raise.
     """
     if column not in cells.columns:
         raise ValueError(f"`cells` is missing column {column!r}.")
@@ -1192,9 +1266,7 @@ def dest_values_geo(
         if d is None or lookup is None:
             return None
         return {
-            origin: np.fromiter(
-                (lookup.get(dest, np.nan) for dest in dests), dtype=dtype, count=len(dests)
-            )
+            origin: np.fromiter((lookup[dest] for dest in dests), dtype=dtype, count=len(dests))
             for origin, dests in d.items()
         }
 
@@ -1469,15 +1541,15 @@ def max_cost(costs: TieredODPairs) -> float:
     """Largest finite value across all tiers of `costs`.
 
     Designed as a one-liner upper bound to pass as `cutoff=` to downstream
-    routing helpers (`routing.tiered_path_costs`, `traffic_flows.estimate_edge_flows`,
+    routing helpers (`routing.tiered_path_costs`,
     `network_processing.get_nested_edge_betweenness`, etc.) when the
     routing targets are guaranteed to live inside this `costs` ODM — e.g.
     the canonical traffic-flows workflow::
 
-        costs  = routing.tiered_path_costs(pairs, g, weight)
+        costs  = routing.tiered_path_costs(g, pairs, weight)
         sample = traffic_flows.nested_node_sample(pairs, weights, costs, ...)
-        flows  = traffic_flows.estimate_edge_flows(g, weight, expected_km, sample,
-                                   cutoff=od_pairs.max_cost(costs))
+        bc     = network_processing.get_nested_edge_betweenness(
+                     g, sample, weight, cutoff=od_pairs.max_cost(costs))
 
     Correctness-preserving: every (origin, dest) pair in `costs` is
     reachable within this distance by definition, so a downstream

@@ -22,12 +22,12 @@
 # Every aperta primitive is exercised exactly once, with no commentary.
 # For the guided tour see
 # [`walkthrough/accessibility.ipynb`](../walkthrough/accessibility.ipynb);
-# for a production-scale demo see [`extended/`](../extended/).
+# for production-scale calibration demos see [`calibration/`](../calibration/).
 
 # %%
+import geopandas as gpd
 import matplotlib.pyplot as plt
 import osmnx as ox
-import geopandas as gpd
 
 import aperta.accessibility as accessibility
 import aperta.geo_mapping as geo_mapping
@@ -90,8 +90,8 @@ walk_weight = routing.mask_excluded_edges(
 routing.apply_edge_weights(prepared.graph, walk_weight, 'walk_time_s')
 
 pairs = od_pairs.get_pairs(cells, r_cells=2000.0, node_column='node_id')
-times = routing.tiered_path_costs(pairs, prepared.graph, weight='walk_time_s')
-sm_weights = od_pairs.dest_values('supermarkets', pairs, cells, node_column='node_id')
+times = routing.tiered_path_costs(prepared.graph, pairs, weight='walk_time_s')
+sm_weights = od_pairs.lookup_dest_column_node('supermarkets', pairs, cells, node_column='node_id')
 
 acc = accessibility.cumulative_opportunities(
     times, {'supermarkets': sm_weights}, {},

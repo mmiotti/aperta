@@ -22,7 +22,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 
-from aperta import geo_processing
+from aperta import data_processing
 from aperta.errors import DataError
 
 
@@ -47,11 +47,15 @@ def _sjoin_with_nearest_fallback(
     index_name = right_df.index.name
     dist_col = index_name + "_distance"
     res = gpd.sjoin(left_df[["geometry"]], right_df[["geometry"]], how="left", predicate=predicate)
-    res = geo_processing.remove_duplicate_indices(res)
+    res = data_processing.remove_duplicate_indices(res)
     # sjoin doesn't create a distance column; initialise to NaN so we have
-    # a uniform shape (and so the within-matches get NaN distances).
+    # a uniform shape. Containment matches (`within` / `contains`) then get
+    # distance = 0 (the natural "contained = zero proximity" reading),
+    # nearest-fallback matches get their finite distance from `sjoin_nearest`
+    # below, and truly unmatched rows keep NaN — three distinguishable states.
     res[dist_col] = np.nan
     matched = pd.notnull(res[index_name])
+    res.loc[matched, dist_col] = 0.0
     logging.info(
         f"{matched.sum():,} of {len(left_df):,} {left_label} "
         f"({matched.sum() / len(left_df) * 100:.1f}%) allocated to containing "
@@ -65,7 +69,7 @@ def _sjoin_with_nearest_fallback(
             max_distance=max_distance,
             distance_col=dist_col,
         )
-        res_nearest = geo_processing.remove_duplicate_indices(res_nearest)
+        res_nearest = data_processing.remove_duplicate_indices(res_nearest)
         nearest_matched = pd.notnull(res_nearest[index_name])
         denom = max((~matched).sum(), 1)
         logging.info(
@@ -122,10 +126,12 @@ def map_points_to_polygons(
             - `ids`: the matched polygon ID for each point. NaN where no match
               (e.g. point outside all polygons and `allow_nearest=False`, or
               beyond `max_distance`).
-            - `distances`: distance to the matched polygon (CRS units). NaN
-              for points matched by "within" (inside the polygon — no
-              meaningful distance) and for unmatched points. Only finite for
-              points assigned via nearest-fallback.
+            - `distances`: distance to the matched polygon (CRS units).
+              `0.0` for points matched by "within" (inside the polygon —
+              natural "contained = zero proximity" reading); finite
+              positive values for points assigned via nearest-fallback;
+              NaN only for truly unmatched points (`allow_nearest=False`
+              or beyond `max_distance`).
 
     Points that match multiple polygons (overlapping) take the first match.
     """
@@ -171,9 +177,11 @@ def map_polygons_to_points(
               match (no contained point and either `allow_nearest=False` or
               beyond `max_distance`).
             - `distances`: distance from the polygon to the matched point
-              (CRS units). NaN for polygons matched by "contains" (point
-              inside the polygon — no meaningful distance) and for unmatched
-              polygons. Only finite for polygons assigned via nearest-fallback.
+              (CRS units). `0.0` for polygons matched by "contains" (point
+              inside the polygon — natural "contained = zero proximity"
+              reading); finite positive values for polygons assigned via
+              nearest-fallback; NaN only for truly unmatched polygons
+              (`allow_nearest=False` or beyond `max_distance`).
     """
     return _sjoin_with_nearest_fallback(
         left_df=polygons,
@@ -187,10 +195,11 @@ def map_polygons_to_points(
 
 
 def map_points_to_points(
-    left_points: gpd.GeoDataFrame,
-    right_points: gpd.GeoDataFrame,
+    left_points: gpd.GeoDataFrame | gpd.GeoSeries,
+    right_points: gpd.GeoDataFrame | gpd.GeoSeries,
     *,
     max_distance: float | None = None,
+    verbose: bool = False,
 ) -> tuple[pd.Series, pd.Series]:
     """For each point in `left_points`, find the nearest point in `right_points`.
 
@@ -201,9 +210,9 @@ def map_points_to_points(
     coordinates and wrapping them in a GeoDataFrame.
 
     Args:
-        left_points: GeoDataFrame of query points. Output is indexed by
-            `left_points.index`.
-        right_points: GeoDataFrame of candidate points.
+        left_points: GeoDataFrame or GeoSeries of query points. Output is
+            indexed by `left_points.index`.
+        right_points: GeoDataFrame or GeoSeries of candidate points.
         max_distance: distance cap (CRS units). `None` = no cap. Query points
             with no match within `max_distance` get NaN ID and NaN distance.
 
@@ -213,6 +222,13 @@ def map_points_to_points(
               within `max_distance`.
             - `distances`: distance to the matched point (CRS units). NaN if no match.
     """
+    # Coerce GeoSeries → single-column GeoDataFrame so the `df[["geometry"]]`
+    # calls below work uniformly (on a GeoSeries, `[["geometry"]]` is a
+    # row-label lookup and raises KeyError).
+    if isinstance(left_points, gpd.GeoSeries):
+        left_points = left_points.to_frame(name="geometry")
+    if isinstance(right_points, gpd.GeoSeries):
+        right_points = right_points.to_frame(name="geometry")
     index_name = right_points.index.name
     dist_col = index_name + "_distance"
     res = gpd.sjoin_nearest(
@@ -222,31 +238,32 @@ def map_points_to_points(
         max_distance=max_distance,
         distance_col=dist_col,
     )
-    res = geo_processing.remove_duplicate_indices(res)
+    res = data_processing.remove_duplicate_indices(res)
     f = pd.notnull(res[index_name])
-    logging.info(
-        f"{f.sum():,} of {len(left_points):,} points in `left_points` found a match "
-        f"in `right_points`."
-    )
     count_unique = len(res[index_name].unique())
-    logging.info(
-        f"{count_unique:,} ({count_unique / len(right_points) * 100:.1f}%) of points in "
-        f"`right_points` are present in `left_points`."
-    )
+    if verbose:
+        logging.info(
+            f"{f.sum():,} of {len(left_points):,} points in `left_points` found a match "
+            f"in `right_points`."
+        )
+        logging.info(
+            f"{count_unique:,} ({count_unique / len(right_points) * 100:.1f}%) of points in "
+            f"`right_points` are present in `left_points`."
+        )
     return res[index_name], res[dist_col]
 
 
 def map_points_to_filtered_lines(
     points: gpd.GeoDataFrame,
     lines: gpd.GeoDataFrame,
-    search_radius: float | pd.Series,
     *,
+    max_distance: float | pd.Series,
     eligible_lines: Callable[[pd.Series, gpd.GeoDataFrame], gpd.GeoDataFrame] | None = None,
     accept: Callable[[pd.Series, pd.Series, dict], bool] | None = None,
 ) -> pd.DataFrame:
     """For each point, find the nearest line that passes per-point filters.
 
-    Matching is sequential per point: candidate lines within `search_radius`
+    Matching is sequential per point: candidate lines within `max_distance`
     are optionally pre-filtered, sorted by cartesian distance to the point,
     then walked in increasing-distance order. The first line `accept` returns
     `True` for is the match. If `accept` is `None`, the nearest eligible line
@@ -256,12 +273,12 @@ def map_points_to_filtered_lines(
         points: GeoDataFrame of point geometries.
         lines: GeoDataFrame of LineString / MultiLineString geometries. Must
             be in the same CRS as `points`.
-        search_radius: max distance (CRS units) for candidate lines. Scalar
+        max_distance: max distance (CRS units) for candidate lines. Scalar
             applies to all points; pass a `pd.Series` aligned to `points.index`
             for per-point radii (e.g. a wider radius for highway counters).
         eligible_lines: optional per-point pre-filter
             `(point_row, candidate_lines) -> eligible_lines`. Receives only
-            candidates already within `search_radius` of the point; should
+            candidates already within `max_distance` of the point; should
             return a subset (typically `candidate_lines[mask]`).
         accept: optional per-candidate acceptance test
             `(point_row, line_row, ctx) -> bool`, where `ctx` is a dict with
@@ -277,12 +294,12 @@ def map_points_to_filtered_lines(
           - `distance`: cartesian distance to matched line (or `NaN`)
           - `dist_along`: distance along matched line to nearest point (or `NaN`)
     """
-    if isinstance(search_radius, (int, float)):
-        radii = pd.Series(float(search_radius), index=points.index)
+    if isinstance(max_distance, (int, float)):
+        radii = pd.Series(float(max_distance), index=points.index)
     else:
-        radii = search_radius.astype(float)
+        radii = max_distance.astype(float)
         if not radii.index.equals(points.index):
-            raise DataError("`search_radius` Series must share index with `points`.")
+            raise DataError("`max_distance` Series must share index with `points`.")
     if points.crs != lines.crs:
         raise DataError(f"`points` CRS {points.crs} does not match `lines` CRS {lines.crs}.")
 

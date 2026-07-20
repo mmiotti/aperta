@@ -1,8 +1,9 @@
-"""Tests for `aperta.calibration.calibrate_edge_weights`.
+"""Tests for `aperta.calibration` — `calibrate_edge_weights`,
+`apply_edge_durations`, `snap_counters_to_edges`, `evaluate_against_counters`.
 
-Synthetic-graph recovery tests — build a graph + a feature with a known
-per-feature coefficient, generate ground truth from the known model, fit,
-verify the fitted coefficient matches.
+Synthetic-graph recovery tests for calibrate_edge_weights: build a graph
+with a known per-feature coefficient, generate ground truth from the
+known model, fit, verify the fitted coefficient matches.
 
 Run with:
     python -m unittest tests.test_calibration
@@ -17,10 +18,24 @@ import pandas as pd
 from shapely.geometry import LineString, Point
 
 from aperta.calibration import (
+    apply_edge_durations,
     calibrate_edge_weights,
     evaluate_against_counters,
     snap_counters_to_edges,
 )
+
+_KMH_TO_MS = 1.0 / 3.6
+
+
+def _add_baseline_duration(g: nx.MultiGraph, attr: str = "__baseline_duration") -> None:
+    """Pre-compute per-edge baseline duration (sec) from length + speed_kph.
+
+    `apply_edge_durations` expects a duration attr, not a speed attr — the
+    production caller (e.g. atlas's 04) pre-computes this and passes the
+    attr name. Tests do the same.
+    """
+    for *_, d in g.edges(keys=True, data=True):
+        d[attr] = float(d["length"]) / (float(d["speed_kph"]) * _KMH_TO_MS)
 
 
 def _chain_graph(
@@ -122,21 +137,19 @@ class CalibrateEdgeWeightsTestCase(unittest.TestCase):
             multiplier_features={"slow_zone": 0.0},
             additive_route_features={},
             additive_endpoint_features={},
-            constant=True,
+            constant=0.0,
             n_iterations=1,
-            snap_max_distance=10.0,
-            min_trip_distance=0.0,
-            max_trip_distance=10_000.0,
+            max_distance=10.0,
             max_dist_to_line_ratio=10.0,
         )
         # α (baseline coefficient) should be near 1.0.
         alpha = result.coefficients.loc["baseline_time", "coef"]
         self.assertAlmostEqual(alpha, 1.0, places=1)
         # Recovered multiplier coefficient ≈ 5.0.
-        recovered = result.coefficients.loc["slow_zone__mult", "coef"]
+        recovered = result.coefficients.loc["slow_zone", "coef"]
         self.assertAlmostEqual(recovered, 5.0, delta=0.5)
-        # R² should be very high (data was generated FROM the model).
-        self.assertGreater(result.r_squared, 0.99)
+        # Regression R² should be very high (data was generated FROM the model).
+        self.assertGreater(result.metrics_regression.loc["all", "r2"], 0.99)
 
     def test_returns_expected_result_fields(self):
         g = _chain_graph(n=10)
@@ -146,20 +159,24 @@ class CalibrateEdgeWeightsTestCase(unittest.TestCase):
             gt,
             multiplier_features={"slow_zone": 0.0},
             n_iterations=1,
-            snap_max_distance=10.0,
-            min_trip_distance=0.0,
-            max_trip_distance=10_000.0,
+            max_distance=10.0,
             max_dist_to_line_ratio=10.0,
         )
-        # Required output shape.
+        # Coefficients frame has the expected rows.
         self.assertIn("baseline_time", result.coefficients.index)
-        self.assertIn("slow_zone__mult", result.coefficients.index)
-        self.assertEqual(len(result.predicted_times), result.n_used)
-        self.assertEqual(len(result.observed_times), result.n_used)
-        self.assertIn(result.edge_duration_attr, next(iter(g.edges(data=True)))[2])
-        self.assertGreater(result.r_squared, 0.0)
-        self.assertGreater(result.rmse, 0.0)
-        self.assertEqual(len(result.iter_log), 1)
+        self.assertIn("slow_zone", result.coefficients.index)
+        # `n_used` matches the number of fitted trips.
+        self.assertGreater(result.n_used, 0)
+        # Three per-distance-band metrics frames are populated.
+        for frame_name in ("metrics_baseline", "metrics_calibrated", "metrics_regression"):
+            frame = getattr(result, frame_name)
+            self.assertIsInstance(frame, pd.DataFrame)
+            self.assertIn("all", frame.index)
+            for col in ("r2", "rmse", "bias"):
+                self.assertIn(col, frame.columns)
+        # The calibrated edge-duration attr is written on the graph
+        # (default name `duration_calibrated`).
+        self.assertIn("duration_calibrated", next(iter(g.edges(data=True)))[2])
 
     def test_missing_ground_truth_column_raises(self):
         g = _chain_graph(n=5)
@@ -198,11 +215,9 @@ class CalibrateEdgeWeightsTestCase(unittest.TestCase):
         result = calibrate_edge_weights(
             g,
             gt,
-            constant=False,
+            constant=None,
             n_iterations=1,
-            snap_max_distance=10.0,
-            min_trip_distance=0.0,
-            max_trip_distance=10_000.0,
+            max_distance=10.0,
             max_dist_to_line_ratio=10.0,
         )
         # α should be very close to 1.0.
@@ -211,11 +226,8 @@ class CalibrateEdgeWeightsTestCase(unittest.TestCase):
     def test_eligible_node_ids_restricts_trip_snap(self):
         """`eligible_node_ids` propagates to the internal snap, so trips
         whose endpoints are nearest to ineligible nodes get re-snapped
-        to the next-nearest eligible node (or dropped if snap_max_distance
-        is exceeded). Demonstrated by excluding one chain endpoint:
-        trips whose dest_x lies between the excluded node and its
-        neighbor must end up snapped to the neighbor.
-        """
+        to the next-nearest eligible node (or dropped if max_distance
+        is exceeded)."""
         g = _chain_graph(n=20)
         # Exclude node 10. Trips with dest at x=1000 (right on node 10) would
         # normally snap to node 10; with the eligibility filter they must
@@ -227,22 +239,13 @@ class CalibrateEdgeWeightsTestCase(unittest.TestCase):
             gt,
             multiplier_features={"slow_zone": 0.0},
             n_iterations=1,
-            snap_max_distance=200.0,  # generous so re-snap succeeds
-            min_trip_distance=0.0,
-            max_trip_distance=10_000.0,
+            max_distance=200.0,  # generous so re-snap succeeds
             max_dist_to_line_ratio=10.0,
             eligible_node_ids=eligible,
         )
         # Calibration must still succeed (no trips dropped because the
-        # adjacent eligible nodes are within snap_max_distance).
+        # adjacent eligible nodes are within max_distance).
         self.assertGreater(result.n_used, 100)
-        # Implementation cross-check: with the excluded node missing from the
-        # snap pool, no leg should be reported as snapped to node 10.
-        # (Internal `nx_node_orig` / `nx_node_dest` get filtered into
-        # `predicted_times` whose length equals n_used, so we can't probe
-        # them directly via the public result. The structural assertion
-        # above — calibration ran successfully under the filter — is the
-        # public-API-level guarantee.)
 
     def test_eligible_node_flag_restricts_trip_snap(self):
         """Same as the eligible_node_ids test, but using the per-node flag
@@ -257,13 +260,194 @@ class CalibrateEdgeWeightsTestCase(unittest.TestCase):
             gt,
             multiplier_features={"slow_zone": 0.0},
             n_iterations=1,
-            snap_max_distance=200.0,
-            min_trip_distance=0.0,
-            max_trip_distance=10_000.0,
+            max_distance=200.0,
             max_dist_to_line_ratio=10.0,
             eligible_node_flag="is_snap_eligible",
         )
         self.assertGreater(result.n_used, 100)
+
+    def test_r_squared_regression_geq_calibrated(self):
+        """Regression R² ≥ Calibrated R² always (mod small numerical noise).
+
+        Regression R² is the OLS optimum on the iteration-N routing's
+        paths. Calibrated R² is the same prediction formula evaluated
+        on the routing the FINAL coefs produce. When the coef update
+        shifts any path choice, Calibrated R² ≤ Regression R². When
+        no paths shift, they're equal.
+        """
+        g = _chain_graph(n=20)
+        gt = _ground_truth_from_model(g, n_trips=400, slow_zone_coef=5.0, noise_std=2.0, seed=0)
+        result = calibrate_edge_weights(
+            g,
+            gt,
+            multiplier_features={"slow_zone": 0.0},
+            additive_route_features={},
+            additive_endpoint_features={},
+            constant=0.0,
+            n_iterations=1,
+            max_distance=10.0,
+            max_dist_to_line_ratio=10.0,
+        )
+        r2_regression = result.metrics_regression.loc["all", "r2"]
+        r2_calibrated = result.metrics_calibrated.loc["all", "r2"]
+        # Allow small numerical wiggle for the strict-equality case; the
+        # core invariant is `regression - calibrated ≥ -eps`.
+        self.assertGreaterEqual(
+            r2_regression + 1e-9,
+            r2_calibrated,
+            f"regression R²={r2_regression:.4f} should be "
+            f">= calibrated R²={r2_calibrated:.4f} (OLS is "
+            f"the optimal fit on the iter-N paths; re-routing with "
+            f"updated coefs can only equal-or-worsen the fit).",
+        )
+
+    def test_r_squared_baseline_invariant_under_prior_coefs(self):
+        """`metrics_baseline.loc['all', 'r2']` must NOT depend on the
+        user's prior multiplier / additive coefficient choices. It's the
+        "no calibration" R² — only the baseline routing (weight =
+        `length / speed_kph`) feeds into it, never the priors.
+
+        Without this invariance, the diagnostic is misleading: changing
+        a prior shifts the chosen Dijkstra paths, shifts the baseline-
+        time sum, and shifts baseline R² — even though the user's intent
+        is "what R² do I get from pure speed_kph?".
+        """
+        g = _chain_graph(n=20)
+        gt = _ground_truth_from_model(g, n_trips=400, slow_zone_coef=5.0, noise_std=2.0, seed=0)
+        common_kwargs = dict(
+            baseline_speed_attr="speed_kph",
+            constant=0.0,
+            n_iterations=1,
+            max_distance=10.0,
+            max_dist_to_line_ratio=10.0,
+        )
+
+        result_zero = calibrate_edge_weights(
+            g,
+            gt,
+            multiplier_features={"slow_zone": 0.0},
+            additive_route_features={},
+            additive_endpoint_features={},
+            **common_kwargs,
+        )
+        result_far_off = calibrate_edge_weights(
+            g,
+            gt,
+            # Very different (and bad) priors — should not move baseline R²
+            multiplier_features={"slow_zone": 50.0},
+            additive_route_features={},
+            additive_endpoint_features={},
+            **common_kwargs,
+        )
+
+        # Overall baseline R² invariant under prior changes.
+        self.assertAlmostEqual(
+            result_zero.metrics_baseline.loc["all", "r2"],
+            result_far_off.metrics_baseline.loc["all", "r2"],
+            places=10,
+            msg="baseline R² changed when only the prior multiplier "
+            "coefficient was changed — the baseline pass is leaking "
+            "the priors via Dijkstra path choice.",
+        )
+        # And per-distance-band baseline R²s.
+        for band in result_zero.metrics_baseline.index:
+            a = result_zero.metrics_baseline.loc[band, "r2"]
+            b = result_far_off.metrics_baseline.loc[band, "r2"]
+            if pd.isna(a) and pd.isna(b):
+                continue
+            self.assertAlmostEqual(a, b, places=10, msg=f"band={band}")
+
+
+class ApplyEdgeDurationsTestCase(unittest.TestCase):
+    """`apply_edge_durations` writes the per-edge calibration formula.
+
+    The function reads the baseline duration from a pre-computed per-edge
+    attribute (default name `'speed_kph'` — overridden here to a true
+    duration attr we pre-compute in `setUp`, matching what production
+    callers like atlas's 04 do).
+    """
+
+    def setUp(self) -> None:
+        # 3-edge chain with varied lengths + speeds + features.
+        self.g = nx.MultiDiGraph()
+        edges = [
+            # (u, v, length_m, speed_kph, slope_climb, is_signal)
+            (0, 1, 100.0, 50.0, 0.05, 0),
+            (1, 2, 500.0, 30.0, 0.0, 1),
+            (2, 3, 200.0, 20.0, 0.10, 0),
+        ]
+        for u, v, length, speed_kph, slope_climb, sig in edges:
+            self.g.add_edge(
+                u,
+                v,
+                length=length,
+                speed_kph=speed_kph,
+                slope_climb=slope_climb,
+                is_traffic_signal=sig,
+            )
+        # Pre-compute baseline durations (seconds) — the attr `apply_edge_durations`
+        # will read via `baseline_duration_attr`.
+        _add_baseline_duration(self.g)
+
+    def test_prior_alpha_one_no_features_passes_baseline_through(self):
+        """`alpha=1.0` and no features ⇒ `out_attr` value matches the
+        pre-computed baseline duration."""
+        apply_edge_durations(self.g, out_attr="d", baseline_duration_attr="__baseline_duration")
+        for *_, data in self.g.edges(keys=True, data=True):
+            expected = data["length"] / (data["speed_kph"] / 3.6)
+            self.assertAlmostEqual(float(data["d"]), expected, places=6)
+
+    def test_features_compose_as_documented(self):
+        """`d = α · base + base · Σ mult · feat + Σ add · feat`."""
+        apply_edge_durations(
+            self.g,
+            multiplier_features={"slope_climb": 8.0},
+            additive_route_features={"is_traffic_signal": 5.0},
+            alpha=1.2,
+            out_attr="d",
+            baseline_duration_attr="__baseline_duration",
+            max_speed_kph=1000.0,  # disable upper clamp for predictability
+        )
+        for *_, data in self.g.edges(keys=True, data=True):
+            base = data["length"] / (data["speed_kph"] / 3.6)
+            expected = (
+                1.2 * base + base * 8.0 * data["slope_climb"] + 5.0 * data["is_traffic_signal"]
+            )
+            self.assertAlmostEqual(float(data["d"]), expected, places=6)
+
+    def test_min_speed_kph_clamps_long_durations(self):
+        """`min_speed_kph` caps each edge's duration at `length / (min_speed/3.6)` —
+        prevents pathological large feature contributions from producing
+        absurdly-slow edges."""
+        # alpha=10 → 10 × baseline; without the cap, e.g. a 100m@50km/h edge
+        # would jump from 7.2s to 72s (= 5 km/h). Cap at 30 km/h.
+        apply_edge_durations(
+            self.g,
+            alpha=10.0,
+            out_attr="d",
+            baseline_duration_attr="__baseline_duration",
+            min_speed_kph=30.0,
+        )
+        for *_, data in self.g.edges(keys=True, data=True):
+            max_dur_allowed = data["length"] / (30.0 / 3.6)
+            self.assertLessEqual(float(data["d"]), max_dur_allowed + 1e-9)
+
+    def test_max_speed_kph_clamps_short_durations(self):
+        """`max_speed_kph` floors each edge's duration at `length / (max_speed/3.6)` —
+        prevents negative / impossibly-small durations from pathological
+        coefficient combinations."""
+        # alpha=-1 → -baseline; without the cap, durations go negative.
+        # Floor at 120 km/h.
+        apply_edge_durations(
+            self.g,
+            alpha=-1.0,
+            out_attr="d",
+            baseline_duration_attr="__baseline_duration",
+            max_speed_kph=120.0,
+        )
+        for *_, data in self.g.edges(keys=True, data=True):
+            min_dur_allowed = data["length"] / (120.0 / 3.6)
+            self.assertGreaterEqual(float(data["d"]), min_dur_allowed - 1e-9)
 
 
 class SnapCountersToEdgesTestCase(unittest.TestCase):
@@ -291,7 +475,7 @@ class SnapCountersToEdgesTestCase(unittest.TestCase):
             geometry=[Point(50.0, 1.0), Point(50.0, -1.0)],
             crs="EPSG:2056",
         )
-        result = snap_counters_to_edges(counters, g, search_radius=10.0, bearing_tol_deg=20.0)
+        result = snap_counters_to_edges(counters, g, max_distance=10.0, bearing_tol_deg=20.0)
         self.assertEqual((result.loc[0, "u"], result.loc[0, "v"]), (1, 2))
         self.assertEqual((result.loc[1, "u"], result.loc[1, "v"]), (2, 1))
 
@@ -304,7 +488,7 @@ class SnapCountersToEdgesTestCase(unittest.TestCase):
             geometry=[Point(50.0, 1.0)],
             crs="EPSG:2056",
         )
-        result = snap_counters_to_edges(counters, g, search_radius=10.0, bearing_tol_deg=20.0)
+        result = snap_counters_to_edges(counters, g, max_distance=10.0, bearing_tol_deg=20.0)
         self.assertTrue(pd.isna(result.loc[0, "u"]))
 
     def test_eligible_edges_filter(self):
@@ -324,7 +508,7 @@ class SnapCountersToEdgesTestCase(unittest.TestCase):
             return cands[cands["highway"] == "motorway"]
 
         result = snap_counters_to_edges(
-            counters, g, search_radius=10.0, eligible_edges=only_motorway
+            counters, g, max_distance=10.0, eligible_edges=only_motorway
         )
         self.assertEqual((result.loc[0, "u"], result.loc[0, "v"]), (1, 2))
 
