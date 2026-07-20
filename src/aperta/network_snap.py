@@ -798,7 +798,7 @@ def insert_projected_nodes(
 
     **Composability.** The function can be called repeatedly on the same
     graph with different `edge_filter` values, accumulating virtuals
-    suited to different needs:
+    suited to different needs::
 
         # Cells: densify any non-highway edge near each cell.
         insert_projected_nodes(
@@ -851,13 +851,13 @@ def insert_projected_nodes(
             (e.g., `snap_eligible_<mode>` from `prepare_network`).
         cost_excluded_flag: name of a per-edge bool attribute marking
             cost-excluded edges; if set, those edges are skipped.
-        edge_filter: which edges may receive a virtual node.
-            - `None` (default): exclude motorway / trunk classes (see
-              `DEFAULT_EXCLUDED_HIGHWAY_TAGS`).
-            - `Iterable[str]`: allowlist of OSM `highway` tag strings
-              (e.g., `{'primary', 'secondary', 'tertiary'}` to only
-              densify main roads).
-            - `Callable[[dict], bool]`: arbitrary predicate on edge data.
+        edge_filter: which edges may receive a virtual node. `None`
+            (default) excludes motorway / trunk classes (see
+            `DEFAULT_EXCLUDED_HIGHWAY_TAGS`); an `Iterable[str]` is
+            an allowlist of OSM `highway` tag strings (e.g.
+            `{'primary', 'secondary', 'tertiary'}` to only densify
+            main roads); a `Callable[[dict], bool]` is an arbitrary
+            predicate on edge data.
         verbose: if True, print one summary line with insertion / skip /
             no-match counts. Useful on large networks for sanity-checking
             that the filter and radius parameters are tuned reasonably.
