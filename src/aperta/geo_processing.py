@@ -32,6 +32,8 @@ import numpy as np
 import pandas as pd
 import shapely
 
+from aperta import NOTE
+
 
 def _line_segments(line) -> np.ndarray | None:
     """Stack of `(dx, dy, length)` rows for every segment, across all parts.
@@ -590,9 +592,10 @@ def simplify_geometry(
     new_geometry = geometry.simplify(precision)
     new_size = len(new_geometry.xy[0])
     if new_size > maximum_size:
-        logging.warning(
+        logging.log(
+            NOTE,
             f"Could not reduce geometry to target size with precision "
-            f"{precision:.5f}: {maximum_size} ({new_size:,})"
+            f"{precision:.5f}: {maximum_size} ({new_size:,})",
         )
     return new_geometry, new_size, new_size / old_size
 

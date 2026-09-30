@@ -319,11 +319,13 @@ def calibrate_edge_weights(
     max_speed_kph: float = 120.0,
     constant: float | None = None,
     n_iterations: int = 3,
+    r2_tolerance: float = 0.0001,
     max_distance: float = 300.0,
     max_dist_to_line_ratio: float = 4.0,
     edge_duration_attr: str = "duration_calibrated",
     eligible_node_ids=None,
     eligible_node_flag: str | None = None,
+    weight_col: str | None = None,
 ) -> CalibrationResult:
     """Iteratively calibrate per-edge durations against observed trip times.
 
@@ -359,6 +361,12 @@ def calibrate_edge_weights(
         max_speed_kph: maximum edge speed (including node effects) in km/h.
         constant: include an intercept in the OLS fit.
         n_iterations: number of route-fit cycles. 2-3 usually converges.
+        r2_tolerance: minimum R² improvement (calibration a-priori gross,
+            "all" band) required to accept an iteration's coefficient
+            update and continue to the next iteration. Default 1e-4 —
+            fits typically stop before `n_iterations` because sub-1e-4
+            improvements aren't practically meaningful. Lower this to
+            keep iterating past marginal gains; raise it to stop earlier.
         max_distance: drop trips where origin or destination is farther
             than this from any network node (metres).
         max_dist_to_line_ratio: if `dist_measured` is present, drop trips
@@ -375,6 +383,12 @@ def calibrate_edge_weights(
             per-node bool attribute on `graph` marking eligible snap targets
             (e.g., `prepared.snap_eligible_flag`). Ignored if
             `eligible_node_ids` is also given.
+        weight_col: optional column name on `ground_truth` carrying
+            per-trip sample weights (e.g. `'weight_person'` for surveys
+            with stratified sampling like MZMV/MTMC). When set, the OLS
+            fit is replaced by weighted least squares. Trips with NaN
+            or non-positive weight are dropped from the fit. Pass `None`
+            (default) for unweighted OLS.
 
     Returns:
         `CalibrationResult` — see its docstring.
@@ -389,7 +403,6 @@ def calibrate_edge_weights(
     multiplier_features = dict(multiplier_features or {})
     additive_route_features = dict(additive_route_features or {})
     additive_endpoint_features = dict(additive_endpoint_features or {})
-    r2_tolerance = 0.0001
 
     # 1: Data preparation
     required = {"orig_x", "orig_y", "dest_x", "dest_y", "time_measured"}
@@ -489,11 +502,27 @@ def calibrate_edge_weights(
             constant is not None,
         )
 
-        # 4.3: Run OLS
+        # 4.3: Run OLS (or WLS when sample weights are supplied — surveys
+        # with stratified sampling like MZMV carry per-respondent weights
+        # in `weight_col`; MOBIS-style GPS panels set weights to 1 so
+        # WLS reduces to OLS)
         y = trips.loc[routed.index, "time_measured"]
         valid = X.notna().all(axis=1) & y.notna()
         X_f, y_f = X[valid], y[valid]
-        fit_result = sm.OLS(y_f, X_f).fit()
+        if weight_col is not None:
+            w = trips.loc[routed.index, weight_col].loc[valid].astype(float)
+            valid_w = w.notna() & (w > 0)
+            w_final = w[valid_w]
+            logging.info(
+                f"    WLS on {weight_col!r}: n={len(w_final):,}  "
+                f"weights min/mean/max = "
+                f"{w_final.min():.3g} / {w_final.mean():.3g} / {w_final.max():.3g}  "
+                f"CV = {w_final.std() / w_final.mean():.3f}"
+            )
+            fit_result = sm.WLS(y_f[valid_w], X_f[valid_w], weights=w_final).fit()
+        else:
+            logging.info("    OLS (no weight_col)")
+            fit_result = sm.OLS(y_f, X_f).fit()
 
         # 4.4: Gather error metrics
         dist_line = ground_truth.loc[valid.index, "dist_line"]
@@ -529,14 +558,35 @@ def calibrate_edge_weights(
             for name in cur_end:
                 # Average origin and destination impact
                 cur_end[name] = (float(c[f"{name}_orig"]) + float(c[f"{name}_dest"])) / 2
+            baseline_avg = float(routed[baseline_duration_attr].mean())
             for name, r in final_coefs.iterrows():
+                # `effect_avg` = average per-trip time contribution of this
+                # term, computed differently by term kind so multiplier
+                # features (which enter as coef·baseline_time·feature) are
+                # reported as their actual seconds-per-trip impact rather
+                # than the tiny raw-feature product. Term kinds:
+                #   - baseline_time: enters as α·base    → coef·avg(base)
+                #   - const:         enters as intercept → coef (added
+                #                    unconditionally to every trip)
+                #   - multiplier:    enters as coef·base·feat → scales
+                #                    baseline; effect ≈ coef·feat_avg·base_avg
+                #   - additive route/endpoint: enters as coef·feat → coef·feat_avg
                 if name == "baseline_time":
-                    avg = routed[baseline_duration_attr].mean()
+                    avg = baseline_avg
+                    effect_avg = r["coef"] * avg
                 elif name == "const":
                     avg = const
+                    effect_avg = r["coef"]
                 else:
-                    avg = routed[name].mean()
-                logging.info(f"    {name:.<20s}: {r['coef']:7.3f} (p={r['p']:.3g}, avg={avg:.3g})")
+                    avg = float(routed[name].mean())
+                    if name in cur_mult:
+                        effect_avg = r["coef"] * avg * baseline_avg
+                    else:
+                        effect_avg = r["coef"] * avg
+                logging.info(
+                    f"    {name:.<20s}: {r['coef']:7.3f} (p={r['p']:.3g}, "
+                    f"feat_avg={avg:.3g}, effect_avg={effect_avg:+.1f}s)"
+                )
         else:
             logging.info(f".  Calibration completed after {iteration} iterations")
             for band in m_calib.index:

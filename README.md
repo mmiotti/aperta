@@ -5,7 +5,7 @@
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A Python toolkit for **cross-modal accessibility analysis on transport networks** — routing, distance/time computation, utility-based travel costs, and gravity- and logsum-based accessibility metrics on `networkx` graphs (routed via `scipy.sparse.csgraph`).
+A Python toolkit for **cross-modal accessibility analysis on transport networks** calibrated with ground-truth data: network preparation, routing, distance/time computation, utility-based travel costs, and different accessibility metrics (including logsums) on `networkx` graphs (routed via `scipy.sparse.csgraph`).
 
 ![Three families of aperta capabilities, illustrated on the Bern region: network preparation (estimated traffic volumes and calibrated edge speeds), path feature collection (bike-comfort scores along realized routes and aggregated per origin cell), and accessibility analysis (time-based access to hiking opportunities and cross-modal utility-based access to groceries).](docs/assets/hero.jpg)
 

@@ -63,6 +63,7 @@ Key types:
                                 + origin + destination feature coefficients).
 """
 
+import logging
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 
@@ -71,4 +72,23 @@ try:
 except PackageNotFoundError:  # running from a source tree without install
     __version__ = "0.0.0+unknown"
 
-__all__ = ["__version__"]
+
+# Custom NOTE log level (25 — between INFO=20 and WARNING=30). For
+# observations that are worth surfacing but often benign — where the
+# emphasis of `⚠ WARNING` would be too strong. Standalone `aperta`
+# users see it as plain "NOTE"; the `aperta_atlas` scaffolding
+# overrides the level name at basicConfig time to render it in bold
+# yellow with a `⚠ NOTE` prefix (see `aperta_atlas.context.init_context`).
+NOTE: int = 25
+logging.addLevelName(NOTE, "NOTE")
+
+
+def _logging_note(msg, *args, **kwargs) -> None:
+    logging.log(NOTE, msg, *args, **kwargs)
+
+
+if not hasattr(logging, "note"):
+    logging.note = _logging_note  # type: ignore[attr-defined]
+
+
+__all__ = ["__version__", "NOTE"]
