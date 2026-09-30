@@ -44,10 +44,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Matches `requires-python = ">=3.11"` and the classifiers in
+        # Matches `requires-python = ">=3.12"` and the classifiers in
         # pyproject.toml. Drop or extend versions here when the floor
         # moves.
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.12", "3.13"]
 
     steps:
       - uses: actions/checkout@v4
