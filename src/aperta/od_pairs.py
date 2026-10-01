@@ -610,7 +610,7 @@ def get_pairs(
 
     # Pre-compute per-zone-index "is this zone an eligible destination?" mask
     # (used by middle + far tiers).
-    zone_nodes_arr = np.array(zone_nodes, dtype=object)
+    zone_nodes_arr = np.fromiter(zone_nodes, dtype=object, count=len(zone_nodes))
     if dest_zone_node_set is not None:
         zone_is_dest = np.array(
             [zone_nodes[i] in dest_zone_node_set for i in range(n_zones)], dtype=bool

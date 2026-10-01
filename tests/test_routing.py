@@ -766,5 +766,33 @@ class ShortestPathCostsOneToOneTestCase(unittest.TestCase):
             self.assertEqual(lean[t], full.loc[t, "cost"])
 
 
+class TupleNodeIdsTestCase(unittest.TestCase):
+    """Tuple node ids (e.g. `nx.grid_2d_graph`) must stay 1-D elements in the
+    CSR id map — `np.array(tuples, dtype=object)` would turn them into a 2-D array."""
+
+    def _graph(self):
+        g = nx.MultiDiGraph()
+        g.add_edge((0, 0), (0, 1), w=1.0)
+        g.add_edge((0, 1), (1, 1), w=1.0)
+        g.add_edge((0, 0), (1, 0), w=5.0)
+        g.add_edge((1, 0), (1, 1), w=5.0)
+        return g
+
+    def test_csr_id_map_is_one_dimensional(self):
+        from aperta.routing import _graph_to_csr
+
+        _, nx_to_seq, seq_to_nx = _graph_to_csr(self._graph(), "w")
+        self.assertEqual(seq_to_nx.shape, (4,))
+        self.assertEqual(seq_to_nx[nx_to_seq[(1, 1)]], (1, 1))
+
+    def test_nested_edge_betweenness(self):
+        from aperta.network_processing import get_nested_edge_betweenness
+
+        counts = get_nested_edge_betweenness(self._graph(), {(0, 0): [(1, 1), (1, 1), (0, 1)]}, "w")
+        self.assertEqual(counts[((0, 0), (0, 1), 0)], 3)
+        self.assertEqual(counts[((0, 1), (1, 1), 0)], 2)
+        self.assertNotIn(((0, 0), (1, 0), 0), counts.index)
+
+
 if __name__ == "__main__":
     unittest.main()

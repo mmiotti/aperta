@@ -133,7 +133,8 @@ def _graph_to_csr(graph: nx.Graph, weight: str, return_parallel_keys: bool = Fal
 
     node_ids = list(graph.nodes())
     nx_to_seq = {n: i for i, n in enumerate(node_ids)}
-    seq_to_nx = np.array(node_ids, dtype=object)
+    # fromiter, not np.array: keeps tuple node ids (e.g. grid graphs) as 1-D elements.
+    seq_to_nx = np.fromiter(node_ids, dtype=object, count=len(node_ids))
     is_multi = isinstance(graph, (nx.MultiGraph, nx.MultiDiGraph))
     is_directed = graph.is_directed()
     track_keys = return_parallel_keys and is_multi
