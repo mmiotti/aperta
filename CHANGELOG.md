@@ -29,7 +29,7 @@ calibration example that no longer uses Google Maps data.
   numpy (same definitions as before).
 - `examples` extra no longer includes `contextily` (no example uses basemap tiles any more).
 - Calibration example: ground truth is now GPS-tracked car legs from the MOBIS study
-  (`car_legs_peak.csv`, weekday peak hours), replacing Google-Maps-derived travel times.
+  (`car_legs_peak.csv`, weekday peak hours).
   Maps use an OSM water underlay instead of CARTO basemap tiles; the density feature uses
   `scipy.spatial.KDTree` instead of scikit-learn's.
 
@@ -670,7 +670,8 @@ Initial public release, alongside the toolkit-paper submission.
 - 13 test modules, ~320 test methods; CI on Python 3.11–3.13.
 - Sphinx documentation hosted on ReadTheDocs.
 
-[Unreleased]: https://github.com/mmiotti/aperta/compare/v0.3.0-alpha...HEAD
+[Unreleased]: https://github.com/mmiotti/aperta/compare/v0.4.0-alpha...HEAD
+[0.4.0a0]: https://github.com/mmiotti/aperta/compare/v0.3.0-alpha...v0.4.0-alpha
 [0.3.0a0]: https://github.com/mmiotti/aperta/compare/v0.2.0-alpha...v0.3.0-alpha
 [0.2.0a0]: https://github.com/mmiotti/aperta/compare/v0.1.0-alpha...v0.2.0-alpha
 [0.1.0a0]: https://github.com/mmiotti/aperta/releases/tag/v0.1.0-alpha
