@@ -86,7 +86,7 @@ intersphinx_mapping = {
 
 # Never re-execute notebooks during the docs build. The notebooks ship with
 # committed outputs; rebuilding them on RTD would require their data inputs
-# (OSM downloads, Google Maps API responses, private travel-survey data) that
+# (OSM downloads, private travel-survey and traffic-counter data) that
 # the build environment can't provide.
 nbsphinx_execute = "never"
 

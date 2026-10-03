@@ -526,6 +526,8 @@ def calibrate_edge_weights(
 
         # 4.4: Gather error metrics
         dist_line = ground_truth.loc[valid.index, "dist_line"]
+        # TODO: this is baseline duration summed along the route chosen with the CURRENT
+        # weights; route once on the baseline weights instead (true speed-limit shortest path).
         m_baseline = _metrics_by_distance(y_f, routed[baseline_duration_attr][valid], dist_line)
         m_calib_net = _metrics_by_distance(y_f, routed["cost_net"][valid], dist_line)
         m_calib = _metrics_by_distance(y_f, routed["cost"][valid], dist_line)

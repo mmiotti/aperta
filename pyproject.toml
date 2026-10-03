@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aperta"
-version = "0.3.0a0"
+version = "0.4.0a0"
 description = "Python toolkit for cross-modal accessibility analysis on transport networks."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -59,9 +59,7 @@ dependencies = [
 #     (DEM tile download).
 #   - `h3`: `geo_processing.build_h3_grid` (and any other h3-based helper).
 #   - `examples`: everything needed to run the example notebooks. Rolls up
-#     the three domain extras + notebook tooling (`jupytext`), basemap
-#     tiles (`contextily`), and Swiss-specific BFS PC-Axis parsing
-#     (`pyaxis`).
+#     the `osm` + `h3` extras and notebook tooling (`jupytext`).
 #
 # Install with `pip install 'aperta[osm]'` (or any other extra), or
 # `pip install 'aperta[examples]'` for the full notebook environment.
@@ -80,7 +78,6 @@ examples = [
     "aperta[osm]",
     "aperta[h3]",
     "jupytext>=1.16",
-    "contextily>=1.4",
 ]
 # Dev tooling that backs the pre-commit hooks + CI jobs (lint, typecheck,
 # notebook-pair sync, unit tests). Install with `pip install -e '.[dev]'`
@@ -126,12 +123,10 @@ module = [
     "rasterio.*",
     "osmnx.*",
     "h3.*",
-    "contextily.*",
     "matplotlib.*",
     "mpl_toolkits.*",
     "statsmodels.*",
     "numba.*",
-    "pyaxis.*",
     "requests.*",
     "sklearn.*",
 ]

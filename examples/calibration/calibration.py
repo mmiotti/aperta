@@ -27,19 +27,21 @@
 # 3. compute a per-edge congestion feature `vc_beta_2 =
 #    (flow_estimate / capacity)²`, and
 # 4. calibrate per-edge durations (`aperta.calibration.calibrate_edge_weights`)
-#    against observed peak-hour travel times, with `vc_beta_2` as a
-#    multiplier feature alongside `density_norm` and `is_traffic_signal`.
+#    against GPS-observed weekday peak-hour car travel times, with
+#    `vc_beta_2` as a multiplier feature alongside `density_norm` and
+#    `is_traffic_signal`.
 #
 # The point of consolidating the two demos into one notebook is exactly
 # this composition: flows in isolation produce a number that goes
 # nowhere; edge weights in isolation ignore congestion. Together they
 # tell one story — which is how aperta-atlas's production pipeline is
-# structured (`main/04b_traffic_flows.py` → `main/05_edge_weights.py`).
+# structured (`main/03b_traffic_flows.py` → `main/04_edge_weights.py`).
 #
 # > ⚠️ **Data availability.** Only ground truth is proprietary: Swiss
 # > ASTRA traffic-counter readings (`traffic_counters.gpkg`) and
-# > Google-Maps-derived car travel times (`travel_times_car_peak.csv`),
-# > both under `<APERTA_EXAMPLES_GROUND_TRUTH_DIR>` (default
+# > GPS-tracked car trip legs from the MOBIS study (`car_legs_peak.csv`:
+# > weekday peak hours, pre-COVID-19; endpoints on a 100 m grid), both
+# > under `<APERTA_EXAMPLES_GROUND_TRUTH_DIR>` (default
 # > `../data/ground_truth`). aperta cannot redistribute these under
 # > their source terms — cells past §1 will not run without them.
 # > A synthetic public version is planned.
@@ -49,7 +51,7 @@
 # > Poisson GLM, calibrated cost-distribution bin edges, BPR capacity
 # > model, per-time-of-day fits, transferable coefficients), see
 # > [aperta-atlas](https://github.com/mmiotti/aperta-atlas)'s
-# > `main/04b_traffic_flows.py` + `main/05_edge_weights.py`.
+# > `main/03b_traffic_flows.py` + `main/04_edge_weights.py`.
 #
 # ## Approach at a glance
 #
@@ -74,15 +76,15 @@
 # via `vc_beta_2`); it's not acceptable for road design.
 #
 # **Cost-distribution target.** Each origin's sampled trip costs are
-# reweighted to match a target P(C) read directly from the ground-truth
-# Google-Maps trip times — equal-probability percentile bins over
+# reweighted to match a target P(C) read directly from the observed
+# (GPS) trip times — equal-probability percentile bins over
 # `[MIN_COST_S, MAX_COST_S]`. `bin_adjusted_dest_weights` does the
 # reweighting; `nested_node_sample` then draws destinations proportional
 # to the adjusted weights.
 #
 # **Cell + zone hierarchy.** Origins and short-trip destinations use
-# H3-res-10 cells (~130 m); medium- and far-tier destinations aggregate
-# to H3-res-8 zones (~460 m). Cell-level origins matter because
+# H3-res-10 cells (~66 m hex edge); medium- and far-tier destinations
+# aggregate to H3-res-8 zones (~460 m hex edge). Cell-level origins matter because
 # intra-zone short trips contribute disproportionately to local-road
 # flows.
 #
@@ -90,7 +92,7 @@
 # centroids falling in it (`n_buildings`), then applies a
 # Poisson-GLM-shaped rescaling with a density interaction:
 #     trip_weight ≈ (1 + n_buildings)^(LOG_BLDG_COEF + DENSITY_INTERACTION_COEF · density)
-# The shape mirrors aperta-atlas 04a's calibrated GLM (log1p(pop) +
+# The shape mirrors aperta-atlas 03a's calibrated GLM (log1p(pop) +
 # log1p(emp) with density interactions); we substitute `n_buildings` for
 # the calibrated (pop, emp) pair and hand-pick the exponents.
 
@@ -105,8 +107,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import osmnx as ox
 import pandas as pd
-from shapely.geometry import Polygon
-from sklearn.neighbors import KDTree
+from shapely.geometry import Polygon, box
+from scipy.spatial import KDTree
 
 from aperta import (
     calibration,
@@ -139,7 +141,7 @@ OSM_HIGHWAY_RANKS = figures.OSM_HIGHWAY_RANKS
 # Ground truth (proprietary). Override with APERTA_EXAMPLES_GROUND_TRUTH_DIR.
 GROUND_TRUTH_DIR = Path(os.environ.get(
     'APERTA_EXAMPLES_GROUND_TRUTH_DIR', '../data/ground_truth'))
-GROUND_TRUTH_LEGS = GROUND_TRUTH_DIR / 'travel_times_car_peak.csv'
+GROUND_TRUTH_LEGS = GROUND_TRUTH_DIR / 'car_legs_peak.csv'
 GROUND_TRUTH_COUNTERS = GROUND_TRUTH_DIR / 'traffic_counters.gpkg'
 
 # Area + CRS. `Kanton Zürich` (~1,700 km²) is much larger than the city
@@ -149,7 +151,7 @@ GROUND_TRUTH_COUNTERS = GROUND_TRUTH_DIR / 'traffic_counters.gpkg'
 PLACE = 'Kanton Zürich, Switzerland'
 LOCATION_LABEL = 'Zurich'
 CRS_METRIC = 'EPSG:2056'  # LV95 (Swiss metric)
-H3_RES_CELLS = 10          # ~130 m hex edge
+H3_RES_CELLS = 10          # ~66 m hex edge
 H3_RES_ZONES = 8           # ~460 m hex edge (parent-child = single H3 call)
 DENSITY_RADIUS_M = 500.0   # for the per-edge `density_norm` feature
 
@@ -214,7 +216,7 @@ MAX_COST_S = 3600.0   # 1 h - covers most survey trips
 # this against observed counters.
 TRIPS_PER_BUILDING_PER_DAY = 3.0
 
-# Trip-generation weight per cell — analogous in shape to aperta-atlas 04a's
+# Trip-generation weight per cell — analogous in shape to aperta-atlas 03a's
 # calibrated Poisson GLM (log1p(pop) + log1p(emp) with density interactions),
 # hand-picked in magnitude here:
 #   trip_weight = (1 + n_buildings)^(LOG_BLDG_COEF + DENSITY_INTERACTION_COEF · density_norm)
@@ -236,7 +238,7 @@ VC_BETA_EXPONENT     = 2.0        # BPR standard is β ≈ 4 for saturated flows
 # %% [markdown]
 # ## 1. Study-area polygons + OSM network + ground truth
 #
-# Three concentric polygons anchor the model (see the Parameters
+# Two concentric polygons anchor the model (see the Parameters
 # section for the semantic split). Then one OSMnx call each for the
 # car network + buildings, plus two per-edge features
 # (`is_traffic_signal` + `density_norm`) derived inline. Features
@@ -280,7 +282,7 @@ for u, v, k, d in car_graph.edges(keys=True, data=True):
 # --- density_norm: per-node KDTree count within DENSITY_RADIUS_M → normalise → mean of edge endpoints.
 _node_ids = list(car_graph.nodes)
 _xy = np.array([[car_graph.nodes[n]['x'], car_graph.nodes[n]['y']] for n in _node_ids])
-_counts = KDTree(_xy).query_radius(_xy, r=DENSITY_RADIUS_M, count_only=True)
+_counts = KDTree(_xy).query_ball_point(_xy, r=DENSITY_RADIUS_M, return_length=True)
 _density = _counts / max(_counts.max(), 1)
 for n, dens in zip(_node_ids, _density):
     car_graph.nodes[n]['density_norm'] = float(dens)
@@ -470,7 +472,7 @@ for u, v, k, d in car_graph.edges(keys=True, data=True):
     d['duration_initial'] = max(base + mult_term + add_term, base * 0.2)
 
 # --- Tiered OD pairs + per-pair routing costs. Symmetric `trip_weight`
-# at origin and destination (matches aperta-atlas 04b's convention).
+# at origin and destination (matches aperta-atlas 03b's convention).
 pairs = od_pairs.get_pairs(
     cells, r_cells=R_CELLS_M, node_column='node_id',
     zones=zones, r_zones=R_ZONES_M, r_medium=R_MEDIUM_M,
@@ -644,8 +646,9 @@ plt.show()
 # %% [markdown]
 # ## 5. Flow-aware edge-weight calibration
 #
-# Same `aperta.calibration.calibrate_edge_weights` primitive as
-# `edge_weights.ipynb` used, but now the multiplier features include
+# `aperta.calibration.calibrate_edge_weights` routes each observed trip,
+# fits an OLS of observed time on features collected along the routed
+# path, and iterates. Here the multiplier features include
 # `vc_beta_2` — a per-edge congestion index derived from the flow
 # estimate. The idea: intersection-only and density-only features
 # capture *where* travel time is slower in the abstract; `vc_beta_2`
@@ -661,7 +664,14 @@ plt.show()
 #   routed path. `is_traffic_signal` here.
 # - **additive_endpoint**: adds seconds based on a per-node attribute
 #   at origin + destination. Empty here for simplicity; production adds
-#   `snap_dist` (cell-centroid → nearest-node distance) — see aperta-atlas.
+#   `snap_dist` (trip endpoint → snapped-node distance) — see aperta-atlas.
+#
+# The printed metrics: R² is relative to the 1:1 line (`1 − SS_res /
+# SS_tot`), so systematic bias lowers it and values < 0 mean worse than
+# predicting the mean observed time — common for the uncalibrated
+# baseline within a distance band. `bias` is Σ predicted / Σ observed
+# (1.0 = unbiased). The baseline row sums speed-limit durations along
+# the route the calibrated weights choose.
 
 # %%
 # Zero (0.0) defaults for coefficients is generally fine, calibration converges.
@@ -703,6 +713,13 @@ xlim = (PAPER_CROP_CENTER_XY[0] - PAPER_CROP_HALF_M,
 ylim = (PAPER_CROP_CENTER_XY[1] - PAPER_CROP_HALF_M,
         PAPER_CROP_CENTER_XY[1] + PAPER_CROP_HALF_M)
 
+# Lakes + rivers from OSM (`natural=water`) as a light underlay for both
+# maps — orientation without a tile service or API key.
+_crop_ll = gpd.GeoSeries(
+    [box(xlim[0], ylim[0], xlim[1], ylim[1])], crs=CRS_METRIC).to_crs('EPSG:4326').iloc[0]
+water = ox.features_from_polygon(_crop_ll, tags={'natural': 'water'})
+water = water[water.geometry.type.isin(['Polygon', 'MultiPolygon'])].to_crs(CRS_METRIC)
+
 # --- Flow map.
 FLOW_VMAX = 50_000   # AADT cap for the colour scale
 fig, ax = plt.subplots(figsize=(7, 6.5))
@@ -712,6 +729,7 @@ figures.plot_network_map(
     title=f'Estimated per-edge AADT ({LOCATION_LABEL})',
     xlim=xlim, ylim=ylim,
     vmax=FLOW_VMAX,
+    water=water,
 )
 plt.tight_layout()
 figures.save_figure(fig, 'flow_estimate_map')
@@ -741,7 +759,7 @@ figures.plot_network_map(
     cbar_label='effective speed (km/h, including intersections + congestion)',
     title=f'Calibrated per-edge effective speed — peak hours ({LOCATION_LABEL})',
     xlim=xlim, ylim=ylim,
-    basemap=True, crs=CRS_METRIC,
+    water=water,
 )
 plt.tight_layout()
 figures.save_figure(fig, 'calibrated_edge_speed_map')
@@ -801,7 +819,7 @@ plt.show()
 #   §5). §4 sweeps `DENSITY_INTERACTION_COEF` in isolation; the
 #   others are hand-picked. Production coordinate-descents
 #   them jointly with the linear calibration coefficients against
-#   counters + Google-Maps trip times.
+#   counters + observed trip times.
 # - **No iterative refinement on stricter trip filters.** Production
 #   iterates filters (drop outliers, retain trips within a polygon,
 #   etc.) — we use a single set here.

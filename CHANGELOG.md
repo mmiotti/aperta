@@ -9,6 +9,36 @@ changes may occur in 0.x releases.
 
 _Nothing yet._
 
+## [0.4.0a0] — 2026-10-03
+
+A small release: weighted calibration fits, a Python 3.12 floor, one routing fix, and a
+calibration example that no longer uses Google Maps data.
+
+### Added
+- `aperta.NOTE` — custom log level (25, between INFO and WARNING) for messages users should
+  see but that aren't warnings. `geo_processing` uses it for its informational notices.
+- `calibration.calibrate_edge_weights(weight_col=...)` — optional per-trip weight column
+  (e.g. survey person weights); the fit becomes weighted least squares. Default `None`
+  keeps plain OLS.
+- `calibration.calibrate_edge_weights(r2_tolerance=...)` — minimum R² improvement per
+  iteration to keep iterating (previously hard-coded at `1e-4`, still the default).
+
+### Changed
+- **Python ≥ 3.12** (was ≥ 3.11). CI tests 3.12 and 3.13.
+- Dropped the `scikit-learn` dependency: R² and RMSE in `calibration` are computed with
+  numpy (same definitions as before).
+- `examples` extra no longer includes `contextily` (no example uses basemap tiles any more).
+- Calibration example: ground truth is now GPS-tracked car legs from the MOBIS study
+  (`car_legs_peak.csv`, weekday peak hours), replacing Google-Maps-derived travel times.
+  Maps use an OSM water underlay instead of CARTO basemap tiles; the density feature uses
+  `scipy.spatial.KDTree` instead of scikit-learn's.
+
+### Fixed
+- Routing on graphs with tuple node ids (e.g. grid graphs): the CSR id map now keeps tuples
+  as single elements instead of letting numpy expand them into a 2-D array.
+- Read the Docs build warnings (stale `osm_helpers` references, docstring RST, ambiguous
+  cross-references).
+
 ## [0.3.0a0] — 2026-07-20 — the aperta / aperta-atlas split becomes real
 
 This cycle is dominated by one arc: **the aperta / aperta-atlas split becoming real**. [aperta-atlas](https://github.com/mmiotti/aperta-atlas) (formerly aperta-lab) is now a stable public companion repo, and with it as a home for scenario-bound, project-shaped, and OSM-tag-aware code, aperta itself can be trimmed to its algorithm-library essence.
