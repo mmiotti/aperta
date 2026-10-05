@@ -14,7 +14,7 @@ outputs.
 The **calibration notebook** fetches the OSM car network for the Canton
 of Zurich inline via `osmnx`; the only external inputs are ground-truth
 files whose source terms preclude redistribution — GPS-tracked car trip
-legs from the MOBIS study and Swiss ASTRA counter readings. It renders here
+legs from the MOBIS study and Swiss traffic-counter readings. It renders here
 from committed outputs; re-running locally requires the private
 ground-truth inputs. A public-data version is planned.
 

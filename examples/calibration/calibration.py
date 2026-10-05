@@ -38,7 +38,7 @@
 # structured (`main/03b_traffic_flows.py` → `main/04_edge_weights.py`).
 #
 # > ⚠️ **Data availability.** Only ground truth is proprietary: Swiss
-# > ASTRA traffic-counter readings (`traffic_counters.gpkg`) and
+# > traffic-counter readings (`traffic_counters.gpkg`) and
 # > GPS-tracked car trip legs from the MOBIS study (`car_legs_peak.csv`:
 # > weekday peak hours, pre-COVID-19; endpoints on a 100 m grid), both
 # > under `<APERTA_EXAMPLES_GROUND_TRUTH_DIR>` (default
