@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aperta"
-version = "0.4.0a0"
+version = "0.4.1a0"
 description = "Python toolkit for cross-modal accessibility analysis on transport networks."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -37,6 +37,7 @@ dependencies = [
     "numpy>=2.0",
     "pandas>=2.0",
     "geopandas>=1.0",
+    "pyproj>=3.5",          # CRS support; without it geopandas silently drops CRSs
     "networkx>=3.0",        # input graph type; routing converts to scipy CSR
     "scipy>=1.10",          # routing (csgraph.dijkstra), KDTree, sparse matrices
     "statsmodels>=0.14",    # calibration.calibrate_edge_weights (OLS)

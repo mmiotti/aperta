@@ -9,6 +9,21 @@ changes may occur in 0.x releases.
 
 _Nothing yet._
 
+## [0.4.1a0] — 2026-10-09
+
+### Fixed
+- `traffic_flows.nested_node_sample` applies the cost-bin reweighting to each sampled
+  origin's combined destination row (cell, middle and far tiers). Before, each tier was
+  normalised on its own, so every tier got the same total sampling mass whatever its costs.
+  Flow estimates change.
+
+### Changed
+- `nested_node_sample` takes `bin_edges=` (e.g. from `percentile_bin_edges`) instead of
+  `cost_to_weight=`. `bin_adjusted_dest_weights` is removed; its reweighting now happens
+  inside `nested_node_sample`.
+- `pyproj` is a required dependency. geopandas 1.x no longer installs it, and without it
+  GeoDataFrames silently lose their CRS, which also defeats aperta's CRS-mismatch checks.
+
 ## [0.4.0a0] — 2026-10-03
 
 A small release: weighted calibration fits, a Python 3.12 floor, one routing fix, and a
@@ -670,7 +685,8 @@ Initial public release, alongside the toolkit-paper submission.
 - 13 test modules, ~320 test methods; CI on Python 3.11–3.13.
 - Sphinx documentation hosted on ReadTheDocs.
 
-[Unreleased]: https://github.com/mmiotti/aperta/compare/v0.4.0-alpha...HEAD
+[Unreleased]: https://github.com/mmiotti/aperta/compare/v0.4.1-alpha...HEAD
+[0.4.1a0]: https://github.com/mmiotti/aperta/compare/v0.4.0-alpha...v0.4.1-alpha
 [0.4.0a0]: https://github.com/mmiotti/aperta/compare/v0.3.0-alpha...v0.4.0-alpha
 [0.3.0a0]: https://github.com/mmiotti/aperta/compare/v0.2.0-alpha...v0.3.0-alpha
 [0.2.0a0]: https://github.com/mmiotti/aperta/compare/v0.1.0-alpha...v0.2.0-alpha

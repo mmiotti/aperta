@@ -13,7 +13,22 @@ The name is Latin/Italian for *open* — the condition that accessibility, at ro
 
 ## Status
 
-**Pre-1.0, alpha.** Published alongside a toolkit paper (in submission). APIs may change without notice until v1.0.
+**Pre-1.0, alpha.** APIs may change without notice until v1.0.
+
+**Coming in 0.5** (in development; a redesign with breaking API changes, so pin `aperta<0.5`
+if you build on the current version):
+
+- **A faster routing kernel**: a multi-threaded Dijkstra written in Python and compiled with
+  Numba. Each search stops as soon as all its destinations are reached, and nothing is
+  precomputed, so new edge weights (calibration, scenarios) cost nothing extra.
+- **A `Network` object stored as arrays**: networks load and save in seconds and use far less
+  memory than `networkx` graphs, which remain supported for import and export.
+- **A simpler, more consistent API**, with a runner that handles a whole accessibility
+  computation in a few lines.
+- **Streamed or stored**: compute accessibility without keeping intermediate travel-time tables,
+  or store them and reuse them across runs.
+- **Calibration built in**: fit edge travel times and door-to-door overheads to observed trips.
+- **Networks straight from OpenStreetMap**: build them from `.pbf` extracts (optional extra).
 
 ## Companion project: aperta-atlas
 

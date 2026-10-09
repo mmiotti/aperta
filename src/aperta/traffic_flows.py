@@ -3,9 +3,10 @@
 Estimates daily per-edge traffic volumes (interpretable as AADT once
 calibrated) by simulating a quick three-step travel demand model:
 trip generation (origin sampling weighted by population), trip distribution
-(per-origin destination sampling weighted by a cost-decay function and
-per-destination attractiveness), and route assignment (shortest-path routing
-on the current edge weights, accumulating per-edge counts). Outputs can be
+(per-origin destination sampling weighted by per-destination attractiveness,
+reweighted per cost bin so the sampled trip costs follow an observed
+distribution), and route assignment (shortest-path routing on the current
+edge weights, accumulating per-edge counts). Outputs can be
 calibrated against ground-truth counter data via the helpers in
 `aperta.calibration`.
 
@@ -21,8 +22,9 @@ estimation cheap and consistent with the rest of the pipeline; it does not
 aim to replace a dedicated traffic-assignment tool. An iterative
 congestion-aware variant is theoretically possible as a future extension.
 
-This module supplies the sampling primitive `nested_node_sample`. The
-routing + per-edge accumulation itself lives in
+This module supplies the sampling primitive `nested_node_sample` and
+`percentile_bin_edges`, which derives its cost bins from observed trip
+costs. The routing + per-edge accumulation itself lives in
 `network_processing.get_nested_edge_betweenness`. A simpler alternative
 for small study areas — radius-limited Brandes betweenness without
 explicit OD sampling — also lives in `network_processing`. Downstream
@@ -31,7 +33,6 @@ counts (e.g. scaling to an expected vehicle-kilometres total).
 """
 
 from collections import Counter, defaultdict
-from typing import Callable
 
 import numpy as np
 import pandas as pd
@@ -58,46 +59,48 @@ def _weighted_sample_indices(weights: np.ndarray, rvals: np.ndarray) -> np.ndarr
     return out
 
 
-def _zone_tier_dests_and_scores(
+def _zone_tier_rows(
     pairs: TieredODPairs,
     weights: TieredODPairs,
     costs: TieredODPairs,
-    cost_to_weight: Callable,
     mask: TieredODPairs | None = None,
 ) -> dict:
-    """Pre-compute per-zone shared (zone_dests, zone_score) with optional mask
-    applied. Done once per zone — reused across every cell in that zone during
-    sampling, amortizing both the `cost_to_weight` call and the mask-filter
-    step.
-
-    Empty arrays when a zone has no zone-tier dests.
-
-    Phase A note: previously also pre-computed region-tier dests/scores. The
-    region tier has been replaced by `cells_to_zones` (cell-keyed origin,
-    zone-keyed dest), which can't be amortised per-zone the same way — each
-    cell has its own dest set. Re-integration of the cells_to_zones tier into
-    `nested_node_sample` is a Phase B / D follow-up.
-    """
+    """Per-zone `(dests, weights, costs)` of the far tier (`zones_to_zones`), with
+    the optional mask applied. Done once per zone and reused by every cell in it."""
     z2z_d = pairs.zones_to_zones or {}
     z2z_w = weights.zones_to_zones or {}
     z2z_c = costs.zones_to_zones or {}
     z2z_m = (mask.zones_to_zones if mask is not None else None) or {}
-    empty_dest = np.empty(0, dtype=object)
-    empty_score = np.empty(0)
 
     out: dict = {}
-    for zn in z2z_d:
-        if zn in z2z_d and len(z2z_d[zn]):
-            zd, zw, zc = z2z_d[zn], z2z_w[zn], z2z_c[zn]
-            if zn in z2z_m:
-                m = z2z_m[zn]
-                zd, zw, zc = zd[m], zw[m], zc[m]
-            zone_dests = zd
-            zone_score = zw * cost_to_weight(zc)
-        else:
-            zone_dests, zone_score = empty_dest, empty_score
-        out[zn] = (zone_dests, zone_score)
+    for zn, zd in z2z_d.items():
+        zw = np.asarray(z2z_w[zn], dtype=float)
+        zc = np.asarray(z2z_c[zn], dtype=float)
+        if zn in z2z_m:
+            m = z2z_m[zn]
+            zd, zw, zc = zd[m], zw[m], zc[m]
+        out[zn] = (zd, zw, zc)
     return out
+
+
+def _bin_adjusted_scores(
+    costs: np.ndarray, weights: np.ndarray, bin_edges: np.ndarray
+) -> np.ndarray:
+    """Sampling scores for one origin's destination row.
+
+    Every populated cost bin gets the same total score, split among its
+    destinations in proportion to their weight. Destinations whose cost falls
+    outside `[bin_edges[0], bin_edges[-1])` (or is non-finite) get zero. Scores
+    are unnormalised: sampling only needs relative values.
+    """
+    n_bins = bin_edges.size - 1
+    idx = np.digitize(costs, bin_edges) - 1
+    in_range = (idx >= 0) & (idx < n_bins) & np.isfinite(costs)
+    idx = np.where(in_range, idx, 0)
+    w = np.where(in_range, weights, 0.0)
+    bin_sums = np.bincount(idx, weights=w, minlength=n_bins)
+    scale = np.divide(1.0, bin_sums, out=np.zeros(n_bins), where=bin_sums > 0)
+    return w * scale[idx]
 
 
 def nested_node_sample(
@@ -107,7 +110,7 @@ def nested_node_sample(
     *,
     cell_to_zone_node: dict,
     orig_weights: np.ndarray | pd.Series | None,
-    cost_to_weight: Callable,
+    bin_edges: np.ndarray,
     n_orig: int,
     n_dest: int,
     random_state: np.random.RandomState,
@@ -117,18 +120,16 @@ def nested_node_sample(
     """Sample `n_dest` destinations for `n_orig` weighted-sampled origin cells,
     integrating all three tiers (cell, middle, far) into one combined pool.
 
-    Per origin cell, the tier dest arrays are concatenated on the fly into one
-    combined dest pool with per-pair scores `weight * cost_to_weight(cost)`.
-    Sampling is then a single `np.random.choice`-equivalent (JITted) over the
-    pool. Peak memory is bounded by the largest single per-origin concatenation,
-    not by `n_orig × total_dests`.
-
-    The per-zone shared scores (far tier) are computed once per zone (not per
-    cell), so the `cost_to_weight` call is amortized across all cells in the
-    zone. The middle tier (`cells_to_zones`) is keyed per cell — same dest
-    *zones* across cells in a zone, but different per-cell costs — so it can't
-    amortise the same way, but the per-cell cost is what makes the score
-    correct.
+    Per origin cell, the tier rows are concatenated into one destination pool:
+    the cell's `cells_to_cells` and `cells_to_zones` rows plus the
+    `zones_to_zones` row of its zone. Each cost bin of that combined row gets
+    the same probability mass, split among the bin's destinations in proportion
+    to their weight, so the sampled trip costs follow the distribution behind
+    `bin_edges` (typically `percentile_bin_edges` of observed trip costs).
+    Destinations with costs outside `[bin_edges[0], bin_edges[-1])` are never
+    sampled. Sampling is then a single JITted weighted draw over the pool. Peak
+    memory is bounded by the largest single per-origin pool, not by
+    `n_orig × total_dests`.
 
     Args:
         pairs: destination IDs per tier.
@@ -141,8 +142,8 @@ def nested_node_sample(
         orig_weights: per-origin sampling weights, aligned position-wise with
             `list(pairs.cells_to_cells.keys())`. Required when `chosen` is
             None; ignored when `chosen` is provided.
-        cost_to_weight: monotone-decreasing function mapping a cost (e.g. distance
-            in metres) to a per-pair weight. Vectorized — receives a 1-D array.
+        bin_edges: `n_bins + 1` non-decreasing cost-bin edges, typically
+            `percentile_bin_edges(observed_trip_costs)`.
         n_orig, n_dest: number of origins to sample; number of destinations
             sampled PER origin-pick. Origin sampling is with replacement
             (popular origins can appear multiple times in the underlying
@@ -181,6 +182,13 @@ def nested_node_sample(
     """
     if pairs.cells_to_cells is None:
         raise ValueError("`pairs.cells_to_cells` is None; cell-tier is required.")
+    bin_edges = np.asarray(bin_edges, dtype=float)
+    if bin_edges.ndim != 1 or bin_edges.size < 2:
+        raise ValueError(
+            f"`bin_edges` must be a 1-D array of length >= 2; got shape {bin_edges.shape}."
+        )
+    if np.any(np.diff(bin_edges) < 0):
+        raise ValueError("`bin_edges` must be non-decreasing.")
     if costs.cells_to_cells is None or weights.cells_to_cells is None:
         raise ValueError("`costs` and `weights` must both have a populated cell-tier.")
     cell_pairs = pairs.cells_to_cells
@@ -236,9 +244,8 @@ def nested_node_sample(
                 f"Example missing: {sorted(missing)[:3]}."
             )
 
-    # Pre-compute per-zone shared dest arrays + scores for the FAR tier
-    # (zones_to_zones). Reused across every cell in that zone during sampling.
-    z_combo = _zone_tier_dests_and_scores(pairs, weights, costs, cost_to_weight, mask)
+    # Per-zone far-tier rows (zones_to_zones), reused by every cell in the zone.
+    z_rows = _zone_tier_rows(pairs, weights, costs, mask)
     cell_mask_dict = (mask.cells_to_cells if mask is not None else None) or {}
     # Middle tier (cells_to_zones) is cell-keyed; pre-bind the dicts (or empty
     # fallbacks) so the inner loop doesn't keep checking for None.
@@ -247,7 +254,7 @@ def nested_node_sample(
     c2z_weights = weights.cells_to_zones or {}
     c2z_mask_dict = (mask.cells_to_zones if mask is not None else None) or {}
     empty_dest = np.empty(0, dtype=object)
-    empty_score = np.empty(0)
+    empty_float = np.empty(0)
 
     # Group sampled origins by zone — shared work (far tier) is done once per
     # zone-group. Count occurrences via `Counter` so duplicate picks in
@@ -264,10 +271,7 @@ def nested_node_sample(
 
     out: dict = {}
     for zone_node, cells_here in chosen_by_zone.items():
-        zone_dests, zone_score = z_combo.get(
-            zone_node,
-            (empty_dest, empty_score),
-        )
+        zone_dests, zone_w, zone_c = z_rows.get(zone_node, (empty_dest, empty_float, empty_float))
         for c in cells_here:
             # Cell tier (cells_to_cells): per-cell origin + per-cell dest.
             # `get_pairs` populates an entry for every valid origin
@@ -280,11 +284,10 @@ def nested_node_sample(
             if c in cell_mask_dict:
                 m = cell_mask_dict[c]
                 cell_dests, cell_costs, cell_weights = cell_dests[m], cell_costs[m], cell_weights[m]
-            cell_score = cell_weights * cost_to_weight(cell_costs)
 
             # Middle tier (cells_to_zones): per-cell origin → zone-node dest.
             # Cells in the same zone share dest IDs but have distinct per-cell
-            # costs, so the score has to be re-computed per cell.
+            # costs.
             if c in c2z_pairs:
                 cz_dests = c2z_pairs[c]
                 cz_costs_arr = c2z_costs[c]
@@ -294,16 +297,20 @@ def nested_node_sample(
                     cz_dests = cz_dests[cm]
                     cz_costs_arr = cz_costs_arr[cm]
                     cz_weights_arr = cz_weights_arr[cm]
-                cz_score = cz_weights_arr * cost_to_weight(cz_costs_arr)
             else:
-                cz_dests, cz_score = empty_dest, empty_score
+                cz_dests, cz_costs_arr, cz_weights_arr = empty_dest, empty_float, empty_float
 
+            # Bin adjustment runs on the combined row, so cost bins (not
+            # tiers) get equal mass.
             all_dests = np.concatenate([cell_dests, cz_dests, zone_dests])
-            all_score = np.concatenate([cell_score, cz_score, zone_score])
-            # An origin with NO destinations across any tier (truly
-            # isolated cell — no in-radius cells, no zones in [r_cells,
-            # r_zones]) can't generate flow. Skip rather than crash on
-            # the empty `cumsum` inside `_weighted_sample_indices`.
+            all_score = _bin_adjusted_scores(
+                np.concatenate([cell_costs, cz_costs_arr, zone_c]).astype(float),
+                np.concatenate([cell_weights, cz_weights_arr, zone_w]).astype(float),
+                bin_edges,
+            )
+            # An origin with no in-range destination across any tier can't
+            # generate flow. Skip rather than crash on the empty `cumsum`
+            # inside `_weighted_sample_indices`.
             if all_score.size == 0 or all_score.sum() <= 0:
                 continue
             # Sample `n_picks × n_dest` destinations: this origin was
@@ -318,13 +325,6 @@ def nested_node_sample(
     return out
 
 
-# ---------------------------------------------------------------------------
-# Bin-adjusted destination weights — fix for the cost-weighted sampling bias
-# at sparse-periphery origins. See memory `aperta-traffic-flow-sampling-bias-fix`
-# for the design and motivation.
-# ---------------------------------------------------------------------------
-
-
 def percentile_bin_edges(
     survey_costs: np.ndarray | pd.Series,
     n_bins: int = 20,
@@ -333,7 +333,7 @@ def percentile_bin_edges(
 
     Returns ``n_bins + 1`` edges such that each bin contains roughly ``1 / n_bins``
     of the survey data by count. Suitable as the ``bin_edges`` input to
-    `bin_adjusted_dest_weights` for sampling that targets the empirical cost
+    `nested_node_sample`, so sampled trip costs follow the empirical cost
     distribution non-parametrically (no need to fit a log-normal or similar).
 
     Args:
@@ -351,107 +351,3 @@ def percentile_bin_edges(
     if arr.size == 0:
         raise ValueError("`survey_costs` is empty after dropping non-finite values.")
     return np.percentile(arr, np.linspace(0.0, 100.0, n_bins + 1))
-
-
-def bin_adjusted_dest_weights(
-    pairs: TieredODPairs,
-    costs: TieredODPairs,
-    dest_weights: TieredODPairs,
-    bin_edges: np.ndarray,
-    *,
-    renormalize_per_origin: bool = True,
-) -> TieredODPairs:
-    """Per-origin per-bin reweight of destination weights, fixing the
-    cost-weighted sampling bias at sparse-periphery origins.
-
-    For each origin and each cost bin, the bin's target probability mass
-    (``1 / n_bins``) is divided among the destinations that fall in that bin
-    in proportion to their existing weight ``W(D)``. Bins with no destinations
-    contribute nothing. The result is a per-origin adjusted weight array of
-    the same shape as ``dest_weights``, which can be passed to
-    `nested_node_sample` (or any weighted sampler) in place of the raw
-    weights — replacing the ``cost_to_weight`` callable entirely.
-
-    Destinations whose cost falls outside ``[bin_edges[0], bin_edges[-1]]``
-    receive zero weight (treated as too rare to be informative).
-
-    Args:
-        pairs: destination IDs per tier (any of the three may be ``None``).
-        costs: per-pair costs, same shape as ``pairs`` (e.g. travel times).
-        dest_weights: base destination weights ``W(D)`` per pair, same shape
-            as ``pairs`` (e.g. populations, employment counts).
-        bin_edges: ``n_bins + 1`` sorted values, typically from
-            `percentile_bin_edges` applied to a travel-survey cost column.
-        renormalize_per_origin: when ``True`` (default), the adjusted weights
-            for each origin are normalised to sum to 1, so each origin has
-            the same total sampling weight regardless of how many cost bins
-            its destinations populate. When ``False``, sparse-periphery
-            origins end up with a smaller total weight (the empty bins'
-            target mass is not redistributed) — this naturally reduces their
-            effective trip count, useful when the bin adjustment is the only
-            mechanism reducing trips from sparse origins. The default
-            ``True`` matches the recommended decoupling: bin-adjustment fixes
-            the cost distribution only; trip-generation count stays
-            controlled separately at the ``orig_weights`` stage.
-
-    Returns:
-        Same ``TieredODPairs`` subclass as ``pairs`` with per-origin adjusted
-        weight arrays. Origins whose destinations are entirely out of range
-        (or whose ``dest_weights`` sum to zero) receive an all-zero array.
-    """
-    bin_edges = np.asarray(bin_edges, dtype=float)
-    if bin_edges.ndim != 1 or bin_edges.size < 2:
-        raise ValueError(
-            f"`bin_edges` must be a 1-D array of length >= 2; got shape {bin_edges.shape}."
-        )
-    if np.any(np.diff(bin_edges) < 0):
-        raise ValueError("`bin_edges` must be non-decreasing.")
-    n_bins = bin_edges.size - 1
-    target_mass_per_bin = 1.0 / n_bins
-
-    def _adjust_tier(
-        pair_tier: dict | None,
-        cost_tier: dict | None,
-        weight_tier: dict | None,
-    ) -> dict | None:
-        if pair_tier is None or cost_tier is None or weight_tier is None:
-            return None
-        out: dict = {}
-        for origin, dest_arr in pair_tier.items():
-            cost_arr = np.asarray(cost_tier[origin], dtype=float)
-            w_arr = np.asarray(weight_tier[origin], dtype=float)
-            adjusted = np.zeros_like(w_arr, dtype=float)
-            # Bin assignment: np.digitize(x, edges) returns 0 for x < edges[0],
-            # n_bins+1 for x >= edges[-1], and i in 1..n_bins otherwise.
-            # Subtract 1 to get 0..n_bins-1 for in-range, -1/n_bins for out.
-            bin_idx = np.digitize(cost_arr, bin_edges) - 1
-            in_range = (bin_idx >= 0) & (bin_idx < n_bins) & np.isfinite(cost_arr)
-            if not in_range.any():
-                out[origin] = adjusted
-                continue
-            # Per-bin total weight (vectorised with bincount).
-            bin_idx_safe = np.where(in_range, bin_idx, 0)
-            bin_sums = np.bincount(bin_idx_safe, weights=w_arr * in_range, minlength=n_bins)
-            # Per-bin scaling factor: target_mass / available_mass, 0 for empty bins.
-            scale = np.zeros(n_bins, dtype=float)
-            populated = bin_sums > 0
-            scale[populated] = target_mass_per_bin / bin_sums[populated]
-            adjusted = w_arr * scale[bin_idx_safe] * in_range
-            if renormalize_per_origin:
-                total = adjusted.sum()
-                if total > 0:
-                    adjusted = adjusted / total
-            out[origin] = adjusted
-        return out
-
-    return type(pairs)(
-        cells_to_cells=_adjust_tier(
-            pairs.cells_to_cells, costs.cells_to_cells, dest_weights.cells_to_cells
-        ),
-        cells_to_zones=_adjust_tier(
-            pairs.cells_to_zones, costs.cells_to_zones, dest_weights.cells_to_zones
-        ),
-        zones_to_zones=_adjust_tier(
-            pairs.zones_to_zones, costs.zones_to_zones, dest_weights.zones_to_zones
-        ),
-    )

@@ -78,9 +78,8 @@
 # **Cost-distribution target.** Each origin's sampled trip costs are
 # reweighted to match a target P(C) read directly from the observed
 # (GPS) trip times — equal-probability percentile bins over
-# `[MIN_COST_S, MAX_COST_S]`. `bin_adjusted_dest_weights` does the
-# reweighting; `nested_node_sample` then draws destinations proportional
-# to the adjusted weights.
+# `[MIN_COST_S, MAX_COST_S]`. `nested_node_sample` gives each cost bin of an
+# origin's destination row equal mass, split by destination weight.
 #
 # **Cell + zone hierarchy.** Origins and short-trip destinations use
 # H3-res-10 cells (~66 m hex edge); medium- and far-tier destinations
@@ -501,16 +500,13 @@ print(f"Cost-bin edges ({N_BINS} bins over "
       f"n_survey={len(_survey_costs):,}):")
 print(f"  {[f'{e:.0f}' for e in bin_edges]}")
 
-adjusted_dest_weights = traffic_flows.bin_adjusted_dest_weights(
-    pairs, costs, dest_weights, bin_edges,
-)
 
 # --- Sample origins + destinations; accumulate edge betweenness; scale to AADT.
 rng = np.random.RandomState(RNG_SEED)
 nested_sample = traffic_flows.nested_node_sample(
-    pairs=pairs, weights=adjusted_dest_weights, costs=costs,
+    pairs=pairs, weights=dest_weights, costs=costs,
     cell_to_zone_node=cell_to_zone_node, orig_weights=orig_weights,
-    cost_to_weight=np.ones_like, n_orig=N_ORIG, n_dest=N_DEST,
+    bin_edges=bin_edges, n_orig=N_ORIG, n_dest=N_DEST,
     random_state=rng,
 )
 edge_bc = network_processing.get_nested_edge_betweenness(
@@ -599,12 +595,11 @@ def _estimate_flows(coef: float) -> dict:
         'trip_weight', cells_c, list(pairs.cells_to_cells.keys()))
     dw = od_pairs.lookup_dest_column_node(
         'trip_weight', pairs, cells_c, zones=zones_c)
-    adj = traffic_flows.bin_adjusted_dest_weights(pairs, costs, dw, bin_edges)
     rng = np.random.RandomState(RNG_SEED)
     sample = traffic_flows.nested_node_sample(
-        pairs=pairs, weights=adj, costs=costs,
+        pairs=pairs, weights=dw, costs=costs,
         cell_to_zone_node=cell_to_zone_node, orig_weights=ow,
-        cost_to_weight=np.ones_like, n_orig=N_ORIG, n_dest=N_DEST,
+        bin_edges=bin_edges, n_orig=N_ORIG, n_dest=N_DEST,
         random_state=rng)
     bc = network_processing.get_nested_edge_betweenness(
         car_graph, sample, weight='duration_initial',
