@@ -30,7 +30,7 @@ The name is Latin/Italian for *open* — the condition that accessibility, at ro
   computation in a few lines.
 - **Streamed or stored**: compute accessibility without keeping intermediate travel-time tables,
   or store them and reuse them across runs.
-- **Calibration built in**: fit edge travel times and door-to-door overheads to observed trips.
+- **Calibration built in**: fit edge weights (travel times) and door-to-door overheads to observed trips, with common travel survey post-processing built in.
 - **Networks straight from OpenStreetMap**: build them from `.pbf` extracts (optional extra).
 
 ## Companion project: aperta-atlas
