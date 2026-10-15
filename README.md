@@ -141,6 +141,14 @@ Aperta deliberately doesn't try to do everything in-house. Two interoperability 
 
 Ultimate speed for the full accessibility stack was not aperta's goal. On production-shape cumulative-opportunity workloads (AOI cells as origins, tiered destinations covering a wider buffer), aperta runs within ~2–6× of Pandana — a modest constant-factor cost for the extra capabilities aperta provides (path-first routing, cross-modal aggregation, live-graph iterative calibration). For iterative workloads (re-routing after edge-weight calibration or scenario changes) Pandana would pay its contraction-hierarchy preprocess cost on every change, whereas aperta re-routes directly on the mutated graph — a different comparison not measured by this one-shot benchmark. See the [benchmark](https://aperta.readthedocs.io/en/latest/benchmark.html) for the full setup and numbers, or run [`examples/benchmarks/benchmark.py`](examples/benchmarks/benchmark.py) to reproduce.
 
+## Development
+
+aperta has been developed since February 2023 as research code at ETH Zurich for the BlueCity and
+LUMOS projects. It became a standalone public library in May 2026 (v0.1). AI coding assistants
+support the implementation, especially for performance improvements, test coverage, and
+consistency. The design, features, and validation are the author's, and every change is reviewed
+by the author.
+
 ## Acknowledgments
 
 Aperta was developed at the [Chair of Ecological Systems Design](https://esd.ifu.ethz.ch/) at [ETH Zurich](https://ethz.ch) in the context of the [BlueCity](https://www.epfl.ch/schools/enac/blue-city-project/) project and [LUMOS](https://csfm.ethz.ch/en/research/projects/lumos.html).
