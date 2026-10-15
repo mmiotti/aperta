@@ -7,6 +7,10 @@
 
 A Python toolkit for **cross-modal accessibility analysis on transport networks** calibrated with ground-truth data: network preparation, routing, distance/time computation, utility-based travel costs, and different accessibility metrics (including logsums) on `networkx` graphs (routed via `scipy.sparse.csgraph`).
 
+> **Aperta 0.5 is coming in the next months**, with new features and faster routing. It also
+> brings breaking API changes, so pin `aperta<0.5` if you build on the current version. See
+> [Status](#status).
+
 ![Three families of aperta capabilities, illustrated on the Bern region: network preparation (estimated traffic volumes and calibrated edge speeds), path feature collection (bike-comfort scores along realized routes and aggregated per origin cell), and accessibility analysis (time-based access to hiking opportunities and cross-modal utility-based access to groceries).](docs/assets/hero.jpg)
 
 The name is Latin/Italian for *open* — the condition that accessibility, at root, measures.
@@ -15,8 +19,7 @@ The name is Latin/Italian for *open* — the condition that accessibility, at ro
 
 **Pre-1.0, alpha.** APIs may change without notice until v1.0.
 
-**Coming in 0.5** (in development; a redesign with breaking API changes, so pin `aperta<0.5`
-if you build on the current version):
+**Coming in 0.5** (in development; a redesign with breaking API changes):
 
 - **A faster routing kernel**: a multi-threaded Dijkstra written in Python and compiled with
   Numba. Each search stops as soon as all its destinations are reached, and nothing is
