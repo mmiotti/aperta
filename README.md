@@ -143,15 +143,13 @@ Ultimate speed for the full accessibility stack was not aperta's goal. On produc
 
 ## Development
 
-aperta has been developed since February 2023 as research code at ETH Zurich for the BlueCity and
-LUMOS projects. It became a standalone public library in May 2026 (v0.1). AI coding assistants
-support the implementation, especially for performance improvements, test coverage, and
-consistency. The design, features, and validation are the author's, and every change is reviewed
-by the author.
-
-## Acknowledgments
-
-Aperta was developed at the [Chair of Ecological Systems Design](https://esd.ifu.ethz.ch/) at [ETH Zurich](https://ethz.ch) in the context of the [BlueCity](https://www.epfl.ch/schools/enac/blue-city-project/) project and [LUMOS](https://csfm.ethz.ch/en/research/projects/lumos.html).
+Aperta has been developed by [Marco Miotti](https://marco.miotti.me) at the
+[Chair of Ecological Systems Design](https://esd.ifu.ethz.ch/) at [ETH Zurich](https://ethz.ch)
+since February 2023, for the [BlueCity](https://www.epfl.ch/schools/enac/blue-city-project/) and
+[LUMOS](https://csfm.ethz.ch/en/research/projects/lumos.html) projects. It became a standalone
+public library in May 2026 (v0.1). AI coding assistants support the implementation, especially
+for performance improvements, test coverage, and consistency. The design, features, and
+validation are the author's, and every change is reviewed by the author.
 
 ## Cite this
 
