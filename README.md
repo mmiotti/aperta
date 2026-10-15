@@ -45,7 +45,7 @@ pip install 'aperta[osm]'       # + OSM ingestion (osmnx)
 pip install 'aperta[examples]'  # + everything needed to run the example notebooks
 ```
 
-Requires Python ≥ 3.11.
+Requires Python ≥ 3.12.
 
 Optional backing libraries are imported lazily: `osmnx` (used by
 `osm_helpers`), `rasterio` + `requests` (used by DEM fetch and raster
