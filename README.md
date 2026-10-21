@@ -171,4 +171,7 @@ If you use aperta in a publication, please cite the archived release:
 
 ## License
 
+© 2026 ETH Zurich\
+Created by: Marco Miotti
+
 MIT. See [LICENSE](LICENSE).

@@ -6,7 +6,7 @@ from importlib.metadata import version as _pkg_version
 
 project = "aperta"
 author = "Marco Miotti"
-copyright = "2026, Marco Miotti"
+copyright = "2026, ETH Zurich"
 
 # Pull version from installed package metadata so docs and pyproject stay in sync.
 try:
