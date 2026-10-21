@@ -1,8 +1,12 @@
 # Contributing to aperta
 
-Internal repository for now — external contributions open after the
-toolkit-paper publication. The setup notes below are relevant for
-collaborators with commit access in the meantime.
+Bug reports, questions and feature requests are welcome as
+[GitHub issues](https://github.com/mmiotti/aperta/issues).
+
+Pull requests open with the 0.5 release, once the terms for external
+contributions are settled. 0.5 replaces most of the routing and OD
+internals, so changes against 0.4 would need reworking anyway. Until then,
+the setup notes below are for collaborators with commit access.
 
 ## Editing notebooks
 
