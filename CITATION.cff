@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use aperta in a publication, please cite the archived release."
+type: software
+title: "Aperta: Path-first, cross-modal accessibility analysis in Python"
+authors:
+  - family-names: Miotti
+    given-names: Marco
+    affiliation: ETH Zurich
+    orcid: "https://orcid.org/0000-0003-4458-6253"
+doi: 10.5281/zenodo.20473787
+repository-code: "https://github.com/mmiotti/aperta"
+url: "https://aperta.readthedocs.io"
+license: MIT
+keywords:
+  - accessibility
+  - transport networks
+  - routing
+  - cross-modal
+  - Python
