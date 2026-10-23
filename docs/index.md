@@ -4,10 +4,11 @@ hide-toc: true
 
 # aperta
 
-**Path-first, cross-modal accessibility analysis in Python.**
+**Calibrated, cross-modal accessibility analysis in Python.**
 
-A Python library for routing, distance/time computation, and gravity- /
-utility- / logsum-based accessibility metrics on
+A Python library for routing, distance/time computation, traffic-flow
+estimation and edge-weight calibration against ground-truth data, and
+gravity- / utility- / logsum-based accessibility metrics on
 [NetworkX](https://networkx.org/) graphs (routed via
 [`scipy.sparse.csgraph`](https://docs.scipy.org/doc/scipy/reference/sparse.csgraph.html)).
 Designed around a path-first routing primitive that returns the realized
@@ -19,8 +20,7 @@ The name is Latin/Italian for *open*.
 
 ## Status
 
-**Pre-1.0, alpha.** Published alongside a toolkit paper (in submission).
-APIs may change without notice until v1.0.
+**Pre-1.0, alpha.** APIs may change without notice until v1.0.
 
 ## Install
 

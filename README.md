@@ -156,16 +156,17 @@ validation are the author's, and every change is reviewed by the author.
 
 ## Cite this
 
-If you use aperta in a publication, please cite the archived release:
+If you use aperta in a publication, please cite the archived release. The DOI below always
+resolves to the latest version; Zenodo also lists a DOI for each release.
 
 ```bibtex
 @software{miotti_aperta_2026,
   author    = {Miotti, Marco},
-  title     = {{Aperta: Path-first, cross-modal accessibility analysis in Python}},
+  title     = {{Aperta: Calibrated, cross-modal accessibility analysis in Python}},
   year      = 2026,
   publisher = {Zenodo},
-  doi       = {10.5281/zenodo.20473787},
-  url       = {https://doi.org/10.5281/zenodo.20473787}
+  doi       = {10.5281/zenodo.20473786},
+  url       = {https://doi.org/10.5281/zenodo.20473786}
 }
 ```
 
