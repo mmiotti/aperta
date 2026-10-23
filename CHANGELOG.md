@@ -9,6 +9,17 @@ changes may occur in 0.x releases.
 
 _Nothing yet._
 
+## [0.4.2a0] — 2026-10-23
+
+Documentation and metadata only; the code is unchanged from 0.4.1a0.
+
+### Added
+- `CITATION.cff`, for GitHub's "Cite this repository".
+
+### Changed
+- README: development and acknowledgements notes; contribution policy (issues welcome now,
+  pull requests from 0.5; see `CONTRIBUTING.md`).
+
 ## [0.4.1a0] — 2026-10-09
 
 ### Fixed
@@ -685,7 +696,8 @@ Initial public release, alongside the toolkit-paper submission.
 - 13 test modules, ~320 test methods; CI on Python 3.11–3.13.
 - Sphinx documentation hosted on ReadTheDocs.
 
-[Unreleased]: https://github.com/mmiotti/aperta/compare/v0.4.1-alpha...HEAD
+[Unreleased]: https://github.com/mmiotti/aperta/compare/v0.4.2-alpha...HEAD
+[0.4.2a0]: https://github.com/mmiotti/aperta/compare/v0.4.1-alpha...v0.4.2-alpha
 [0.4.1a0]: https://github.com/mmiotti/aperta/compare/v0.4.0-alpha...v0.4.1-alpha
 [0.4.0a0]: https://github.com/mmiotti/aperta/compare/v0.3.0-alpha...v0.4.0-alpha
 [0.3.0a0]: https://github.com/mmiotti/aperta/compare/v0.2.0-alpha...v0.3.0-alpha
