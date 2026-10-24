@@ -151,6 +151,33 @@ class CalibrateEdgeWeightsTestCase(unittest.TestCase):
         # Regression R² should be very high (data was generated FROM the model).
         self.assertGreater(result.metrics_regression.loc["all", "r2"], 0.99)
 
+    def test_recovers_multiplier_when_route_cost_includes_other_terms(self):
+        """The multiplier regressor is the baseline time the feature scales
+        (Σ base · feature along the path), not the full route cost. With a
+        non-zero starting constant the route cost exceeds the baseline time,
+        which would otherwise shrink the fitted coefficient by baseline /
+        route time and push α up to compensate."""
+        g = _chain_graph(n=20)
+        gt = _ground_truth_from_model(g, n_trips=400, slow_zone_coef=5.0, noise_std=0.5, seed=1)
+        gt["time_measured"] += 120.0
+        result = calibrate_edge_weights(
+            g,
+            gt,
+            baseline_speed_attr="speed_kph",
+            multiplier_features={"slow_zone": 1.0},
+            additive_route_features={},
+            additive_endpoint_features={},
+            constant=120.0,
+            n_iterations=3,
+            r2_tolerance=-1e9,
+            max_distance=10.0,
+            max_dist_to_line_ratio=10.0,
+        )
+        coefs = result.coefficients["coef"]
+        self.assertAlmostEqual(coefs["slow_zone"], 5.0, delta=0.25)
+        self.assertAlmostEqual(coefs["const"], 120.0, delta=5.0)
+        self.assertAlmostEqual(coefs["baseline_time"], 1.0, delta=0.05)
+
     def test_returns_expected_result_fields(self):
         g = _chain_graph(n=10)
         gt = _ground_truth_from_model(g, n_trips=100, seed=1)

@@ -9,6 +9,17 @@ changes may occur in 0.x releases.
 
 _Nothing yet._
 
+## [0.4.3a0] — 2026-10-23
+
+### Fixed
+- `calibration.calibrate_edge_weights`: each multiplier feature's regressor is now the baseline
+  time it scales, summed along the path (Σ base_e · feature_e, as `apply_edge_durations` applies
+  it), instead of the full route cost times the feature's length-weighted mean. Whenever the route
+  cost included other terms (constant, additive or endpoint features, or the multipliers
+  themselves after the first iteration), the old regressor shrank multiplier coefficients by
+  roughly baseline / route time, with α and the other terms absorbing part of the difference.
+  Recalibrate edge weights fitted with multiplier features.
+
 ## [0.4.2a0] — 2026-10-23
 
 Documentation and metadata only; the code is unchanged from 0.4.1a0.
@@ -696,7 +707,8 @@ Initial public release, alongside the toolkit-paper submission.
 - 13 test modules, ~320 test methods; CI on Python 3.11–3.13.
 - Sphinx documentation hosted on ReadTheDocs.
 
-[Unreleased]: https://github.com/mmiotti/aperta/compare/v0.4.2-alpha...HEAD
+[Unreleased]: https://github.com/mmiotti/aperta/compare/v0.4.3-alpha...HEAD
+[0.4.3a0]: https://github.com/mmiotti/aperta/compare/v0.4.2-alpha...v0.4.3-alpha
 [0.4.2a0]: https://github.com/mmiotti/aperta/compare/v0.4.1-alpha...v0.4.2-alpha
 [0.4.1a0]: https://github.com/mmiotti/aperta/compare/v0.4.0-alpha...v0.4.1-alpha
 [0.4.0a0]: https://github.com/mmiotti/aperta/compare/v0.3.0-alpha...v0.4.0-alpha

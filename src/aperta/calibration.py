@@ -9,7 +9,7 @@ formula used for routing AND the regression — keeping the two consistent
 Model:
 
     time_trip = α · baseline_time
-              + Σ_m coef_m · (baseline_time · length-weighted-avg of m along path)
+              + Σ_m coef_m · (Σ over the path's edges of baseline_time_e · m_e)
               + Σ_a coef_a · (sum of a along path)
               + Σ_e coef_e · (endpoint value of e)
               + constant
@@ -145,6 +145,11 @@ def apply_edge_durations(
         data[out_attr] = max(min(duration, max_duration), min_duration)
 
 
+def _base_times_name(feature: str) -> str:
+    """Edge attribute holding `baseline_duration · feature` (see `_build_predictors`)."""
+    return f"__base_x_{feature}"
+
+
 def _build_predictors(
     routed: pd.DataFrame,
     baseline_edge_attr: str,
@@ -155,9 +160,10 @@ def _build_predictors(
 ) -> tuple[pd.DataFrame, list[str], list[str]]:
     """Build the OLS design matrix `X` and the list of feature column names.
 
-    Multiplier features enter as `cost · feature_avg` (a velocity-like
-    interaction term). Additive route features enter as raw sums. Endpoint
-    features become two columns each: `<f>_orig` and `<f>_dest`.
+    Multiplier features enter as `Σ_e base_e · feature_e` along the path (the
+    baseline time each feature scales, as in `apply_edge_durations`).
+    Additive route features enter as raw sums. Endpoint features become two
+    columns each: `<f>_orig` and `<f>_dest`.
 
     Returns `(X, feature_columns, kinds_per_column)`. The first column is
     always `cost` (baseline duration along the routed path) — its OLS
@@ -168,7 +174,7 @@ def _build_predictors(
     kinds = ["baseline"]
     feat_cols = ["baseline_time"]
     for f in multiplier_features:
-        rows[f] = (routed["cost"] * routed[f]).astype(float)
+        rows[f] = routed[_base_times_name(f)].astype(float)
         kinds.append("multiplier")
         feat_cols.append(f)
     for f in additive_route_features:
@@ -457,12 +463,25 @@ def calibrate_edge_weights(
         for k, v in baseline_speed.items()
     }
     nx.set_edge_attributes(graph, baseline_duration, baseline_duration_attr)
+    # Multiplier features scale each edge's baseline time, so their regressor
+    # is Σ_e base_e · m_e along the path: precompute the per-edge product.
+    for f in multiplier_features:
+        nx.set_edge_attributes(
+            graph,
+            {
+                (u, v, k): d[baseline_duration_attr] * float(d.get(f, 0.0))
+                for u, v, k, d in graph.edges(keys=True, data=True)
+                if baseline_duration_attr in d
+            },
+            _base_times_name(f),
+        )
 
-    # Aggregation per feature: multiplier features get length-weighted-avg
-    # (so they enter as a speed-like correction); additive route features
-    # get summed along the path.
+    # Aggregation per feature: multiplier features get their summed
+    # baseline-time products (the regressors) and a length-weighted average
+    # (for the log); additive route features get summed along the path.
     edge_feature_aggs: dict[str, str] = {
         **{baseline_duration_attr: "sum"},
+        **{_base_times_name(f): "sum" for f in multiplier_features},
         **{f: "length_weighted" for f in multiplier_features},
         **{f: "sum" for f in additive_route_features},
     }
@@ -570,8 +589,8 @@ def calibrate_edge_weights(
                 #   - baseline_time: enters as α·base    → coef·avg(base)
                 #   - const:         enters as intercept → coef (added
                 #                    unconditionally to every trip)
-                #   - multiplier:    enters as coef·base·feat → scales
-                #                    baseline; effect ≈ coef·feat_avg·base_avg
+                #   - multiplier:    enters as coef·Σ base·feat → scales
+                #                    baseline; effect = coef·avg(Σ base·feat)
                 #   - additive route/endpoint: enters as coef·feat → coef·feat_avg
                 if name == "baseline_time":
                     avg = baseline_avg
@@ -582,7 +601,7 @@ def calibrate_edge_weights(
                 else:
                     avg = float(routed[name].mean())
                     if name in cur_mult:
-                        effect_avg = r["coef"] * avg * baseline_avg
+                        effect_avg = r["coef"] * float(routed[_base_times_name(name)].mean())
                     else:
                         effect_avg = r["coef"] * avg
                 logging.info(
