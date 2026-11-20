@@ -940,6 +940,30 @@ class AggregateAcrossModesTestCase(unittest.TestCase):
         # X: walk=10, car=inf → min=10. Y: walk=20, car=5 → min=5. Z: walk=inf, car=7 → 7.
         np.testing.assert_array_equal(combined.cells_to_cells["A"], np.array([10.0, 5.0, 7.0]))
 
+    def test_list_dest_ids_same_as_arrays(self):
+        """Dest IDs given as lists (as string IDs often load) give the same result as arrays."""
+        walk_costs = TieredODGeoPairs(cells_to_cells={"A": np.array([10.0, 20.0])})
+        car_costs = TieredODGeoPairs(cells_to_cells={"A": np.array([5.0, 7.0])})
+
+        def run(ids):
+            return aggregate_across_modes(
+                {
+                    "walk": (TieredODGeoPairs(cells_to_cells={"A": ids(["X", "Y"])}), walk_costs),
+                    "car": (TieredODGeoPairs(cells_to_cells={"A": ids(["Y", "Z"])}), car_costs),
+                },
+                aggregator="logsum",
+            )
+
+        list_pairs, list_costs = run(list)
+        array_pairs, array_costs = run(np.array)
+        self.assertEqual(list(list_pairs.cells_to_cells["A"]), ["X", "Y", "Z"])
+        self.assertEqual(
+            list(list_pairs.cells_to_cells["A"]), list(array_pairs.cells_to_cells["A"])
+        )
+        np.testing.assert_array_equal(
+            list_costs.cells_to_cells["A"], array_costs.cells_to_cells["A"]
+        )
+
     def test_disjoint_origins_union(self):
         """Modes with different origin sets → union of origins appears in result."""
         walk_pairs = TieredODGeoPairs(cells_to_cells={"A": np.array(["D"])})

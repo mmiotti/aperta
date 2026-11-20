@@ -435,12 +435,14 @@ def sample_raster_at_points(
             # Snap to integer pixel boundaries — `from_bounds` returns a
             # fractional window, and `src.read(window=...)` /
             # `src.window_transform(...)` behave more predictably with
-            # integer offsets. Floor the offset, ceil the far edge, then
-            # clip to the actual raster extent.
-            col_start = max(0, int(np.floor(requested.col_off)))
-            row_start = max(0, int(np.floor(requested.row_off)))
-            col_stop = min(src.width, int(np.ceil(requested.col_off + requested.width)))
-            row_stop = min(src.height, int(np.ceil(requested.row_off + requested.height)))
+            # integer offsets. Floor the offset, ceil the far edge, add one
+            # pixel of margin (bilinear interpolation also reads the pixel
+            # beyond the one a point lies in, so points on the window's edge
+            # would otherwise get NaN), then clip to the actual raster extent.
+            col_start = max(0, int(np.floor(requested.col_off)) - 1)
+            row_start = max(0, int(np.floor(requested.row_off)) - 1)
+            col_stop = min(src.width, int(np.ceil(requested.col_off + requested.width)) + 1)
+            row_stop = min(src.height, int(np.ceil(requested.row_off + requested.height)) + 1)
             if col_stop > col_start and row_stop > row_start:
                 window = Window.from_slices((row_start, row_stop), (col_start, col_stop))
             else:

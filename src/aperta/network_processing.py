@@ -273,35 +273,6 @@ def get_nested_edge_betweenness(
     return pd.Series(out)
 
 
-def _add_to_edge_info(node_row, collected_edge_information, cols, node_edge_relations):
-    """Fan a node's feature values out onto each edge it touches.
-
-    For directed graphs (e.g. osmnx `MultiDiGraph`), `graph.edges(node)`
-    returns only OUTGOING edges. Without explicitly fetching `in_edges`
-    too, each edge would only ever receive a contribution from its source
-    node — its destination node's row would never reach it. Mean
-    aggregation would then collapse to "value at source", missing the
-    half-allocation behavior callers expect.
-    """
-    if isinstance(node_edge_relations, str):
-        edge_ids = node_row[node_edge_relations].split(",")
-    elif isinstance(node_edge_relations, nx.Graph):
-        if node_edge_relations.is_directed():
-            edge_ids = list(node_edge_relations.out_edges(node_row.name, keys=True)) + list(
-                node_edge_relations.in_edges(node_row.name, keys=True)
-            )
-        else:
-            edge_ids = list(node_edge_relations.edges(node_row.name, keys=True))
-    else:
-        raise TypeError("node_edge_relations must be a str or nx.Graph.")
-    for edge_id in edge_ids:
-        if edge_id not in collected_edge_information:
-            collected_edge_information[edge_id] = {col: [] for col in cols}
-        for col in cols:
-            collected_edge_information[edge_id][col].append(node_row[col])
-    return collected_edge_information
-
-
 def aggregate_nodes_to_edges(
     df_nodes: pd.DataFrame,
     cols: list[str],
@@ -316,40 +287,52 @@ def aggregate_nodes_to_edges(
         cols: list of columns in df_nodes to be mapped to edges.
         node_edge_relations: if str, must list the edges belonging to each node in column
             'node_edge_relations' in df_nodes, separated by a comma (,). Otherwise, supply an
-            nx.Graph where the ID of each node corresponds to the index in df_nodes.
+            nx.MultiGraph / nx.MultiDiGraph where the ID of each node corresponds to the index
+            in df_nodes; each edge `(u, v, key)` then takes the values of both its endpoints
+            (a self-loop's node twice).
         aggregator: how to aggregate values from different nodes onto a single edge.
             One of `'max'`, `'min'`, `'mean'`, `'sum'`, `'median'`, or a callable that
             takes a 1-D numpy array of per-node values and returns a scalar. String
-            aggregators use the nan-safe numpy variants (silently skip NaN values).
+            aggregators skip NaN values (`'sum'` of only NaN is 0).
+
+    Returns:
+        One row per edge with at least one endpoint (or listing node) in df_nodes, one float
+        column per entry of `cols`; indexed by `(u, v, key)` for a graph, else by the edge id
+        strings.
     """
-    _agg: Callable
-    if aggregator == "max":
-        _agg = np.nanmax
-    elif aggregator == "min":
-        _agg = np.nanmin
-    elif aggregator == "mean":
-        _agg = np.nanmean
-    elif aggregator == "sum":
-        _agg = np.nansum
-    elif aggregator == "median":
-        _agg = np.nanmedian
-    elif callable(aggregator):
-        _agg = aggregator
-    else:
+    if isinstance(aggregator, str) and aggregator not in ("max", "min", "mean", "sum", "median"):
         raise ValueError(
             f"Unknown aggregator {aggregator!r}; expected "
             f"'max', 'min', 'mean', 'sum', 'median', or a callable."
         )
+    # One entry per (edge, node) incidence: the node's row position and the edge's code.
+    if isinstance(node_edge_relations, str):
+        incidences = df_nodes[node_edge_relations].reset_index(drop=True).str.split(",").explode()
+        node_pos = incidences.index.to_numpy()
+        codes, edge_ids = pd.factorize(incidences.to_numpy())
+    elif isinstance(node_edge_relations, nx.Graph):
+        edge_ids = pd.MultiIndex.from_tuples(list(node_edge_relations.edges(keys=True)))
+        node_pos = np.concatenate(
+            [df_nodes.index.get_indexer(edge_ids.get_level_values(i)) for i in (0, 1)]
+        )
+        codes = np.tile(np.arange(len(edge_ids)), 2)
+    else:
+        raise TypeError("node_edge_relations must be a str or nx.Graph.")
+    keep = (node_pos >= 0) & (codes >= 0)  # endpoints not in df_nodes; nodes listing no edge
+    node_pos, codes = node_pos[keep], codes[keep]
 
-    collected_edge_information: dict = {}
-    df_nodes.apply(
-        lambda row: _add_to_edge_info(row, collected_edge_information, cols, node_edge_relations),
-        axis=1,
+    agg = aggregator if isinstance(aggregator, str) else (lambda s: float(aggregator(s.to_numpy())))
+    # Column by column: one (incidences,) array at a time, not (incidences, cols).
+    out = pd.DataFrame(
+        {
+            col: pd.Series(df_nodes[col].to_numpy(dtype=float)[node_pos])
+            .groupby(codes, sort=False)
+            .agg(agg)
+            for col in cols
+        }
     )
-    for k, d in collected_edge_information.items():
-        for col, values in d.items():
-            collected_edge_information[k][col] = float(_agg(np.asarray(values, dtype=float)))
-    return pd.DataFrame.from_dict(collected_edge_information, orient="index")
+    out.index = edge_ids[out.index.to_numpy()]
+    return out
 
 
 def snap_features_to_nodes(

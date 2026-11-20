@@ -34,14 +34,17 @@ is meaningful relative to trip cost. At ~1 km zone diameter and ~10 km
 medium-tier radius, cell variation within a zone is ~10% of trip cost — not
 noise.
 
-Tier rule (per ordered cell c, c' with parent zones Z, Z'):
+Tier rule (per ordered cell c, c' with parent zones Z, Z'; d = Euclidean
+distance between the zone centroids, `zones_centroids` or the zone polygons'
+centroids):
 
-    d(c, c') < r_cells           → cell tier (cells_to_cells)
-    r_cells ≤ d(c, c') < r_medium → cells_to_zones (cell c → zone(c'))
-    d(c, c') ≥ r_medium           → zones_to_zones (zone(c) → zone(c'))
-    else (beyond outer cutoff)   → drop
+    Z == Z' or d(Z, Z') < r_cells   → cell tier (cells_to_cells)
+    r_cells ≤ d(Z, Z') < r_medium   → cells_to_zones (cell c → zone Z')
+    r_medium ≤ d(Z, Z') < r_zones   → zones_to_zones (zone Z → zone Z')
+    else (beyond outer cutoff)     → drop
 
-Symmetry: distances are symmetric, so tier assignment is too.
+Tiers are assigned per zone pair, so all cells of a zone share them, and
+distances are symmetric, so tier assignment is too.
 
 Architectural note: aperta used to have a four-tier scheme with a
 separate `zones_to_regions` slot keyed by zones with region-level dests.
@@ -1361,6 +1364,11 @@ def _aggregate_modes_tier(
     raise ValueError(f"Unknown aggregator {aggregator!r}; expected 'min', 'logsum', or a callable.")
 
 
+def _id_list(ids) -> list:
+    """Per-origin dest IDs as a list: arrays converted, lists passed through uncopied."""
+    return ids.tolist() if isinstance(ids, np.ndarray) else ids
+
+
 def aggregate_across_modes(
     odms: dict[str, tuple[TieredODGeoPairs, TieredODGeoPairs]],
     *,
@@ -1378,7 +1386,8 @@ def aggregate_across_modes(
 
     Each mode contributes `(pairs, costs)`:
 
-      - `pairs`: geo-keyed `TieredODGeoPairs` of dest unit IDs.
+      - `pairs`: geo-keyed `TieredODGeoPairs` of dest unit IDs (per-origin arrays or
+        lists; lists avoid a copy when the IDs are loaded as Python strings).
       - `costs`: geo-keyed `TieredODGeoPairs` of cost values aligned to `pairs`.
 
     For each (origin, dest_unit) pair in the UNION across modes:
@@ -1475,7 +1484,7 @@ def aggregate_across_modes(
             dest_union: set = set()
             for p in per_mode_pairs:
                 if origin in p:
-                    dest_union.update(p[origin].tolist())
+                    dest_union.update(_id_list(p[origin]))
             if not dest_union:
                 continue
             dest_sorted = np.asarray(sorted(dest_union))
@@ -1489,7 +1498,7 @@ def aggregate_across_modes(
                 # entry, then look up each dest in the union.
                 mode_dests = p[origin]
                 mode_costs = np.asarray(c[origin], dtype=dt)
-                lookup = dict(zip(mode_dests.tolist(), mode_costs.tolist()))
+                lookup = dict(zip(_id_list(mode_dests), mode_costs.tolist()))
                 aligned.append(
                     np.fromiter(
                         (lookup.get(d, np.inf) for d in dest_sorted),

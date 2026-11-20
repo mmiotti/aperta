@@ -4,14 +4,18 @@ Run with:
     python -m unittest tests.test_geo_processing
 """
 
+import importlib.util
 import math
+import os
+import tempfile
 import unittest
 
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 from shapely.geometry import Point
 
-from aperta.geo_processing import cross_sum_within_radius
+from aperta.geo_processing import cross_sum_within_radius, sample_raster_at_points
 
 
 def _points(
@@ -143,6 +147,56 @@ class AggregateWithinRadiusTestCase(unittest.TestCase):
         sources = _points([(0, 0)], index=["S0"])
         result = cross_sum_within_radius(targets, sources, radius=10.0)
         self.assertEqual(list(result.index), ["x", "y", "z"])
+
+
+@unittest.skipUnless(importlib.util.find_spec("rasterio"), "needs rasterio (`topo` extra)")
+class SampleRasterAtPointsTestCase(unittest.TestCase):
+    """`sample_raster_at_points` on a linear ramp, which bilinear interpolation reproduces
+    exactly: value = col + 100 * row at pixel centres (1-unit pixels, top-left at (0, 20))."""
+
+    def setUp(self):
+        import rasterio
+        from rasterio.transform import from_origin
+
+        self._dir = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._dir.name, "ramp.tif")
+        rows, cols = np.mgrid[0:20, 0:30]
+        with rasterio.open(
+            self.path,
+            "w",
+            driver="GTiff",
+            height=20,
+            width=30,
+            count=1,
+            dtype="float32",
+            transform=from_origin(0.0, 20.0, 1.0, 1.0),
+        ) as dst:
+            dst.write((cols + 100 * rows).astype("float32"), 1)
+        self.xs = np.array([5.2, 12.8, 20.4])
+        self.ys = np.array([14.3, 9.9, 3.6])
+        # Pixel centres sit at x = col + 0.5, y = 20 - row - 0.5.
+        self.expected = (self.xs - 0.5) + 100 * (19.5 - self.ys)
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    def test_bilinear_points_on_window_edge(self):
+        """The outermost points of a sample (and a point sampled alone) need pixels beyond
+        the sample's bounding box; they get the interpolated value, not NaN."""
+        points = gpd.GeoDataFrame(geometry=gpd.points_from_xy(self.xs, self.ys))
+        np.testing.assert_allclose(
+            sample_raster_at_points(points, self.path), self.expected, rtol=1e-6
+        )
+        for i in range(len(points)):
+            alone = sample_raster_at_points(points.iloc[[i]], self.path)
+            np.testing.assert_allclose(alone, self.expected[i : i + 1], rtol=1e-6)
+
+    def test_nearest_and_outside(self):
+        """Nearest returns the containing pixel; points off the raster are NaN."""
+        points = gpd.GeoDataFrame(geometry=gpd.points_from_xy([5.2, -3.0], [14.3, 5.0]))
+        result = sample_raster_at_points(points, self.path, method="nearest")
+        self.assertEqual(result.iloc[0], 5 + 100 * 5)
+        self.assertTrue(np.isnan(result.iloc[1]))
 
 
 if __name__ == "__main__":

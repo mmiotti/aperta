@@ -84,10 +84,10 @@ Runnable examples, in increasing depth:
 
 - [examples/minimal/accessibility.ipynb](examples/minimal/accessibility.ipynb) — what aperta does in ~50 lines using only OpenStreetMap. Cambridge MA, ~10 s.
 - [examples/walkthrough/accessibility.ipynb](examples/walkthrough/accessibility.ipynb) — guided tour of every primitive; walking + cycling, cross-modal logsum, path-first per-edge feature aggregation. Central Paris, ~1 min end-to-end.
-- [examples/calibration/](examples/calibration/) — two standalone calibration demos on production-scale Bern + 40 km: edge-weight calibration against observed travel times, traffic-flow tuning against travel-survey + counter data. Reads pre-prepared inputs from [aperta-atlas](https://github.com/mmiotti/aperta-atlas)'s `bern-public` scenario (set `APERTA_DATA_ROOT`). Each notebook is a standalone showcase — they do NOT chain into a pipeline; for the full integrated calibrate → flows → accessibility chain see aperta-atlas. ~30 min per notebook.
-- [examples/benchmarks/](examples/benchmarks/) — aperta vs pandana scaling benchmark on the same Bern + 40 km dataset. Documents the headline scaling numbers in this README.
+- [examples/calibration/](examples/calibration/) — one calibration workflow on the Canton of Zurich (network fetched inline from OSM): traffic flows via nested-betweenness sampling, then edge-weight durations calibrated against GPS-observed (MOBIS) peak-hour car travel times with the flow-derived congestion feature. Needs proprietary ground-truth files (MOBIS trip legs, traffic counts; set `APERTA_EXAMPLES_GROUND_TRUTH_DIR`), so it mainly documents the methods; for the full integrated calibrate → flows → accessibility chain see [aperta-atlas](https://github.com/mmiotti/aperta-atlas). ~30 min.
+- [examples/benchmarks/](examples/benchmarks/) — aperta vs pandana scaling benchmark on the city of Bern (walk and car networks fetched inline from OSM). Documents the headline scaling numbers in this README.
 
-The toy-world end-to-end test in [tests/test_workflow.py](tests/test_workflow.py) doubles as the smallest possible walk-through (~150 lines, runs in a second).
+The toy-world end-to-end test in [tests/test_workflow.py](tests/test_workflow.py) doubles as the smallest possible walk-through (~200 lines, runs in a second).
 
 ## Quick example
 

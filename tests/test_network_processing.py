@@ -15,6 +15,7 @@ from shapely.geometry import LineString, Point, box
 
 from aperta.network_processing import (
     aggregate_edges_to_nodes,
+    aggregate_nodes_to_edges,
     smooth_node_attribute,
     snap_features_to_nodes,
 )
@@ -289,6 +290,54 @@ class AggregateEdgesToNodesTestCase(unittest.TestCase):
         out = aggregate_edges_to_nodes(g, "tier", aggregator="max")
         self.assertEqual(out.loc["a"], 3.0)
         self.assertEqual(out.loc["b"], 3.0)
+
+
+class AggregateNodesToEdgesTestCase(unittest.TestCase):
+    """`aggregate_nodes_to_edges` gives each edge the aggregate of its endpoints' values."""
+
+    def _toy(self) -> tuple[nx.MultiDiGraph, pd.DataFrame]:
+        """a -> b twice (parallel), b -> c, c -> c (self-loop), c -> d; d not in the table;
+        `y` NaN at b."""
+        g = nx.MultiDiGraph()
+        g.add_edges_from([("a", "b"), ("a", "b"), ("b", "c"), ("c", "c"), ("c", "d")])
+        nodes = pd.DataFrame({"x": [1.0, 3.0, 6.0], "y": [2.0, np.nan, 4.0]}, index=["a", "b", "c"])
+        return g, nodes
+
+    def test_mean_over_both_endpoints(self):
+        g, nodes = self._toy()
+        out = aggregate_nodes_to_edges(nodes, ["x", "y"], g, aggregator="mean")
+        self.assertEqual(out.loc[("a", "b", 0), "x"], 2.0)
+        self.assertEqual(out.loc[("a", "b", 1), "x"], 2.0)  # parallel edge: own row
+        self.assertEqual(out.loc[("b", "c", 0), "x"], 4.5)
+        self.assertEqual(out.loc[("c", "c", 0), "x"], 6.0)  # self-loop: c twice
+        self.assertEqual(out.loc[("c", "d", 0), "x"], 6.0)  # d missing: c only
+        self.assertEqual(out.loc[("a", "b", 0), "y"], 2.0)  # NaN at b skipped
+        self.assertEqual(len(out), 5)
+        self.assertEqual(list(out.columns), ["x", "y"])
+
+    def test_sum_and_max(self):
+        g, nodes = self._toy()
+        out = aggregate_nodes_to_edges(nodes, ["x"], g, aggregator="sum")
+        self.assertEqual(out.loc[("b", "c", 0), "x"], 9.0)
+        self.assertEqual(out.loc[("c", "c", 0), "x"], 12.0)
+        out = aggregate_nodes_to_edges(nodes, ["x"], g, aggregator="max")
+        self.assertEqual(out.loc[("a", "b", 0), "x"], 3.0)
+
+    def test_callable_aggregator(self):
+        g, nodes = self._toy()
+        out = aggregate_nodes_to_edges(nodes, ["x"], g, aggregator=lambda arr: float(arr.min()))
+        self.assertEqual(out.loc[("b", "c", 0), "x"], 3.0)
+
+    def test_edge_ids_from_column(self):
+        """Comma-separated edge ids per node, e.g. read from a file."""
+        nodes = pd.DataFrame({"edges": ["e1,e2", "e2", "e3"], "x": [1.0, 2.0, 4.0]})
+        out = aggregate_nodes_to_edges(nodes, ["x"], "edges", aggregator="sum")
+        self.assertEqual(out["x"].to_dict(), {"e1": 1.0, "e2": 3.0, "e3": 4.0})
+
+    def test_unknown_aggregator_raises(self):
+        g, nodes = self._toy()
+        with self.assertRaisesRegex(ValueError, "Unknown aggregator"):
+            aggregate_nodes_to_edges(nodes, ["x"], g, aggregator="nope")
 
 
 class TransportCentroidTestCase(unittest.TestCase):

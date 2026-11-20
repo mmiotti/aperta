@@ -9,6 +9,25 @@ changes may occur in 0.x releases.
 
 _Nothing yet._
 
+## [0.4.4a0] — 2026-11-20
+
+### Fixed
+- `od_pairs.aggregate_across_modes`: per-origin dest IDs may now be lists as well as arrays
+  (before, lists raised `AttributeError`). Passing the lists in which string IDs are often loaded
+  avoids converting them to arrays first, a copy of every ID (tens of GB at national scale).
+- `geo_processing.sample_raster_at_points` (bilinear): points near the edge of the sample's
+  bounding box, i.e. the outermost points of a sample and any point sampled alone, returned NaN,
+  because the raster was read without the neighboring pixels the interpolation needs. The read
+  window now has one pixel of margin, so results equal a read of the whole raster.
+
+### Changed
+- `network_processing.aggregate_nodes_to_edges` is vectorized: one pandas group-by per column
+  over the (edge, node) incidences instead of Python lists per edge and column. Same results,
+  in seconds instead of minutes, and a few GB instead of ~6 KB per edge at 46 columns (60 GB on
+  a national bike network). Changes: an undirected `MultiGraph` now gives one row per edge with
+  both endpoints' values (before, `(u, v, k)` and `(v, u, k)`, one endpoint each); row order may
+  differ; no NumPy warnings for all-NaN edges.
+
 ## [0.4.3a0] — 2026-10-23
 
 ### Fixed
@@ -83,7 +102,7 @@ This cycle is dominated by one arc: **the aperta / aperta-atlas split becoming r
 The two roles going forward:
 
 - **aperta** (this repo) — the algorithm library. Pure primitives on `numpy` / `pandas` / `networkx`. No filesystem, no scenarios, no OSM-tag semantics.
-- **[aperta-atlas](https://github.com/mmiotti/aperta-atlas)** — an opinionated multi-modal accessibility pipeline for Switzerland (published as the "Urban Mobility Atlas") plus reusable `aperta_atlas` scaffolding (context, typed I/O, coefficient system, variant runner) for building your own atlas-style project on top of aperta.
+- **[aperta-atlas](https://github.com/mmiotti/aperta-atlas)** — an opinionated multi-modal accessibility pipeline for Switzerland (published as the "Aperta Accessibility Atlas") plus reusable `aperta_atlas` scaffolding (context, typed I/O, coefficient system, variant runner) for building your own atlas-style project on top of aperta.
 
 Everything below follows from that split. Helpers moved out to aperta-atlas or got removed outright when live code migrated to better patterns; the remaining public surface got an API-consistency pass (naming, argument order, defaults, keyword-only cleanups). Two earlier sub-cycles that belong to the same arc are covered in their own sub-sections below: the sweeping OSM-boundary cleanup (2026-06-07) and the extended-example restructure (2026-06-27).
 
@@ -707,7 +726,8 @@ Initial public release, alongside the toolkit-paper submission.
 - 13 test modules, ~320 test methods; CI on Python 3.11–3.13.
 - Sphinx documentation hosted on ReadTheDocs.
 
-[Unreleased]: https://github.com/mmiotti/aperta/compare/v0.4.3-alpha...HEAD
+[Unreleased]: https://github.com/mmiotti/aperta/compare/v0.4.4-alpha...HEAD
+[0.4.4a0]: https://github.com/mmiotti/aperta/compare/v0.4.3-alpha...v0.4.4-alpha
 [0.4.3a0]: https://github.com/mmiotti/aperta/compare/v0.4.2-alpha...v0.4.3-alpha
 [0.4.2a0]: https://github.com/mmiotti/aperta/compare/v0.4.1-alpha...v0.4.2-alpha
 [0.4.1a0]: https://github.com/mmiotti/aperta/compare/v0.4.0-alpha...v0.4.1-alpha
